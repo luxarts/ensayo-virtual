@@ -42,8 +42,9 @@ public:
     JitterBuffer& receiveBuffer() noexcept override;
     uint32_t getClientId() const noexcept override;
     uint32_t getTrackPosition() const noexcept override;
-    // UDP thread: sends queued packets, receives mix packets → receiveBuffer().push (seq, payload, arrival), stores trackPosition.
-    // Control thread: StreamingSocket read loop; ping every 1 s; reconnect is not attempted.
+    // UDP receive thread: blocking recvfrom → mix packets → receiveBuffer().push (seq, payload, arrival), stores trackPosition.
+    // UDP send thread: woken by sendAudio (SetEvent, the audio thread's one non-blocking kernel call) and drains the queue.
+    // Control thread: StreamingSocket read loop; ping every 1 s; reconnect is not attempted. Writer thread: every socket write.
 
 private:
     class ControlThread;
@@ -74,6 +75,7 @@ private:
     SessionState state;
     std::unique_ptr<JitterBuffer> buffer;
     PacketQueue outgoing;
+    void* sendWake = nullptr;   // Win32 auto-reset event: set by sendAudio, waited on by the UDP send thread; lives with the client
     std::atomic<uint32_t> clientId { 0 }, trackPosition { 0 };
 
     juce::StreamingSocket socket;

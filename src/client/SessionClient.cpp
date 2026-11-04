@@ -180,7 +180,10 @@ private:
 };
 
 //==============================================================================
-// Raw Winsock UDP socket: drains the outgoing queue and feeds mix packets into the jitter buffer.
+// Raw Winsock UDP socket, two threads: this one blocks in recvfrom (no timeout) and feeds mix packets into the
+// jitter buffer; a nested send thread sleeps on the client's wake event and drains the outgoing queue the moment the
+// audio thread pushes a packet, so a packet never waits for a receive to finish or time out. Both ask MMCSS for
+// "Pro Audio" (best effort). Shutdown closes the socket from the destructor, which ends the blocking recvfrom.
 class SessionClient::UdpThread : public juce::Thread
 {
 public:
@@ -192,6 +195,7 @@ public:
     ~UdpThread() override
     {
         signalThreadShouldExit();
+        closeSocket();
         stopThread (3000);
     }
 
@@ -202,8 +206,6 @@ public:
 
         if (WSAStartup (MAKEWORD (2, 2), &wsaData) != 0)
             return;
-
-        sockaddr_in server {};
 
         if (! resolve (server))
         {
@@ -219,13 +221,19 @@ public:
             return;
         }
 
+        socketHandle.store (sock);
+
+        if (threadShouldExit())   // the destructor may already have run closeSocket() before the handle was published
+        {
+            closeSocket();
+            WSACleanup();
+            return;
+        }
+
         // Do not turn ICMP port-unreachable into recvfrom errors.
         BOOL disable = FALSE;
         DWORD bytesReturned = 0;
         WSAIoctl (sock, SIO_UDP_CONNRESET, &disable, sizeof (disable), nullptr, 0, &bytesReturned, nullptr, nullptr);
-
-        const DWORD receiveTimeoutMs = 2;
-        setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, (const char*) &receiveTimeoutMs, sizeof (receiveTimeoutMs));
 
         const int bufferBytes = 256 * 1024;
         setsockopt (sock, SOL_SOCKET, SO_RCVBUF, (const char*) &bufferBytes, sizeof (bufferBytes));
@@ -238,7 +246,7 @@ public:
 
         if (::bind (sock, (const sockaddr*) &local, sizeof (local)) != 0)
         {
-            closesocket (sock);
+            closeSocket();
             WSACleanup();
             return;
         }
@@ -246,42 +254,114 @@ public:
         DWORD taskIndex = 0;
         HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);   // best effort
 
-        std::vector<uint8_t> toSend (maxPacketBytes), incoming (maxPacketBytes);
-
-        while (! threadShouldExit())
         {
-            size_t len = 0;
+            SendThread sender (*this);
+            sender.startThread (juce::Thread::Priority::highest);
 
-            while (owner.outgoing.pop (toSend.data(), len))
-                sendto (sock, (const char*) toSend.data(), (int) len, 0, (const sockaddr*) &server, sizeof (server));
+            std::vector<uint8_t> incoming (maxPacketBytes);
 
-            sockaddr_in from {};
-            int fromLen = sizeof (from);
-            const int n = recvfrom (sock, (char*) incoming.data(), (int) incoming.size(), 0, (sockaddr*) &from, &fromLen);
+            while (! threadShouldExit())
+            {
+                sockaddr_in from {};
+                int fromLen = sizeof (from);
+                const int n = recvfrom (sock, (char*) incoming.data(), (int) incoming.size(), 0, (sockaddr*) &from, &fromLen);
 
-            if (n <= 0)
-                continue;   // timeout or transient error; loop back to drain the queue
+                if (n < 0)
+                {
+                    if (threadShouldExit())   // the socket was closed under us
+                        break;
 
-            AudioPacketView view;
+                    if (WSAGetLastError() != WSAEMSGSIZE)
+                        juce::Thread::sleep (1);   // transient error: keep receiving without spinning
 
-            if (! decodeAudioPacket (incoming.data(), (size_t) n, view) || (view.flags & AudioFlags::mix) == 0)
-                continue;
+                    continue;
+                }
 
-            const auto arrival = juce::Time::getMillisecondCounterHiRes();
-            owner.trackPosition.store (view.trackPosition, std::memory_order_relaxed);
-            owner.buffer->push (view.seq, view.voice, view.voiceLen, arrival);
+                if (n == 0)
+                    continue;
+
+                AudioPacketView view;
+
+                if (! decodeAudioPacket (incoming.data(), (size_t) n, view) || (view.flags & AudioFlags::mix) == 0)
+                    continue;
+
+                const auto arrival = juce::Time::getMillisecondCounterHiRes();
+                owner.trackPosition.store (view.trackPosition, std::memory_order_relaxed);
+                owner.buffer->push (view.seq, view.voice, view.voiceLen, arrival);
+            }
+
+            // ~SendThread: signals, wakes and joins the sender before the socket goes away.
         }
 
         if (mmcss != nullptr)
             AvRevertMmThreadCharacteristics (mmcss);
 
-        closesocket (sock);
+        closeSocket();
         WSACleanup();
        #endif
     }
 
 private:
    #if JUCE_WINDOWS
+    class SendThread : public juce::Thread
+    {
+    public:
+        explicit SendThread (UdpThread& u) : juce::Thread ("EnsayoUdpSend"), udp (u) {}
+
+        ~SendThread() override
+        {
+            signalThreadShouldExit();
+            SetEvent ((HANDLE) udp.owner.sendWake);
+            stopThread (3000);
+        }
+
+        void run() override
+        {
+            DWORD taskIndex = 0;
+            HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);   // best effort
+
+            std::vector<uint8_t> toSend (maxPacketBytes);
+            const HANDLE wake = (HANDLE) udp.owner.sendWake;
+
+            while (! threadShouldExit())
+            {
+                size_t len = 0;
+
+                while (udp.owner.outgoing.pop (toSend.data(), len))
+                {
+                    const SOCKET sock = udp.socketHandle.load();
+
+                    if (sock == INVALID_SOCKET)
+                        break;
+
+                    sendto (sock, (const char*) toSend.data(), (int) len, 0, (const sockaddr*) &udp.server, sizeof (udp.server));
+                }
+
+                // Auto-reset event: a push that lands between the drain and this wait leaves it signalled, so nothing is
+                // missed. The timeout only guards against a lost wake-up.
+                if (wake != nullptr)
+                    WaitForSingleObject (wake, 100);
+                else
+                    juce::Thread::sleep (1);
+            }
+
+            if (mmcss != nullptr)
+                AvRevertMmThreadCharacteristics (mmcss);
+        }
+
+    private:
+        UdpThread& udp;
+    };
+
+    // Any thread; idempotent. Closing from the destructor is what unblocks the receive loop's recvfrom.
+    void closeSocket()
+    {
+        const SOCKET sock = socketHandle.exchange (INVALID_SOCKET);
+
+        if (sock != INVALID_SOCKET)
+            closesocket (sock);
+    }
+
     bool resolve (sockaddr_in& out)
     {
         addrinfo hints {};
@@ -297,6 +377,9 @@ private:
         freeaddrinfo (result);
         return true;
     }
+
+    std::atomic<SOCKET> socketHandle { INVALID_SOCKET };
+    sockaddr_in server {};   // written before the send thread starts, read-only afterwards
    #endif
 
     SessionClient& owner;
@@ -579,11 +662,19 @@ SessionClient::SessionClient()
       outgoing (64),
       generation (std::make_shared<std::atomic<int>> (0))
 {
+   #if JUCE_WINDOWS
+    sendWake = CreateEventW (nullptr, FALSE, FALSE, nullptr);   // auto-reset, initially clear
+   #endif
 }
 
 SessionClient::~SessionClient()
 {
     leave();
+
+   #if JUCE_WINDOWS
+    if (sendWake != nullptr)
+        CloseHandle ((HANDLE) std::exchange (sendWake, nullptr));
+   #endif
 }
 
 void SessionClient::create (const juce::String& host, int port, const juce::String& name, Role role)
@@ -715,9 +806,17 @@ const SessionState& SessionClient::getState() const noexcept
 }
 
 //==============================================================================
+// Audio thread. SetEvent is the one kernel call the callback makes: it never blocks (it only flips the event and
+// readies the waiting send thread), so the packet leaves right away instead of waiting for the UDP thread's loop.
 void SessionClient::sendAudio (const uint8_t* packet, size_t len) noexcept
 {
-    outgoing.push (packet, len);
+    if (! outgoing.push (packet, len))
+        return;
+
+   #if JUCE_WINDOWS
+    if (sendWake != nullptr)
+        SetEvent ((HANDLE) sendWake);
+   #endif
 }
 
 JitterBuffer& SessionClient::receiveBuffer() noexcept
