@@ -49,6 +49,8 @@ set(ENSAYO_CORE_SOURCES
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
+    src/server/ServerHost.cpp
+    src/server/HighResClock.cpp
 )
 set(ENSAYO_UI_SOURCES
     # T9
@@ -69,6 +71,7 @@ set(ENSAYO_TEST_SOURCES
     tests/BackingTrackTests.cpp
     tests/MixServerTests.cpp
     # T5-tests
+    tests/ServerHostTests.cpp
     # T6-tests
     # T7-tests
     # T8-tests
