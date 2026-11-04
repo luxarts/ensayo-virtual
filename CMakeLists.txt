@@ -41,6 +41,10 @@ set(ENSAYO_CORE_SOURCES
     src/core/JitterBuffer.cpp
     # T4
     # T6
+    src/client/PluginSlot.cpp
+    src/client/FakeAudioDevice.cpp
+    src/client/AudioEngine.cpp
+    src/client/Settings.cpp
     # T7
     # T8
     # T10
@@ -64,6 +68,10 @@ set(ENSAYO_TEST_SOURCES
     # T4-tests
     # T5-tests
     # T6-tests
+    tests/PluginSlotTests.cpp
+    tests/FakeAudioDeviceTests.cpp
+    tests/AudioEngineTests.cpp
+    tests/SettingsTests.cpp
     # T7-tests
     # T8-tests
     # T10-tests
