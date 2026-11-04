@@ -53,7 +53,6 @@ set(ENSAYO_CORE_SOURCES
     src/client/YouTubeImporter.cpp
     # T8
     src/client/HeadlessClient.cpp
-    # T10
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
@@ -65,6 +64,8 @@ set(ENSAYO_UI_SOURCES
     src/ui/LobbyView.cpp
     src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
+    # T10
+    src/ui/Screenshot.cpp
 )
 set(ENSAYO_TEST_SOURCES
     tests/TestMain.cpp
@@ -77,8 +78,6 @@ set(ENSAYO_TEST_SOURCES
     tests/JitterBufferTests.cpp
     tests/SpscQueueTests.cpp
     # T4-tests
-    tests/BackingTrackTests.cpp
-    tests/MixServerTests.cpp
     tests/BackingTrackTests.cpp
     tests/MixServerTests.cpp
     # T5-tests
@@ -96,6 +95,7 @@ set(ENSAYO_TEST_SOURCES
     tests/HeadlessClientTests.cpp
     tests/UiTests.cpp
     # T10-tests
+    tests/ScreenshotTests.cpp
 )
 
 set(ENSAYO_MODULES
