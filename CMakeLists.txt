@@ -61,6 +61,9 @@ set(ENSAYO_SERVER_SOURCES
 )
 set(ENSAYO_UI_SOURCES
     # T9
+    src/ui/LobbyView.cpp
+    src/ui/SessionView.cpp
+    src/ui/MainComponent.cpp
 )
 set(ENSAYO_TEST_SOURCES
     tests/TestMain.cpp
@@ -89,6 +92,7 @@ set(ENSAYO_TEST_SOURCES
     tests/SessionClientTests.cpp
     tests/YouTubeImporterTests.cpp
     # T8-tests
+    tests/UiTests.cpp
     # T10-tests
 )
 
@@ -108,6 +112,7 @@ juce_add_gui_app(EnsayoVirtual PRODUCT_NAME "Ensayo Virtual" COMPANY_NAME "Ensay
 target_sources(EnsayoVirtual PRIVATE src/Main.cpp ${ENSAYO_UI_SOURCES} ${ENSAYO_SERVER_SOURCES} ${ENSAYO_CORE_SOURCES})
 target_include_directories(EnsayoVirtual PRIVATE src)
 target_compile_definitions(EnsayoVirtual PRIVATE ${ENSAYO_DEFINITIONS})
+target_compile_options(EnsayoVirtual PRIVATE /utf-8)
 target_link_libraries(EnsayoVirtual PRIVATE ${ENSAYO_MODULES} Opus::opus ${ENSAYO_SYSTEM_LIBS}
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_lto_flags juce::juce_recommended_warning_flags)
 
@@ -122,5 +127,6 @@ juce_add_console_app(EnsayoTests PRODUCT_NAME "EnsayoTests")
 target_sources(EnsayoTests PRIVATE ${ENSAYO_TEST_SOURCES} ${ENSAYO_UI_SOURCES} ${ENSAYO_SERVER_SOURCES} ${ENSAYO_CORE_SOURCES})
 target_include_directories(EnsayoTests PRIVATE src)
 target_compile_definitions(EnsayoTests PRIVATE ${ENSAYO_DEFINITIONS} ENSAYO_TESTS=1)
+target_compile_options(EnsayoTests PRIVATE /utf-8)
 target_link_libraries(EnsayoTests PRIVATE ${ENSAYO_MODULES} Opus::opus ${ENSAYO_SYSTEM_LIBS}
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
