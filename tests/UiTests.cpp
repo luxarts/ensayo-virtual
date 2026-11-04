@@ -138,6 +138,12 @@ public:
             auto& session = main.getSession();
             expect (session.getState().sessionId == "DEMO42");
             expect (findByName (main, "session.link")->getName() == "session.link");
+
+            // Descargar validates the URL before anything is launched.
+            session.onDownload ("https://example.com/watch?v=abc");
+            expect (statusText (main).contains ("URL de YouTube no v"), "status: " + statusText (main));
+            session.onDownload ("");
+            expect (statusText (main).contains ("URL de YouTube primero"), "status: " + statusText (main));
         }
 
         beginTest ("a second Crear sesion while the first join is pending tears the first attempt down");

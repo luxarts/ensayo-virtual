@@ -959,6 +959,12 @@ void MainComponent::downloadTrack (const juce::String& url)
         return;
     }
 
+    if (! YouTubeImporter::looksLikeYouTubeUrl (url))
+    {
+        setStatus (ES ("URL de YouTube no válida"), true, false);
+        return;
+    }
+
     const auto ytDlp = YouTubeImporter::findYtDlp (settings.ytDlpPath);
 
     if (ytDlp == juce::File())
