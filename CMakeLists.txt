@@ -40,6 +40,8 @@ set(ENSAYO_CORE_SOURCES
     src/core/OpusCodec.cpp
     src/core/JitterBuffer.cpp
     # T4
+    src/server/BackingTrack.cpp
+    src/server/MixServer.cpp
     # T6
     # T7
     # T8
@@ -62,6 +64,10 @@ set(ENSAYO_TEST_SOURCES
     tests/JitterBufferTests.cpp
     tests/SpscQueueTests.cpp
     # T4-tests
+    tests/BackingTrackTests.cpp
+    tests/MixServerTests.cpp
+    tests/BackingTrackTests.cpp
+    tests/MixServerTests.cpp
     # T5-tests
     # T6-tests
     # T7-tests
