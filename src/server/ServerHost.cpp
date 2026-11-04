@@ -1137,6 +1137,11 @@ void ServerHost::sendMix (Session& session, uint32_t clientId, const uint8_t* da
         return;
 
     const auto address = unpackAddress (packed);
+
+    // Accepted v1 trade-off (spec section 3.4): the tick runs on the host's audio callback in the embedded server and
+    // the mix leaves through sendto() right here, i.e. a syscall on the audio thread. On a bound UDP socket with a large
+    // SO_SNDBUF the call never blocks (datagrams are dropped, not queued, when the buffer is full), and it saves one
+    // thread hop (~one scheduler quantum of jitter) per block. Moving it behind an SPSC queue is the v2 option.
     sendto ((SOCKET) udpSocket, (const char*) data, (int) len, 0, (const sockaddr*) &address, sizeof (address));
 }
 }
