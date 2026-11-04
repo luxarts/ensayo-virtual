@@ -46,6 +46,9 @@ set(ENSAYO_CORE_SOURCES
     src/client/AudioEngine.cpp
     src/client/Settings.cpp
     # T7
+    src/client/SessionLink.cpp
+    src/client/SessionClient.cpp
+    src/client/YouTubeImporter.cpp
     # T8
     # T10
 )
@@ -73,6 +76,9 @@ set(ENSAYO_TEST_SOURCES
     tests/AudioEngineTests.cpp
     tests/SettingsTests.cpp
     # T7-tests
+    tests/SessionLinkTests.cpp
+    tests/SessionClientTests.cpp
+    tests/YouTubeImporterTests.cpp
     # T8-tests
     # T10-tests
 )
