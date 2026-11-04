@@ -57,6 +57,10 @@ cmake --build build --config Debug --target EnsayoTests -- /m
 mide la latencia ida con clicks (emitidos en A, detectados en la salida de B), prueba el servidor
 embebido, la subida y reproducción del backing track, la pérdida de paquetes simulada, y genera
 capturas de la UI (`tests/integration/out/<run>/shots/`) verificando que cada control exista.
+`asio-loopback.ps1` usa hardware real: abre el driver ASIO (`-Driver`, por defecto el MiniFuse) en
+una instancia cuyas salidas LOOPBACK vuelven a sus entradas y mide la ida y vuelta completa
+(cliente falso → servidor → ASIO salida → loopback → ASIO entrada → servidor → cliente falso); se
+salta (SKIP) si el driver no está instalado.
 
 ## Usar
 
@@ -109,7 +113,8 @@ de quien lo hace.
 "Ensayo Virtual.exe" --screenshot <dir>                 lobby.png, session.png y controls.json; sale
 "Ensayo Virtual.exe" --headless --host|--join <link> [--name N --role R --fake-audio click|sine|silence
                      --block 64|128|256 --emit-log a.csv --probe b.csv --compare a.csv --track f.wav --play
-                     --simulate-loss N --duration S --stats s.jsonl]
+                     --simulate-loss N --duration S --stats s.jsonl
+                     --asio "<driver>" --mic N --inst N --out P --mute-monitor]   # driver real en vez del falso
 EnsayoServer.exe [--port N] [--udp-port N] [--frame 64|128] [--log]
 ```
 

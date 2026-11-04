@@ -92,8 +92,51 @@ Resultado: **145 resultados unitarios, 0 fallos** (3 corridas) y la suite de int
 La mediana bajó de ≈ 22–25 ms a ≈ 13–15 ms gracias al envío UDP inmediato (antes esperaba el
 timeout de 2 ms del `recvfrom`) y al registro de sesiones sin contención con el tick.
 
+## Hardware real: Arturia MiniFuse 2 (driver "MiniFuse ASIO Driver")
+
+La máquina tiene seis drivers ASIO registrados (Helix, HX Stomp, ASIO4ALL, FL Studio, MiniFuse,
+X-AIR); el MiniFuse 2 está conectado y es el que se usó. Para probarlo sin UI se agregó al cliente
+headless `--asio "<driver>" --mic N --inst N --out P --mute-monitor` (abre el driver real en vez
+del dispositivo falso e imprime canales, tamaños de bloque, frecuencias y latencias del driver) y
+el script `tests/integration/asio-loopback.ps1`, que aprovecha las salidas LOOPBACK del MiniFuse
+(salidas 2/3 reaparecen como entradas 2/3):
+
+```
+B (falso, emite clicks) → servidor → A (MiniFuse salida 2/3) → loopback → A (entrada 2/3) → servidor → B (detecta)
+```
+
+Resultados (Release, 48 kHz):
+
+| Bloque | Driver: latencia in / out | Ida y vuelta completa (2 saltos + hardware) | Callbacks | Underruns |
+|---|---|---|---|---|
+| 128 | 200 / 264 muestras (4.2 / 5.5 ms) | mediana 37.5–37.7 ms, p95 58.7, n 39/39 | 5272 en 14 s (= 48000/128) | 0 |
+| 64 | 136 / 168 muestras (2.8 / 3.5 ms) | mediana 29.2 ms, p95 30.8, n 39/39 | 10544 en 14 s | 0 |
+| 256 | 328 / 408 muestras | (sólo apertura) | OK | 0 |
+
+El driver acepta 8…2048 muestras y 44.1…192 kHz; abre al tamaño pedido (64/128/256) sin pasar
+por su panel. Restando la ida medida en loopback con dispositivos falsos (≈ 14–17 ms), el tramo
+por hardware (salida + loopback + entrada + un salto más de red) suma ≈ 20 ms a 128 y ≈ 14 ms a
+64, consistente con las latencias que el driver declara (9.7 ms y 6.3 ms) más el jitter buffer.
+
+Hallazgos corregidos: (1) con la salida del driver realimentada a su entrada, el monitoreo local
+se realimentaba a sí mismo (pico de salida 2.0, señal continua, ningún click detectable) → el
+headless mute el monitor con `--mute-monitor`; (2) en la primera apertura el driver arrancó una
+vez a 32 muestras (su valor de panel) antes de arrancar a 128, y el motor dejó guardado el error
+"bloques de 64, 128 o 256" del arranque fallido aunque el segundo fuera válido → un arranque
+soportado limpia el error pendiente (`AudioEngine::audioDeviceAboutToStart`).
+
+GUI real (`Ensayo Virtual.exe` sin argumentos, `settings.json` con el MiniFuse, captura con
+PrintWindow en `tests/integration/out/asio-gui/lobby-minifuse.png`): el lobby lista el driver,
+muestra "1: MIC/LINE/INST 1", "2: MIC/LINE/INST 2", "Output Left + Output Right", "Latencia ASIO:
+4.2 ms entrada / 5.5 ms salida" y la barra "Audio: MiniFuse ASIO Driver @ 48000 Hz, 128 muestras".
+
+Suite completa tras estos cambios: **146 resultados unitarios, 0 fallos**; integración
+two-instances 17.14 ms, embedded-host 15.25 ms, backing-track PASS, packet-loss 14.14 ms,
+screenshots PASS, asio-loopback 37.67 ms (todas PASS).
+
 ## Pendiente de verificar con hardware
 
-Con una interfaz ASIO real: apertura del driver, canales, Panel ASIO, VST3 sobre el instrumento
-(editor, bypass, estado guardado), monitoreo propio sin latencia, y una sesión real entre dos
-máquinas (puerto 22140 abierto) midiendo ping y latencia estimada en la barra de estado.
+Con señal real por las entradas: Panel ASIO del driver, VST3 sobre el instrumento (editor,
+bypass, estado guardado), monitoreo propio sin latencia escuchado en la salida, y una sesión
+real entre dos máquinas (puerto 22140 abierto) midiendo ping y latencia estimada en la barra de
+estado.

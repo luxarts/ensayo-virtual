@@ -4,7 +4,7 @@ param ([string] $BuildDir = 'build', [string] $Config = 'Release')
 
 $ErrorActionPreference = 'Stop'
 
-$scripts = @('two-instances', 'embedded-host', 'backing-track', 'packet-loss', 'screenshots')
+$scripts = @('two-instances', 'embedded-host', 'backing-track', 'packet-loss', 'screenshots', 'asio-loopback')
 $results = @()
 $anyFailed = $false
 

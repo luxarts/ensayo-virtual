@@ -54,6 +54,16 @@ sobre Jamulus está en (a) monitoreo local propio sin latencia, (b) backing trac
 el servidor, (c) timer del servidor con deadlines absolutos de alta resolución y (d) servidor
 embebido en el cliente que crea la sesión, manejado por el reloj ASIO del host.
 
+Caso de dos personas (el uso habitual): como el servidor va embebido en el cliente que crea la
+sesión, no hay salto de red extra respecto de P2P. El audio del invitado viaja directo a la
+máquina del host (se mezcla en proceso y sale por su placa) y el del host sale directo al
+invitado: un salto de red por sentido, igual que P2P. Lo único que agrega el servidor es su
+jitter buffer (2–4 bloques), que P2P no evita porque el receptor necesita uno igual. P2P sólo
+gana con 3+ participantes (los invitados entre sí pasan hoy por el host), y a cambio exige
+ICE/STUN para atravesar routers domésticos y un relay TURN —otro servidor en el medio— cuando
+el NAT no se deja perforar (CGNAT). Para dos personas no aporta latencia; lo que la define es el
+RTT de internet entre ambos y quién hostea (el host tiene 0 ms de red para su propio audio).
+
 ### 2.3 Decisiones
 
 | Tema | Elegido | Alternativa descartada | Por qué |

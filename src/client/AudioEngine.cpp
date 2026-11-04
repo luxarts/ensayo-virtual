@@ -160,8 +160,17 @@ void AudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         supported = false;
 
     if (! supported)
+    {
         audioDeviceError ("El dispositivo debe correr a 48000 Hz con bloques de 64, 128 o 256 muestras (actual: "
                           + juce::String (rate, 0) + " Hz, " + juce::String (blockSize) + ")");
+    }
+    else
+    {
+        // Some ASIO drivers (MiniFuse) first start at their own panel size and only then at the requested one; a
+        // start we can run supersedes the complaint about the one we could not.
+        const juce::ScopedLock sl (errorLock);
+        lastError.clear();
+    }
 
     const auto& mode = size == FrameSize::f64 ? mode64 : mode128;
     frameLength = frameSamples (size);

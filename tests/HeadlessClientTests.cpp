@@ -133,6 +133,30 @@ public:
             rejects ({ "--name", "Solo" }, "neither host nor join");
             rejects ({ "--host", "--play" }, "play without track");
             rejects ({ "--host", "--bogus" }, "unknown argument");
+            rejects ({ "--host", "--asio" }, "asio without driver name");
+            rejects ({ "--host", "--mic", "64" }, "mic channel out of range");
+            rejects ({ "--host", "--out", "-1" }, "negative output pair");
+        }
+
+        beginTest ("parseHeadlessOptions: real ASIO device options");
+        {
+            juce::String error;
+            const auto o = parseHeadlessOptions ({ "--host", "--asio", "MiniFuse ASIO Driver", "--out", "1", "--mic", "2",
+                                                  "--inst", "3", "--mute-monitor" }, error);
+            expect (o.has_value(), error);
+
+            if (o)
+            {
+                expectEquals (o->asioDevice, juce::String ("MiniFuse ASIO Driver"));
+                expectEquals (o->outputPair, 1);
+                expectEquals (o->micChannel, 2);
+                expectEquals (o->instrumentChannel, 3);
+                expect (o->muteMonitor);
+            }
+
+            const auto d = parseHeadlessOptions ({ "--host" }, error);
+            expect (d.has_value() && d->asioDevice.isEmpty() && d->micChannel == 0 && d->instrumentChannel == 1
+                    && d->outputPair == 0 && ! d->muteMonitor);
         }
     }
 

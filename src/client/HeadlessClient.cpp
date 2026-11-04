@@ -197,6 +197,31 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
                 return std::nullopt;
             }
         }
+        else if (arg == "--asio")
+        {
+            if (! needValue ("--asio")) return std::nullopt;
+            o.asioDevice = value;
+        }
+        else if (arg == "--mute-monitor")
+        {
+            o.muteMonitor = true;
+        }
+        else if (arg == "--mic" || arg == "--inst" || arg == "--out")
+        {
+            const auto name = arg.toRawUTF8();
+            if (! needValue (name)) return std::nullopt;
+            int channel = 0;
+
+            if (! parseInt (value, channel) || channel < 0 || channel > 63)
+            {
+                error = arg + " must be 0..63";
+                return std::nullopt;
+            }
+
+            if (arg == "--mic")       o.micChannel = channel;
+            else if (arg == "--inst") o.instrumentChannel = channel;
+            else                      o.outputPair = channel;
+        }
         else if (arg == "--probe")
         {
             if (! needValue ("--probe")) return std::nullopt;
@@ -466,32 +491,80 @@ int runHeadless (const HeadlessOptions& o)
     SessionClient& client = g.client;
 
     engine.setRole (o.role);
-    engine.setChannels (0, 1, 0);
+    engine.setChannels (o.micChannel, o.instrumentChannel, o.outputPair);
     engine.setSimulatedLossPercent (o.lossPercent);
 
     // The probe listens to the device output; local monitoring would put our own input clicks there too.
-    if (o.probeLog != juce::File())
+    if (o.probeLog != juce::File() || o.muteMonitor)
         engine.setMonitor (ChannelGain { 0.0f, 0.0f, true });
 
     if (host != nullptr)
         engine.setFrameHook ([&] { host->tick(); });
 
-    engine.useFakeDevice (o.blockSize, o.signal);
+    FakeAudioDevice* fake = nullptr;
 
-    if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
-        return fail ("fake audio device: " + deviceError);
+    if (o.asioDevice.isNotEmpty())
+    {
+        if (! engine.getAsioDeviceNames().contains (o.asioDevice))
+            return fail ("ASIO driver not found: " + o.asioDevice + " (available: " + engine.getAsioDeviceNames().joinIntoString (", ") + ")");
 
-    auto* fake = engine.getFakeDevice();
+        if (const auto openError = engine.openDevice ("ASIO", o.asioDevice, (double) sampleRate, o.blockSize); openError.isNotEmpty())
+            return fail ("ASIO device: " + openError);
 
-    if (fake == nullptr)
-        return fail ("fake audio device not available");
+        auto* device = engine.getDevice();
+
+        if (device == nullptr)
+            return fail ("ASIO device did not open");
+
+        const auto inputs = device->getInputChannelNames();
+        const auto outputs = device->getOutputChannelNames();
+        juce::StringArray sizes, rates;
+
+        for (const auto size : device->getAvailableBufferSizes())
+            sizes.add (juce::String (size));
+
+        for (const auto rate : device->getAvailableSampleRates())
+            rates.add (juce::String (rate, 0));
+
+        headlessPrint ("device " + device->getName()
+                       + " rate " + juce::String (device->getCurrentSampleRate(), 0)
+                       + " block " + juce::String (device->getCurrentBufferSizeSamples())
+                       + " inputs " + juce::String (inputs.size())
+                       + " outputs " + juce::String (outputs.size())
+                       + " latencyIn " + juce::String (device->getInputLatencyInSamples())
+                       + " latencyOut " + juce::String (device->getOutputLatencyInSamples()));
+        headlessPrint ("blocks " + sizes.joinIntoString (" "));
+        headlessPrint ("rates " + rates.joinIntoString (" "));
+
+        for (int i = 0; i < inputs.size(); ++i)
+            headlessPrint ("input " + juce::String (i) + " " + inputs[i]);
+
+        for (int i = 0; i < outputs.size(); ++i)
+            headlessPrint ("output " + juce::String (i) + " " + outputs[i]);
+
+        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
+            return fail ("ASIO device: " + deviceError);
+    }
+    else
+    {
+        engine.useFakeDevice (o.blockSize, o.signal);
+
+        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
+            return fail ("fake audio device: " + deviceError);
+
+        fake = engine.getFakeDevice();
+
+        if (fake == nullptr)
+            return fail ("fake audio device not available");
+    }
 
     emitted.setFile (o.emitLog);
     detected.setFile (o.probeLog);
 
-    fake->onClickEmitted = [&] (ClickEvent e) { emitted.add (e); };
+    if (fake != nullptr)
+        fake->onClickEmitted = [&] (ClickEvent e) { emitted.add (e); };
 
-    if (o.probeLog != juce::File())
+    if (fake != nullptr && o.probeLog != juce::File())
     {
         probe.onClickDetected = [&] (ClickEvent e) { detected.add (e); };
         fake->onOutputBlock = [&] (const float* L, const float* R, int n, int64_t first, double qpcMs)
@@ -610,6 +683,7 @@ int runHeadless (const HeadlessOptions& o)
 
         const auto& s = client.getState();
         const auto stats = client.receiveBuffer().getStats();
+        const auto peaks = engine.takePeaks();
         const double t = (juce::Time::getMillisecondCounterHiRes() - sessionStartMs) / 1000.0;
 
         juce::String line;
@@ -621,6 +695,10 @@ int runHeadless (const HeadlessOptions& o)
              << ",\"participants\":" << (int) s.participants.size()
              << ",\"trackPlaying\":" << jsonBool (s.transport.playing)
              << ",\"trackPosition\":" << (juce::int64) client.getTrackPosition()
+             << ",\"peakVoice\":" << juce::String (peaks.voice, 3)
+             << ",\"peakInstrument\":" << juce::String (peaks.instrument, 3)
+             << ",\"peakReceived\":" << juce::String (peaks.received, 3)
+             << ",\"peakOutput\":" << juce::String (peaks.output, 3)
              << "}\n";
         o.statsLog.appendText (line);
     };
@@ -647,6 +725,14 @@ int runHeadless (const HeadlessOptions& o)
 
     emitted.flush();
     detected.flush();
+
+    if (o.asioDevice.isNotEmpty())
+    {
+        headlessPrint ("callbacks " + juce::String ((juce::int64) engine.getCallbackCount()));
+
+        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
+            return fail ("ASIO device: " + deviceError);
+    }
 
     if (o.compareLog != juce::File())
     {
