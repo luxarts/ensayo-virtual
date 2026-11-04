@@ -51,6 +51,15 @@ public:
             expect (! parseSessionLink ("http://1.2.3.4:22140/ABCDEF").has_value(), "other scheme accepted");
         }
 
+        beginTest ("rejects IPv6 hosts (the UDP path is IPv4 only)");
+        {
+            expect (! parseSessionLink ("ensayo://[::1]:22140/ABCDEF").has_value(), "[::1] accepted");
+            expect (! parseSessionLink ("[::1]:22140/ABCDEF").has_value(), "[::1] without scheme accepted");
+            expect (! parseSessionLink ("ensayo://[2001:db8::1]:22140/ABCDEF").has_value(), "[2001:db8::1] accepted");
+            expect (! parseSessionLink ("ensayo://::1:22140/ABCDEF").has_value(), "bare ::1 accepted");
+            expect (parseSessionLink ("ensayo://host-name_1.example.com:22140/ABCDEF").has_value(), "plain host name rejected");
+        }
+
         beginTest ("toString round trip");
         {
             SessionLink link;
