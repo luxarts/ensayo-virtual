@@ -81,6 +81,7 @@ public:
             expectEquals (engine.getDevice()->getTypeName(), juce::String ("Fake"));
             expectEquals (engine.getDevice()->getCurrentBufferSizeSamples(), 128);
             expect (engine.getFrameSize() == FrameSize::f128);
+            expect (engine.matchesFrameSize (FrameSize::f128) && ! engine.matchesFrameSize (FrameSize::f64));
             expectEquals (engine.getDeviceManager().getCurrentAudioDeviceType(), juce::String ("Fake"));
             expectEquals (engine.takeDeviceError(), juce::String());
 

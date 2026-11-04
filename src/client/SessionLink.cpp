@@ -12,13 +12,15 @@ namespace
         return id.length() == 6 && id.containsOnly ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
     }
 
+    // Host names and IPv4 literals only: the UDP resolver is AF_INET, so an IPv6 literal ("[::1]") would join over
+    // TCP and then never receive audio.
     bool isValidHost (const juce::String& host)
     {
         if (host.isEmpty() || host.length() > 253)
             return false;
 
         for (const auto c : host)
-            if (! (juce::CharacterFunctions::isLetterOrDigit (c) || c == '.' || c == '-' || c == '_' || c == ':' || c == '[' || c == ']'))
+            if (! (juce::CharacterFunctions::isLetterOrDigit (c) || c == '.' || c == '-' || c == '_'))
                 return false;
 
         return true;

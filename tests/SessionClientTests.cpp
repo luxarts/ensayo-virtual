@@ -67,6 +67,28 @@ public:
         return file;
     }
 
+    static juce::File writeBigFile (int bytes)
+    {
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("EnsayoVirtual").getChildFile ("tests");
+        dir.createDirectory();
+        const auto file = dir.getChildFile ("session-client-upload-big.bin");
+        file.deleteFile();
+
+        juce::FileOutputStream out (file);
+        std::vector<char> block (65536);
+
+        for (int written = 0; out.openedOk() && written < bytes; written += (int) block.size())
+        {
+            for (size_t i = 0; i < block.size(); ++i)
+                block[i] = (char) ((i * 31 + (size_t) written) & 0xff);
+
+            out.write (block.data(), block.size());
+        }
+
+        return file;
+    }
+
     void runTest() override
     {
         beginTest ("Sha1 known vectors");
@@ -173,6 +195,34 @@ public:
         a.sendTransport ("play");
         expect (waitFor ([&] { return a.getState().transport.playing && b.getState().transport.playing; }, 5000),
                 "transport.playing not set");
+
+        beginTest ("sendGain returns at once while an upload is on the wire");
+        {
+            const auto big = writeBigFile (8 * 1024 * 1024);
+            expect (big.existsAsFile());
+
+            server.setUploadReadDelayMs (5);   // 128 reads of 64 KB: the upload stays on the wire for >= 0.6 s
+
+            a.uploadTrack (big);
+            expect (waitFor ([&] { return a.getState().trackUploadStatus.startsWith ("Subiendo"); }, 20000),
+                    "upload never started: " + a.getState().trackUploadStatus);
+            expect (server.getUploadedBytes() != (int) big.getSize(), "upload already finished before sendGain was called");
+
+            const auto t0 = juce::Time::getMillisecondCounterHiRes();
+            a.sendGain (2, ChannelGain { -3.0f, 0.0f, false });
+            const auto sendMs = juce::Time::getMillisecondCounterHiRes() - t0;
+            expect (sendMs < 50.0, "sendGain blocked for " + juce::String (sendMs, 1) + " ms during an upload");
+
+            const bool bigLoaded = waitFor ([&] { return a.getState().transport.name == big.getFileName()
+                                                        && a.getState().trackUploadStatus == "Listo"; }, 60000);
+            expect (bigLoaded, "big upload did not complete: " + aError + " / " + a.getState().trackUploadStatus);
+            expectEquals ((juce::int64) server.getUploadedBytes(), big.getSize());
+            expectEquals (server.getLastUploadSha1(), Sha1::hexOfFile (big));
+            expect (a.getState().trackUploadProgress >= 1.0f, "upload progress did not reach 1");
+
+            server.setUploadReadDelayMs (0);
+            big.deleteFile();
+        }
 
         beginTest ("audio round trip primes the receive buffer");
         {

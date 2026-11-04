@@ -274,8 +274,9 @@ bool YouTubeImporter::looksLikeYouTubeUrl (const juce::String& input)
 
 juce::StringArray YouTubeImporter::buildCommand (const juce::File& ytDlp, const juce::String& url, const juce::File& outDir)
 {
+    // "--" ends option parsing, so a URL that starts with '-' can never be taken for a yt-dlp option.
     return { ytDlp.getFullPathName(), "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-playlist",
-             "-o", outDir.getChildFile ("%(title)s.%(ext)s").getFullPathName(), url.trim() };
+             "-o", outDir.getChildFile ("%(title)s.%(ext)s").getFullPathName(), "--", url.trim() };
 }
 
 std::optional<float> YouTubeImporter::parseProgressLine (const juce::String& line)
@@ -303,6 +304,19 @@ void YouTubeImporter::start (const juce::File& ytDlp, const juce::String& url, c
 {
     cancel();
     const int myGeneration = ++(*generation);
+
+    // Only YouTube URLs reach yt-dlp; anything else is reported the same way a failed download is (asynchronously).
+    if (! looksLikeYouTubeUrl (url))
+    {
+        juce::MessageManager::callAsync ([this, gen = generation, my = myGeneration]
+        {
+            if (gen->load() == my && onError != nullptr)
+                onError ("URL de YouTube no valida");
+        });
+
+        return;
+    }
+
     worker = std::make_unique<Worker> (*this, generation, myGeneration, ytDlp, url, outDir);
     worker->startThread();
 }

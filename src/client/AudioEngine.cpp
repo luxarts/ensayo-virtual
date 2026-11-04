@@ -137,6 +137,7 @@ EnginePeaks AudioEngine::takePeaks() noexcept
 
 uint32_t AudioEngine::getCallbackCount() const noexcept    { return callbackCount.load (std::memory_order_relaxed); }
 FrameSize AudioEngine::getFrameSize() const noexcept       { return frameSize.load(); }
+bool AudioEngine::matchesFrameSize (FrameSize fs) const noexcept { return frameSize.load() == fs; }
 
 juce::String AudioEngine::takeDeviceError()
 {

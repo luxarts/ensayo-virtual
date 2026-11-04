@@ -50,6 +50,7 @@ public:
     EnginePeaks takePeaks() noexcept;
     uint32_t getCallbackCount() const noexcept;
     FrameSize getFrameSize() const noexcept;               // from the device block size (256 → f128 ×2)
+    bool matchesFrameSize (FrameSize) const noexcept;      // true when the device-derived frame size equals the session's
     juce::String takeDeviceError();
 private:
     void audioDeviceIOCallbackWithContext (const float* const*, int, float* const*, int, int, const juce::AudioIODeviceCallbackContext&) override;

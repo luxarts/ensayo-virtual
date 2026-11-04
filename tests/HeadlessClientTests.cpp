@@ -211,6 +211,33 @@ public:
             stats.deleteFile();
         }
 
+        // The probe and the click logs are fed from the device thread until the device is closed: the run has to shut
+        // down with both hooks installed (and with the device still open on the way out) without touching freed locals.
+        beginTest ("runHeadless --host with click, probe and emit log shuts down cleanly");
+        {
+            juce::String error;
+            const auto emitLog = tempDir().getChildFile ("smoke-emit.csv");
+            const auto probeLog = tempDir().getChildFile ("smoke-probe.csv");
+            emitLog.deleteFile();
+            probeLog.deleteFile();
+
+            const auto o = parseHeadlessOptions (juce::StringArray { "--host", "--port", juce::String (smokePort), "--duration", "1.1",
+                                                                     "--fake-audio", "click", "--emit-log", emitLog.getFullPathName(),
+                                                                     "--probe", probeLog.getFullPathName() }, error);
+            expect (o.has_value(), error);
+
+            if (o)
+            {
+                expectEquals (runHeadless (*o), 0);
+                expect (emitLog.existsAsFile(), "emit log not written");
+                expect (readClickLog (emitLog).size() >= 3, "fewer than 3 clicks logged in 1.1 s");
+                expect (probeLog.existsAsFile(), "probe log not written");
+            }
+
+            emitLog.deleteFile();
+            probeLog.deleteFile();
+        }
+
         beginTest ("runHeadless --join to a dead server fails cleanly");
         {
             juce::String error;

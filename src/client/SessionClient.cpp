@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 
 namespace ensayo
 {
@@ -21,6 +22,7 @@ namespace
     constexpr int connectTimeoutMs = 5000;
     constexpr size_t maxLineBytes = 64 * 1024;
     constexpr int uploadChunkBytes = 64 * 1024;
+    constexpr size_t maxQueuedUploadChunks = 8;    // back-pressure on the upload thread: 512 KB ahead of the wire
 
     constexpr int writeStallTimeoutMs = 10000;
 
@@ -29,7 +31,7 @@ namespace
     // try-lock on the socket's read lock, which the control thread holds almost permanently inside its own
     // waitUntilReady (true, 100) loop, so a writer waiting that way fails as soon as the send buffer is full
     // (and, when it does win the lock, makes the reader's wait fail instead). A short sleep is enough: the
-    // kernel drains the send buffer independently of this thread.
+    // kernel drains the send buffer independently of this thread. Gives up after writeStallTimeoutMs without progress.
     bool writeAll (juce::StreamingSocket& socket, const void* data, int len, const juce::Thread* thread = nullptr)
     {
         const auto* bytes = static_cast<const char*> (data);
@@ -178,7 +180,10 @@ private:
 };
 
 //==============================================================================
-// Raw Winsock UDP socket: drains the outgoing queue and feeds mix packets into the jitter buffer.
+// Raw Winsock UDP socket, two threads: this one blocks in recvfrom (no timeout) and feeds mix packets into the
+// jitter buffer; a nested send thread sleeps on the client's wake event and drains the outgoing queue the moment the
+// audio thread pushes a packet, so a packet never waits for a receive to finish or time out. Both ask MMCSS for
+// "Pro Audio" (best effort). Shutdown closes the socket from the destructor, which ends the blocking recvfrom.
 class SessionClient::UdpThread : public juce::Thread
 {
 public:
@@ -190,6 +195,7 @@ public:
     ~UdpThread() override
     {
         signalThreadShouldExit();
+        closeSocket();
         stopThread (3000);
     }
 
@@ -200,8 +206,6 @@ public:
 
         if (WSAStartup (MAKEWORD (2, 2), &wsaData) != 0)
             return;
-
-        sockaddr_in server {};
 
         if (! resolve (server))
         {
@@ -217,13 +221,19 @@ public:
             return;
         }
 
+        socketHandle.store (sock);
+
+        if (threadShouldExit())   // the destructor may already have run closeSocket() before the handle was published
+        {
+            closeSocket();
+            WSACleanup();
+            return;
+        }
+
         // Do not turn ICMP port-unreachable into recvfrom errors.
         BOOL disable = FALSE;
         DWORD bytesReturned = 0;
         WSAIoctl (sock, SIO_UDP_CONNRESET, &disable, sizeof (disable), nullptr, 0, &bytesReturned, nullptr, nullptr);
-
-        const DWORD receiveTimeoutMs = 2;
-        setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, (const char*) &receiveTimeoutMs, sizeof (receiveTimeoutMs));
 
         const int bufferBytes = 256 * 1024;
         setsockopt (sock, SOL_SOCKET, SO_RCVBUF, (const char*) &bufferBytes, sizeof (bufferBytes));
@@ -236,7 +246,7 @@ public:
 
         if (::bind (sock, (const sockaddr*) &local, sizeof (local)) != 0)
         {
-            closesocket (sock);
+            closeSocket();
             WSACleanup();
             return;
         }
@@ -244,42 +254,114 @@ public:
         DWORD taskIndex = 0;
         HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);   // best effort
 
-        std::vector<uint8_t> toSend (maxPacketBytes), incoming (maxPacketBytes);
-
-        while (! threadShouldExit())
         {
-            size_t len = 0;
+            SendThread sender (*this);
+            sender.startThread (juce::Thread::Priority::highest);
 
-            while (owner.outgoing.pop (toSend.data(), len))
-                sendto (sock, (const char*) toSend.data(), (int) len, 0, (const sockaddr*) &server, sizeof (server));
+            std::vector<uint8_t> incoming (maxPacketBytes);
 
-            sockaddr_in from {};
-            int fromLen = sizeof (from);
-            const int n = recvfrom (sock, (char*) incoming.data(), (int) incoming.size(), 0, (sockaddr*) &from, &fromLen);
+            while (! threadShouldExit())
+            {
+                sockaddr_in from {};
+                int fromLen = sizeof (from);
+                const int n = recvfrom (sock, (char*) incoming.data(), (int) incoming.size(), 0, (sockaddr*) &from, &fromLen);
 
-            if (n <= 0)
-                continue;   // timeout or transient error; loop back to drain the queue
+                if (n < 0)
+                {
+                    if (threadShouldExit())   // the socket was closed under us
+                        break;
 
-            AudioPacketView view;
+                    if (WSAGetLastError() != WSAEMSGSIZE)
+                        juce::Thread::sleep (1);   // transient error: keep receiving without spinning
 
-            if (! decodeAudioPacket (incoming.data(), (size_t) n, view) || (view.flags & AudioFlags::mix) == 0)
-                continue;
+                    continue;
+                }
 
-            const auto arrival = juce::Time::getMillisecondCounterHiRes();
-            owner.trackPosition.store (view.trackPosition, std::memory_order_relaxed);
-            owner.buffer->push (view.seq, view.voice, view.voiceLen, arrival);
+                if (n == 0)
+                    continue;
+
+                AudioPacketView view;
+
+                if (! decodeAudioPacket (incoming.data(), (size_t) n, view) || (view.flags & AudioFlags::mix) == 0)
+                    continue;
+
+                const auto arrival = juce::Time::getMillisecondCounterHiRes();
+                owner.trackPosition.store (view.trackPosition, std::memory_order_relaxed);
+                owner.buffer->push (view.seq, view.voice, view.voiceLen, arrival);
+            }
+
+            // ~SendThread: signals, wakes and joins the sender before the socket goes away.
         }
 
         if (mmcss != nullptr)
             AvRevertMmThreadCharacteristics (mmcss);
 
-        closesocket (sock);
+        closeSocket();
         WSACleanup();
        #endif
     }
 
 private:
    #if JUCE_WINDOWS
+    class SendThread : public juce::Thread
+    {
+    public:
+        explicit SendThread (UdpThread& u) : juce::Thread ("EnsayoUdpSend"), udp (u) {}
+
+        ~SendThread() override
+        {
+            signalThreadShouldExit();
+            SetEvent ((HANDLE) udp.owner.sendWake);
+            stopThread (3000);
+        }
+
+        void run() override
+        {
+            DWORD taskIndex = 0;
+            HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);   // best effort
+
+            std::vector<uint8_t> toSend (maxPacketBytes);
+            const HANDLE wake = (HANDLE) udp.owner.sendWake;
+
+            while (! threadShouldExit())
+            {
+                size_t len = 0;
+
+                while (udp.owner.outgoing.pop (toSend.data(), len))
+                {
+                    const SOCKET sock = udp.socketHandle.load();
+
+                    if (sock == INVALID_SOCKET)
+                        break;
+
+                    sendto (sock, (const char*) toSend.data(), (int) len, 0, (const sockaddr*) &udp.server, sizeof (udp.server));
+                }
+
+                // Auto-reset event: a push that lands between the drain and this wait leaves it signalled, so nothing is
+                // missed. The timeout only guards against a lost wake-up.
+                if (wake != nullptr)
+                    WaitForSingleObject (wake, 100);
+                else
+                    juce::Thread::sleep (1);
+            }
+
+            if (mmcss != nullptr)
+                AvRevertMmThreadCharacteristics (mmcss);
+        }
+
+    private:
+        UdpThread& udp;
+    };
+
+    // Any thread; idempotent. Closing from the destructor is what unblocks the receive loop's recvfrom.
+    void closeSocket()
+    {
+        const SOCKET sock = socketHandle.exchange (INVALID_SOCKET);
+
+        if (sock != INVALID_SOCKET)
+            closesocket (sock);
+    }
+
     bool resolve (sockaddr_in& out)
     {
         addrinfo hints {};
@@ -295,6 +377,9 @@ private:
         freeaddrinfo (result);
         return true;
     }
+
+    std::atomic<SOCKET> socketHandle { INVALID_SOCKET };
+    sockaddr_in server {};   // written before the send thread starts, read-only afterwards
    #endif
 
     SessionClient& owner;
@@ -303,7 +388,181 @@ private:
 };
 
 //==============================================================================
-// Streams one file through the control socket: the track_upload_begin line followed by the raw bytes.
+// The only thread that writes to the control socket, so no caller ever waits on the kernel's send buffer: control
+// lines (gain, transport, ping, hello) are queued by sendLine and written in order; an upload is queued chunk by
+// chunk by the upload thread with back-pressure. A control line jumps ahead of an upload that has not yet started,
+// but once the track_upload_begin header is on the wire the server reads exactly `size` raw bytes after it, so
+// nothing may be interleaved until the last chunk is out: lines queued meanwhile follow the upload.
+class SessionClient::WriterThread : public juce::Thread
+{
+public:
+    struct Chunk
+    {
+        std::vector<char> bytes;
+        bool header = false, last = false;
+        juce::int64 done = 0, total = 0;   // bytes of the file on the wire after this chunk, and the file size
+    };
+
+    explicit WriterThread (SessionClient& o) : juce::Thread ("EnsayoWriter"), owner (o) {}
+
+    ~WriterThread() override
+    {
+        signalThreadShouldExit();
+        work.signal();
+        space.signal();
+        stopThread (3000);
+    }
+
+    // Any thread. Returns at once.
+    void enqueueLine (const juce::String& line)
+    {
+        const auto* text = line.toRawUTF8();
+        std::vector<char> bytes (text, text + std::strlen (text));
+
+        {
+            const juce::ScopedLock sl (lock);
+            control.push_back (std::move (bytes));
+        }
+
+        work.signal();
+    }
+
+    // Upload thread. Blocks while maxQueuedUploadChunks are waiting; false when the caller or the writer is going
+    // away or an earlier chunk of this upload failed (the failure has already been reported).
+    bool enqueueChunk (Chunk chunk, const juce::Thread& caller)
+    {
+        for (;;)
+        {
+            if (caller.threadShouldExit() || threadShouldExit() || uploadFailed.load())
+                return false;
+
+            {
+                const juce::ScopedLock sl (lock);
+
+                if (upload.size() < maxQueuedUploadChunks)
+                {
+                    upload.push_back (std::move (chunk));
+                    break;
+                }
+            }
+
+            space.wait (100);
+        }
+
+        work.signal();
+        return true;
+    }
+
+    // Message thread, before a new upload is queued: drops the chunks of the previous one that are still waiting.
+    void discardUpload()
+    {
+        const juce::ScopedLock sl (lock);
+        upload.clear();
+        uploadFailed.store (false);
+        space.signal();
+    }
+
+    bool isUploadOnTheWire() const noexcept { return uploadOnTheWire.load(); }
+
+    void run() override
+    {
+        int lastPercent = -1;
+
+        while (! threadShouldExit())
+        {
+            std::vector<char> line;
+            Chunk chunk;
+            bool haveLine = false, haveChunk = false;
+
+            {
+                const juce::ScopedLock sl (lock);
+
+                if (! uploadOnTheWire.load() && ! control.empty())
+                {
+                    line = std::move (control.front());
+                    control.pop_front();
+                    haveLine = true;
+                }
+                else if (! upload.empty())
+                {
+                    chunk = std::move (upload.front());
+                    upload.pop_front();
+                    haveChunk = true;
+
+                    if (chunk.header)
+                    {
+                        uploadOnTheWire.store (true);
+                        lastPercent = -1;
+                    }
+                }
+            }
+
+            if (haveLine)
+            {
+                writeAll (owner.socket, line.data(), (int) line.size(), this);   // a dead socket is reported by the reader
+                continue;
+            }
+
+            if (haveChunk)
+            {
+                space.signal();
+
+                if (! writeAll (owner.socket, chunk.bytes.data(), (int) chunk.bytes.size(), this))
+                {
+                    failUpload();
+                    continue;
+                }
+
+                if (chunk.last)
+                {
+                    uploadOnTheWire.store (false);
+                    owner.postUploadStatus ("Esperando al servidor" + utf8 ("\xe2\x80\xa6"), 1.0f);
+                }
+                else if (! chunk.header && chunk.total > 0)
+                {
+                    const int percent = (int) (chunk.done * 100 / chunk.total);
+
+                    if (percent != lastPercent)
+                    {
+                        lastPercent = percent;
+                        owner.postUploadStatus ("Subiendo " + juce::String (percent) + " %", (float) chunk.done / (float) chunk.total);
+                    }
+                }
+
+                continue;
+            }
+
+            // Nothing to write (or an upload on the wire is waiting for the upload thread to read the next chunk).
+            work.wait (100);
+        }
+    }
+
+private:
+    void failUpload()
+    {
+        {
+            const juce::ScopedLock sl (lock);
+            upload.clear();
+            uploadFailed.store (true);
+            uploadOnTheWire.store (false);
+        }
+
+        space.signal();
+
+        if (! threadShouldExit())
+            owner.postUploadError ("No se pudo enviar el archivo");
+    }
+
+    SessionClient& owner;
+    juce::CriticalSection lock;
+    std::deque<std::vector<char>> control;
+    std::deque<Chunk> upload;
+    juce::WaitableEvent work, space;
+    std::atomic<bool> uploadOnTheWire { false }, uploadFailed { false };
+};
+
+//==============================================================================
+// Reads one file and feeds it to the writer: the track_upload_begin line followed by the raw bytes in 64 KB chunks.
 class SessionClient::UploadThread : public juce::Thread
 {
 public:
@@ -324,16 +583,16 @@ public:
 
         if (! file.existsAsFile() || size <= 0)
         {
-            fail ("No se puede leer el archivo " + file.getFullPathName());
+            owner.postUploadError ("No se puede leer el archivo " + file.getFullPathName());
             return;
         }
 
-        status ("Calculando checksum" + utf8 ("\xe2\x80\xa6"), 0.0f);
+        owner.postUploadStatus ("Calculando checksum" + utf8 ("\xe2\x80\xa6"), 0.0f);
         const auto sha1 = Sha1::hexOfFile (file);
 
         if (sha1.isEmpty())
         {
-            fail ("No se puede leer el archivo " + file.getFullPathName());
+            owner.postUploadError ("No se puede leer el archivo " + file.getFullPathName());
             return;
         }
 
@@ -341,89 +600,58 @@ public:
 
         if (! in.openedOk())
         {
-            fail ("No se puede leer el archivo " + file.getFullPathName());
+            owner.postUploadError ("No se puede leer el archivo " + file.getFullPathName());
             return;
         }
+
+        auto* writer = owner.writer.get();   // outlives this thread: stopThreads destroys the upload first
+
+        if (writer == nullptr)
+            return;
 
         auto begin = makeMessage ("track_upload_begin");
         begin.getDynamicObject()->setProperty ("name", file.getFileName());
         begin.getDynamicObject()->setProperty ("size", (juce::int64) size);
         begin.getDynamicObject()->setProperty ("sha1", sha1);
 
-        status ("Subiendo 0 %", 0.0f);
+        owner.postUploadStatus ("Subiendo 0 %", 0.0f);
 
-        // The header line and the raw bytes must not be interleaved with pings, so the socket is
-        // held for the whole upload; the control thread keeps reading replies meanwhile.
-        const juce::ScopedLock lock (owner.writeLock);
+        WriterThread::Chunk header;
+        const auto headerLine = makeLine (begin);
+        const auto* headerBytes = headerLine.toRawUTF8();
+        header.bytes.assign (headerBytes, headerBytes + std::strlen (headerBytes));
+        header.header = true;
+        header.total = size;
 
-        const auto header = makeLine (begin);
-        const auto* headerBytes = header.toRawUTF8();
-
-        if (! writeAll (owner.socket, headerBytes, (int) std::strlen (headerBytes), this))
-        {
-            fail ("No se pudo enviar el archivo");
+        if (! writer->enqueueChunk (std::move (header), *this))
             return;
-        }
 
-        std::vector<char> chunk ((size_t) uploadChunkBytes);
         juce::int64 sent = 0;
-        int lastPercent = -1;
 
         while (sent < size && ! threadShouldExit())
         {
-            const int n = in.read (chunk.data(), (int) juce::jmin ((juce::int64) chunk.size(), size - sent));
+            WriterThread::Chunk chunk;
+            chunk.bytes.resize ((size_t) juce::jmin ((juce::int64) uploadChunkBytes, size - sent));
+            const int n = in.read (chunk.bytes.data(), (int) chunk.bytes.size());
 
             if (n <= 0)
             {
-                fail ("No se pudo leer el archivo durante la subida");
+                owner.postUploadError ("No se pudo leer el archivo durante la subida");
                 return;
             }
 
-            if (! writeAll (owner.socket, chunk.data(), n, this))
-            {
-                fail ("No se pudo enviar el archivo");
-                return;
-            }
-
+            chunk.bytes.resize ((size_t) n);
             sent += n;
-            const int percent = (int) (sent * 100 / size);
+            chunk.done = sent;
+            chunk.total = size;
+            chunk.last = sent >= size;
 
-            if (percent != lastPercent)
-            {
-                lastPercent = percent;
-                status ("Subiendo " + juce::String (percent) + " %", (float) sent / (float) size);
-            }
+            if (! writer->enqueueChunk (std::move (chunk), *this))
+                return;
         }
-
-        if (! threadShouldExit())
-            status ("Esperando al servidor" + utf8 ("\xe2\x80\xa6"), 1.0f);
     }
 
 private:
-    // The lambdas capture the client, not this thread: the client may delete the thread before they run.
-    void status (const juce::String& text, float progress)
-    {
-        owner.post ([client = &owner, text, progress]
-        {
-            client->state.trackUploadStatus = text;
-            client->state.trackUploadProgress = progress;
-            client->notifyStateChanged();
-        });
-    }
-
-    void fail (const juce::String& message)
-    {
-        owner.post ([client = &owner, message]
-        {
-            client->state.trackUploadStatus = message;
-            client->state.trackUploadProgress = 0.0f;
-            client->notifyStateChanged();
-
-            if (client->onError != nullptr)
-                client->onError (message);
-        });
-    }
-
     SessionClient& owner;
     const juce::File file;
 };
@@ -434,11 +662,19 @@ SessionClient::SessionClient()
       outgoing (64),
       generation (std::make_shared<std::atomic<int>> (0))
 {
+   #if JUCE_WINDOWS
+    sendWake = CreateEventW (nullptr, FALSE, FALSE, nullptr);   // auto-reset, initially clear
+   #endif
 }
 
 SessionClient::~SessionClient()
 {
     leave();
+
+   #if JUCE_WINDOWS
+    if (sendWake != nullptr)
+        CloseHandle ((HANDLE) std::exchange (sendWake, nullptr));
+   #endif
 }
 
 void SessionClient::create (const juce::String& host, int port, const juce::String& name, Role role)
@@ -471,13 +707,15 @@ void SessionClient::connect (const juce::String& host, int port, const juce::var
     trackPosition.store (0);
     buffer->reset();
 
+    writer = std::make_unique<WriterThread> (*this);
+    writer->startThread();
     control = std::make_unique<ControlThread> (*this, host, port, hello);
     control->startThread();
 }
 
 void SessionClient::stopThreads()
 {
-    upload = nullptr;
+    upload = nullptr;   // first: it blocks on the writer's back-pressure
 
     if (control != nullptr)
     {
@@ -491,6 +729,7 @@ void SessionClient::stopThreads()
         socket.close();
     }
 
+    writer = nullptr;   // the closed socket ends any write in progress
     udp = nullptr;
 }
 
@@ -549,6 +788,10 @@ void SessionClient::uploadTrack (const juce::File& file)
     }
 
     upload = nullptr;
+
+    if (writer != nullptr)
+        writer->discardUpload();
+
     state.trackUploadStatus = "Preparando" + utf8 ("\xe2\x80\xa6");
     state.trackUploadProgress = 0.0f;
     notifyStateChanged();
@@ -563,9 +806,17 @@ const SessionState& SessionClient::getState() const noexcept
 }
 
 //==============================================================================
+// Audio thread. SetEvent is the one kernel call the callback makes: it never blocks (it only flips the event and
+// readies the waiting send thread), so the packet leaves right away instead of waiting for the UDP thread's loop.
 void SessionClient::sendAudio (const uint8_t* packet, size_t len) noexcept
 {
-    outgoing.push (packet, len);
+    if (! outgoing.push (packet, len))
+        return;
+
+   #if JUCE_WINDOWS
+    if (sendWake != nullptr)
+        SetEvent ((HANDLE) sendWake);
+   #endif
 }
 
 JitterBuffer& SessionClient::receiveBuffer() noexcept
@@ -586,23 +837,42 @@ uint32_t SessionClient::getTrackPosition() const noexcept
 //==============================================================================
 void SessionClient::sendLine (const juce::var& message)
 {
-    const auto line = makeLine (message);
-    const auto* bytes = line.toRawUTF8();
-    const juce::ScopedLock lock (writeLock);
-    writeAll (socket, bytes, (int) std::strlen (bytes));
+    if (writer != nullptr)
+        writer->enqueueLine (makeLine (message));
 }
 
+// Pings carry a timestamp, so one queued behind a long upload would report the upload time as the round trip.
 bool SessionClient::trySendLine (const juce::var& message)
 {
-    const auto line = makeLine (message);
-    const auto* bytes = line.toRawUTF8();
-    const juce::ScopedTryLock lock (writeLock);
-
-    if (! lock.isLocked())
+    if (writer == nullptr || writer->isUploadOnTheWire())
         return false;
 
-    writeAll (socket, bytes, (int) std::strlen (bytes));
+    writer->enqueueLine (makeLine (message));
     return true;
+}
+
+// The lambdas capture the client, not the calling thread: the client may delete that thread before they run.
+void SessionClient::postUploadStatus (const juce::String& text, float progress)
+{
+    post ([client = this, text, progress]
+    {
+        client->state.trackUploadStatus = text;
+        client->state.trackUploadProgress = progress;
+        client->notifyStateChanged();
+    });
+}
+
+void SessionClient::postUploadError (const juce::String& message)
+{
+    post ([client = this, message]
+    {
+        client->state.trackUploadStatus = message;
+        client->state.trackUploadProgress = 0.0f;
+        client->notifyStateChanged();
+
+        if (client->onError != nullptr)
+            client->onError (message);
+    });
 }
 
 void SessionClient::post (std::function<void()> fn)
