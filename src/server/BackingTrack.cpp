@@ -87,8 +87,8 @@ void BackingTrack::swapIn (std::shared_ptr<const Audio> newAudio)
         position.store (0);
         length.store (newAudio != nullptr ? (int64_t) newAudio->buffer.getNumSamples() : 0);
         loaded.store (newAudio != nullptr);
-        old = std::move (audio);
-        audio = std::move (newAudio);
+        current.store (newAudio.get(), std::memory_order_release);
+        old = audio.exchange (std::move (newAudio));
     }
     // `old` is released here, outside the lock.
 }
@@ -128,16 +128,17 @@ void BackingTrack::setLoop (bool shouldLoop) noexcept
 
 TransportState BackingTrack::getState() const noexcept
 {
+    // Lock-free: never contend with render()'s try-lock.
     TransportState state;
-    const juce::SpinLock::ScopedLockType scoped (lock);
+    const auto snapshot = audio.load (std::memory_order_acquire);
     state.loaded = loaded.load();
     state.playing = playing.load();
     state.loop = loop.load();
     state.position = position.load();
     state.length = length.load();
 
-    if (audio != nullptr)
-        state.name = audio->name;
+    if (snapshot != nullptr)
+        state.name = snapshot->name;
 
     return state;
 }
@@ -152,12 +153,12 @@ void BackingTrack::render (float* L, float* R, int numSamples) noexcept
     if (! scoped.isLocked())
         return;
 
-    const Audio* current = audio.get();
+    const Audio* source = current.load (std::memory_order_acquire);
 
-    if (current == nullptr)
+    if (source == nullptr)
         return;
 
-    const int total = current->buffer.getNumSamples();
+    const int total = source->buffer.getNumSamples();
     int64_t pos = position.load (std::memory_order_relaxed);
     int written = 0;
 
@@ -178,8 +179,8 @@ void BackingTrack::render (float* L, float* R, int numSamples) noexcept
         }
 
         const int chunk = (int) std::min<int64_t> (numSamples - written, total - pos);
-        juce::FloatVectorOperations::add (L + written, current->buffer.getReadPointer (0, (int) pos), chunk);
-        juce::FloatVectorOperations::add (R + written, current->buffer.getReadPointer (1, (int) pos), chunk);
+        juce::FloatVectorOperations::add (L + written, source->buffer.getReadPointer (0, (int) pos), chunk);
+        juce::FloatVectorOperations::add (R + written, source->buffer.getReadPointer (1, (int) pos), chunk);
         pos += chunk;
         written += chunk;
     }
