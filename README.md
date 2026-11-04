@@ -97,13 +97,16 @@ esquema `ensayo://` en el primer arranque; si ya está abierta, se une en la mis
 
 ### YouTube
 
-La app no incluye ningún descargador. Para usar la URL de un video hace falta tener instalados
-[`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (más [`deno`](https://deno.com) y
-[`ffmpeg`](https://ffmpeg.org), que yt-dlp necesita) en el `PATH`, junto al ejecutable, o en la ruta
-configurada en `settings.json` (`ytDlpPath`). La descarga se hace en tu máquina con
-`yt-dlp -x --audio-format mp3 --audio-quality 0 --no-playlist <url>` y el MP3 resultante se sube al
-servidor. Descargar contenido de YouTube puede ir contra sus términos de uso: es responsabilidad
-de quien lo hace.
+No hay nada que instalar: el zip de la app trae en `tools\` los dos programas que hacen falta,
+[`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp) y [`deno.exe`](https://deno.com) (el runtime de
+JavaScript que yt-dlp necesita para YouTube desde fines de 2025). No hace falta ffmpeg: el audio
+se baja tal cual (`m4a`/AAC) con
+`yt-dlp -f "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/bestaudio" --no-playlist --js-runtimes deno:<tools\deno.exe> <url>`
+y el servidor lo decodifica con Media Foundation (nativo de Windows). La app busca `yt-dlp.exe`
+en la ruta configurada en `settings.json` (`ytDlpPath`), en `tools\`, junto al ejecutable y en el
+`PATH`, en ese orden; `deno.exe` junto a yt-dlp, en `tools\` o en el `PATH`. Si compilás vos, bajá
+los binarios con `.\tools\fetch-tools.ps1`. Descargar contenido de YouTube puede ir contra sus
+términos de uso: es responsabilidad de quien lo hace.
 
 ## Modos de línea de comandos
 
@@ -133,7 +136,8 @@ servidor quedan en `%TEMP%\EnsayoVirtual\`.
 | `Sin audio del servidor` | No llegan paquetes UDP: revisar firewall/puerto 22140 UDP en el host. |
 | Nadie puede unirse desde afuera | Abrir el puerto 22140 TCP y UDP en el router del host, o usar `EnsayoServer.exe` en un VPS. |
 | Latencia alta / cortes | Bajar el buffer ASIO a 64 o 128; usar cable, no Wi-Fi; elegir un host cercano. |
-| `yt-dlp` no encontrado | Instalar yt-dlp, deno y ffmpeg y ponerlos en el PATH. |
+| `Falta tools\yt-dlp.exe` | Falta la carpeta `tools` junto al exe (está en el zip del release; o correr `tools\fetch-tools.ps1`). |
+| `yt-dlp falló` con "JS challenge" / pocos formatos | Falta `tools\deno.exe` o yt-dlp está viejo: bajar los dos de nuevo con `tools\fetch-tools.ps1`. |
 
 ## Licencia
 

@@ -1,4 +1,5 @@
 #include "BackingTrack.h"
+#include "MediaFoundationAudioFormat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +9,9 @@ namespace ensayo
 {
 BackingTrack::BackingTrack()
 {
+    // Media Foundation first: it is the only one that decodes AAC (.m4a/.mp4 from YouTube). The basic
+    // formats still cover wav/flac/ogg/mp3 whenever MF declines a file.
+    formats.registerFormat (new MediaFoundationAudioFormat(), false);
     formats.registerBasicFormats();
 }
 

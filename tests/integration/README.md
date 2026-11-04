@@ -20,6 +20,7 @@ failure. Process output, click logs (`*.csv`) and stats (`*.jsonl`) land in `tes
 | `backing-track.ps1` | 22152 | A creates, B probes, C uploads `tests/fixtures/click.wav` and plays it: B detects `>= 8` clicks and its stats show `"trackPlaying":true`. |
 | `packet-loss.ps1`   | 22153 | As two-instances with B `--simulate-loss 10`: B exits 0 and still pairs `n >= 5` clicks.        |
 | `asio-loopback.ps1` | 22154 | Real hardware: A opens `-Driver` (default `MiniFuse ASIO Driver`) with `--out 1 --mic 2 --inst 3` (its LOOPBACK outputs feed inputs 2/3); B (fake) emits clicks and probes them after the full round trip through the driver: driver opens at 48000/`-Block`, A runs the expected callback count with 0 underruns, `n >= 10`, median `< 80 ms`. SKIP when the driver is not in `HKLM\SOFTWARE\ASIO`. |
+| `youtube-track.ps1` | 22155 | Downloads a 19 s public video's audio with `tools\yt-dlp.exe` + `tools\deno.exe` (m4a, no ffmpeg; asserts deno solved the JS challenge), then C uploads it and plays it: B's stats show `trackPlaying:true` and `peakReceived > 0.02`. SKIP when the tools are missing or the download fails. |
 | `screenshots.ps1`   | -     | `--screenshot`: `lobby.png`/`session.png` are 1100x760 and `controls.json` contains every name of `expected-controls.json`, visible with `w,h > 0` (SKIP when the build has no screenshot mode). Then captures the real `--demo` window to `out/screenshots/shots/demo-window.png`. |
 | `run-all.ps1`       | -     | Runs all of the above in separate PowerShell processes and prints a summary table.              |
 

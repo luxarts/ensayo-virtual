@@ -58,6 +58,7 @@ set(ENSAYO_SERVER_SOURCES
     # T5
     src/server/ServerHost.cpp
     src/server/HighResClock.cpp
+    src/server/MediaFoundationAudioFormat.cpp
 )
 set(ENSAYO_UI_SOURCES
     # T9
@@ -79,6 +80,7 @@ set(ENSAYO_TEST_SOURCES
     tests/SpscQueueTests.cpp
     # T4-tests
     tests/BackingTrackTests.cpp
+    tests/MediaFoundationAudioFormatTests.cpp
     tests/MixServerTests.cpp
     # T5-tests
     tests/ServerHostTests.cpp
@@ -108,7 +110,7 @@ set(ENSAYO_DEFINITIONS
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_MP3AUDIOFORMAT=1 JUCE_USE_FLAC=1
     JUCE_USE_OGGVORBIS=1 CUSTOM_MODES=1 JUCE_DISPLAY_SPLASH_SCREEN=0)
 
-set(ENSAYO_SYSTEM_LIBS ws2_32 avrt winmm)
+set(ENSAYO_SYSTEM_LIBS ws2_32 avrt winmm mf mfplat mfreadwrite mfuuid)
 
 juce_add_gui_app(EnsayoVirtual PRODUCT_NAME "Ensayo Virtual" COMPANY_NAME "EnsayoVirtual")
 target_sources(EnsayoVirtual PRIVATE src/Main.cpp ${ENSAYO_UI_SOURCES} ${ENSAYO_SERVER_SOURCES} ${ENSAYO_CORE_SOURCES})

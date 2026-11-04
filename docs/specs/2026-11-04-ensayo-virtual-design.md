@@ -76,8 +76,8 @@ RTT de internet entre ambos y quién hostea (el host tiene 0 ms de red para su p
 | Reloj del servidor | Embebido: lo maneja el callback ASIO del host. Headless: hilo MMCSS "Pro Audio" con `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` y deadlines absolutos (sin deriva). | Servidor manejado por llegada de paquetes | Jamulus usa timer; el servidor dirigido por paquetes elimina el jitter del timer pero vuelve ambiguo el reloj maestro. El reloj ASIO del host es el mejor reloj disponible. |
 | Control | TCP (JUCE `StreamingSocket`) para crear/unirse, lista de participantes, faders, transporte del backing track y subida de archivos. UDP para audio. | Todo por UDP con ACKs propios (Jamulus) | TCP da fiabilidad y orden sin reimplementarlos; la latencia de control no es crítica. |
 | Backing track | El servidor decodifica el archivo y lo inyecta como un canal más en la mezcla de cada cliente, con ganancia por cliente. Transporte (play/pause/seek) centralizado. | (b) Cada cliente reproduce su copia con sincronía de reloj; (c) un cliente lo manda por su entrada | (a) es la única donde todos (incluido quien lo cargó) escuchan el track alineado con la banda; sin sincronía de relojes. (b) deja el track desalineado respecto de los demás; (c) depende de un cliente y pasa por su codec. |
-| YouTube | El cliente que carga pega la URL; la app ejecuta `yt-dlp.exe` instalado por el usuario (con `deno` y `ffmpeg` en el PATH o ruta configurada) con `-x --audio-format mp3`, y sube el MP3 al servidor. Se muestra aviso de términos de uso. | Reproductor IFrame embebido sincronizado por comandos | El IFrame no entra en la mezcla ASIO, su precisión es de cientos de ms y sus términos prohíben uso solo-audio. yt-dlp no se distribuye con la app. |
-| Formatos | WAV, FLAC, OGG, MP3 (`JUCE_USE_MP3AUDIOFORMAT=1`). m4a/webm no; yt-dlp convierte a MP3. | Lector Media Foundation propio | Fuera de alcance. |
+| YouTube | El cliente que carga pega la URL; la app ejecuta `yt-dlp.exe` + `deno.exe` **distribuidos en `tools\`** (revisión 2026-11-04; antes: instalados por el usuario con ffmpeg), baja el AAC original (m4a) sin convertir y lo sube al servidor, que lo decodifica con Media Foundation. Se muestra aviso de términos de uso. | Reproductor IFrame embebido sincronizado por comandos | El IFrame no entra en la mezcla ASIO, su precisión es de cientos de ms y sus términos prohíben uso solo-audio. |
+| Formatos | WAV, FLAC, OGG, MP3 (`JUCE_USE_MP3AUDIOFORMAT=1`) más m4a/mp4/aac por un lector Media Foundation propio (agregado en la revisión del 2026-11-04, ver §3.5). | Convertir todo a MP3 con ffmpeg | Obliga a distribuir ffmpeg (≈ 90 MB) para una remultiplexación que Windows hace nativo. |
 | Link de sesión | `ensayo://host:puerto/ID`. Registro del esquema en `HKCU\Software\Classes\ensayo` al primer arranque; segunda instancia reenviada vía `anotherInstanceStarted`. También campo de texto para pegar. | Solo copiar/pegar | Ambos: el link clickeable es la UX pedida; el campo cubre teléfonos y navegadores que bloquean el handler. |
 | Framework | C++20, JUCE 8.0.17-security (ASIO y VST3 SDK incluidos), CMake, MSVC 2022 | JUCE 9.0.5 | El proyecto de referencia (`discord-share-guitar`) está en JUCE 8; sus `PluginSlot`, `AsioDeviceManager` y patrones se reutilizan sin adaptar a los breaking changes de JUCE 9. |
 | Red en Windows | Winsock crudo: hilo dedicado con `recvfrom` bloqueante, `SIO_UDP_CONNRESET` off, MMCSS "Pro Audio". DSCP vía qWAVE queda como mejora. | JUCE `DatagramSocket` | `DatagramSocket::read` hace `ioctlsocket` + try-lock + `select` por llamada; un `recvfrom` bloqueante despierta al llegar el paquete. |
@@ -220,10 +220,23 @@ el cliente manda los bytes por el mismo socket TCP; el servidor guarda en `%TEMP
 carga y responde `track_ready`. Cualquier participante puede cargar y controlar el transporte.
 El `transport_state` se difunde a todos; la UI muestra nombre, posición y estado.
 
-`YouTubeImporter`: busca `yt-dlp.exe` en la ruta configurada, junto al ejecutable o en el PATH;
-ejecuta `yt-dlp -x --audio-format mp3 --audio-quality 0 -o "<tmp>\%(title)s.%(ext)s" <url>` con
-`ChildProcess`, muestra progreso parseando la salida y, al terminar, dispara la subida. Si falta
-`yt-dlp`, la UI explica cómo instalarlo (yt-dlp + deno + ffmpeg) y recuerda los términos de uso.
+`YouTubeImporter`: busca `yt-dlp.exe` en la ruta configurada, en `<exe>\tools`, junto al
+ejecutable o en el PATH, y `deno.exe` junto a yt-dlp, en `tools` o en el PATH; ejecuta
+`yt-dlp -f "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/bestaudio" --no-playlist --no-update
+-o "<tmp>\%(title)s.%(ext)s" --js-runtimes deno:<deno> -- <url>` con `ChildProcess`, muestra
+progreso parseando la salida y, al terminar, sube el archivo tal cual (m4a). Si falta `yt-dlp`,
+la UI dice que falta `tools\yt-dlp.exe` y recuerda los términos de uso.
+
+Revisión (2026-11-04, tras la primera prueba de uso): la app **distribuye** `yt-dlp.exe` y
+`deno.exe` en `tools\` (licencias Unlicense y MIT) para que el usuario no instale nada, y se
+elimina ffmpeg: en vez de convertir a MP3 se baja el AAC original y el servidor lo decodifica con
+un `juce::AudioFormat` propio sobre **Windows Media Foundation** (`MediaFoundationAudioFormat`,
+lee m4a/mp4/aac, incluido el contenedor DASH fragmentado que yt-dlp escribe sin ffmpeg).
+Alternativas descartadas: (a) reproducir sin descargar — el servidor necesita el audio para
+mezclarlo y sincronizarlo, y "streaming" es la misma extracción en pedazos; (b) un WebView con el
+reproductor de YouTube — suena por la salida de Windows, fuera de la mezcla ASIO y sin sincronía;
+(c) distribuir también `ffmpeg.exe` — otros ≈ 90 MB sólo para remultiplexar; (d) bajar webm/opus
+y escribir un demuxer Matroska — más código para un formato que Media Foundation no decodifica.
 
 ### 3.6 UI (JUCE, en español, una ventana, 1100×760 mínimo)
 

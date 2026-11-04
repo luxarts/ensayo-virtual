@@ -134,6 +134,26 @@ Suite completa tras estos cambios: **146 resultados unitarios, 0 fallos**; integ
 two-instances 17.14 ms, embedded-host 15.25 ms, backing-track PASS, packet-loss 14.14 ms,
 screenshots PASS, asio-loopback 37.67 ms (todas PASS).
 
+## Backing track de YouTube sin instalar nada (revisión del 2026-11-04)
+
+Primera prueba de uso real: "No se encontró yt-dlp.exe". Cambio: la app distribuye `tools\yt-dlp.exe`
+(2026.10.26) y `tools\deno.exe` (2.9.8) y deja de necesitar ffmpeg: baja el AAC original (`m4a`,
+contenedor DASH fragmentado) y el servidor lo decodifica con un `juce::AudioFormat` propio sobre
+Media Foundation (`src/server/MediaFoundationAudioFormat.*`).
+
+- Sonda manual con los binarios: sin `--js-runtimes` yt-dlp avisa "No supported JavaScript runtime"
+  y aun así baja el itag 140; con `--js-runtimes deno:<tools\deno.exe>` (ruta Windows, no MSYS)
+  imprime "[jsc:deno] Solving JS challenges using deno". El `.m4a` resultante no lo abría JUCE
+  (`WindowsMediaAudioFormat` sólo lee mp3/wma/asf) → lector Media Foundation.
+- Unitarias: `MediaFoundationAudioFormat` (WAV de dos senos decodificado con error < 1e-3; el m4a
+  real: 44100 Hz, 2 canales, 840704 muestras = 19.06 s, pico 0.472; `BackingTrack::load` OK) y
+  `YouTubeImporter` (comando sin `-x`, `--js-runtimes` con deno, `findDeno`). **151 resultados, 0 fallos.**
+- Integración `youtube-track.ps1`: descarga real con las herramientas embebidas (302 KB, deno
+  resolvió el desafío JS), C la sube y reproduce, B recibe `trackPlaying:true` en 13/13 segundos y
+  pico de audio 0.471. Suite completa (7 scripts) PASS: two-instances 13.09 ms, embedded-host
+  14.16 ms, packet-loss 13.45 ms, asio-loopback 37.46 ms.
+- Zip 0.1.1: 72 MB (deno 98 MB y yt-dlp 24 MB sin comprimir).
+
 ## Pendiente de verificar con hardware
 
 Con señal real por las entradas: Panel ASIO del driver, VST3 sobre el instrumento (editor,

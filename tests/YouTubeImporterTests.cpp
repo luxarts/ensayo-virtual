@@ -34,14 +34,22 @@ public:
             const juce::File outDir ("C:\\tmp\\ensayo");
             const auto command = YouTubeImporter::buildCommand (ytDlp, "https://youtu.be/abc", outDir);
 
-            const juce::StringArray expected { "C:\\tools\\yt-dlp.exe", "-x", "--audio-format", "mp3",
-                                               "--audio-quality", "0", "--no-playlist", "-o",
+            // No "-x" / "--audio-format": nothing is post-processed, so ffmpeg is never needed.
+            const juce::StringArray expected { "C:\\tools\\yt-dlp.exe", "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/bestaudio",
+                                               "--no-playlist", "--no-update", "-o",
                                                "C:\\tmp\\ensayo\\%(title)s.%(ext)s", "--", "https://youtu.be/abc" };
 
             expectEquals (command.size(), expected.size());
 
             for (int i = 0; i < juce::jmin (command.size(), expected.size()); ++i)
                 expectEquals (command[i], expected[i]);
+
+            // With a bundled deno, yt-dlp is told where it is (it would otherwise only look on the PATH).
+            const auto withDeno = YouTubeImporter::buildCommand (ytDlp, "https://youtu.be/abc", outDir, juce::File ("C:\\tools\\deno.exe"));
+            expectEquals (withDeno.size(), expected.size() + 2);
+            expectEquals (withDeno[withDeno.size() - 4], juce::String ("--js-runtimes"));
+            expectEquals (withDeno[withDeno.size() - 3], juce::String ("deno:C:\\tools\\deno.exe"));
+            expectEquals (withDeno[withDeno.size() - 2], juce::String ("--"));
 
             // The URL always follows "--", so it can never be parsed as an option.
             const auto hostile = YouTubeImporter::buildCommand (ytDlp, "--exec=calc", outDir);
@@ -117,8 +125,8 @@ public:
                    << "echo [youtube] abc: Downloading webpage\r\n"
                    << "echo [download]  50.0%% of 3.00MiB at 1.00MiB/s ETA 00:01\r\n"
                    << "echo [download] 100%% of 3.00MiB\r\n"
-                   << "echo fake mp3 > \"" << outDir.getChildFile ("out.mp3").getFullPathName() << "\"\r\n"
-                   << "echo [ExtractAudio] Destination: out.mp3\r\n";
+                   << "echo fake m4a > \"" << outDir.getChildFile ("out.m4a").getFullPathName() << "\"\r\n"
+                   << "echo [download] Destination: out.m4a\r\n";
             expect (fake.replaceWithText (script));
 
             YouTubeImporter importer;
@@ -141,8 +149,29 @@ public:
             expect (done, "importer never finished");
             expect (error.isEmpty(), "importer failed: " + error);
             expect (maxProgress >= 0.5f, "progress never reached 0.5 (got " + juce::String (maxProgress) + ")");
-            expectEquals (finished.getFileName(), juce::String ("out.mp3"));
+            expectEquals (finished.getFileName(), juce::String ("out.m4a"));
             expect (finished.existsAsFile());
+
+            temp.deleteRecursively();
+        }
+
+        beginTest ("findDeno looks next to yt-dlp first");
+        {
+            const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                  .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("deno-find");
+            temp.deleteRecursively();
+            temp.createDirectory();
+
+            const auto ytDlp = temp.getChildFile ("yt-dlp.exe");
+            const auto deno = temp.getChildFile ("deno.exe");
+            expect (ytDlp.replaceWithText ("x"));
+            expect (deno.replaceWithText ("x"));
+            expect (YouTubeImporter::findDeno (ytDlp) == deno, "deno next to yt-dlp not found");
+
+            deno.deleteFile();
+            const auto fallback = YouTubeImporter::findDeno (ytDlp);
+            expect (fallback == juce::File() || fallback.existsAsFile(), "returned a deno that does not exist");
+            expect (YouTubeImporter::toolsDirectory().getFileName() == "tools");
 
             temp.deleteRecursively();
         }

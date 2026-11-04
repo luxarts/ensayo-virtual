@@ -975,12 +975,12 @@ void MainComponent::downloadTrack (const juce::String& url)
 
     if (ytDlp == juce::File())
     {
-        setStatus (ES ("No se encontró yt-dlp.exe: instalalo (yt-dlp + deno + ffmpeg) junto al programa o en el PATH. Respetá los términos de uso de YouTube."), true, false);
+        setStatus (ES ("Falta tools\\yt-dlp.exe junto al programa (viene en el zip de la app). Respetá los términos de uso de YouTube."), true, false);
         return;
     }
 
     session.setUploadProgress (ES ("Descargando…"), 0.0f);
-    importer.start (ytDlp, url, tempFolder());
+    importer.start (ytDlp, url, tempFolder(), YouTubeImporter::findDeno (ytDlp));
 }
 
 void MainComponent::retry()

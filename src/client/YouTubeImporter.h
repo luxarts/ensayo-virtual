@@ -12,13 +12,21 @@ public:
     YouTubeImporter();
     ~YouTubeImporter();
 
-    static juce::File findYtDlp (const juce::String& configuredPath);   // configured → next to exe → PATH; File() if none
+    // The app ships yt-dlp.exe and deno.exe in <exe dir>\tools so nothing has to be installed.
+    static juce::File toolsDirectory();                                  // <exe dir>\tools
+    static juce::File findYtDlp (const juce::String& configuredPath);   // configured → tools → next to exe → PATH; File() if none
+    static juce::File findDeno (const juce::File& ytDlp);               // next to yt-dlp → tools → next to exe → PATH; File() if none
     static bool looksLikeYouTubeUrl (const juce::String&);
-    static juce::StringArray buildCommand (const juce::File& ytDlp, const juce::String& url, const juce::File& outDir);
-      // {ytdlp, "-x", "--audio-format", "mp3", "--audio-quality", "0", "--no-playlist", "-o", outDir/"%(title)s.%(ext)s", "--", url}
+    // {ytdlp, "-f", audioFormatSelector, "--no-playlist", "--no-update", "-o", outDir/"%(title)s.%(ext)s",
+    //  ["--js-runtimes", "deno:<deno>"], "--", url}. No ffmpeg: the audio is downloaded as it is (m4a/AAC preferred,
+    // decoded server-side by Media Foundation; mp3 as the second choice).
+    static juce::StringArray buildCommand (const juce::File& ytDlp, const juce::String& url, const juce::File& outDir,
+                                           const juce::File& deno = juce::File());
+    static const char* audioFormatSelector() noexcept;   // "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/bestaudio"
     // Background thread; callbacks on the message thread. Progress parsed from "[download]  42.0%".
     // A url for which looksLikeYouTubeUrl is false is refused with onError ("URL de YouTube no valida") and never run.
-    void start (const juce::File& ytDlp, const juce::String& url, const juce::File& outDir);
+    // deno (optional) is handed to yt-dlp with --js-runtimes; without it YouTube may offer fewer formats.
+    void start (const juce::File& ytDlp, const juce::String& url, const juce::File& outDir, const juce::File& deno = juce::File());
     void cancel();
     std::function<void (float)> onProgress; std::function<void (const juce::File&)> onFinished; std::function<void (const juce::String&)> onError;
 

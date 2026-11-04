@@ -4,3 +4,4 @@ build/
 out/
 tests/integration/out/
 tests/fixtures/
+tools/*.exe
