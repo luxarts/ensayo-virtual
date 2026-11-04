@@ -1,4 +1,5 @@
 #include "ui/MainComponent.h"
+#include "FakeControlServer.h"
 #include "MessagePump.h"
 
 namespace ensayo
@@ -162,6 +163,29 @@ public:
             main.getSession().onLeave();
             expect (! main.isInSession());
             expect (lobby.createButton.isEnabled());
+        }
+
+        beginTest ("joining a session with another frame size adjusts the buffer setting and says so");
+        {
+            FakeControlServer server (22190, 22191, FrameSize::f64);
+            expect (server.start(), "could not start the fake server on ports 22190/22191");
+
+            MainComponent main;
+            main.setVisible (true);
+            main.setSize (1100, 760);
+            auto& lobby = main.getLobby();
+            lobby.nameEditor.setText ("Bruno", juce::dontSendNotification);
+            lobby.bufferBox.setSelectedId (2, juce::sendNotificationSync);   // 128 in test mode (no device)
+            expect (lobby.bufferBox.getText() == "128");
+
+            main.joinFromLink ({ "127.0.0.1", 22190, server.getSessionId() });
+            expect (waitFor ([&] { return main.isInSession(); }, 5000), "never joined: " + statusText (main));
+            expect (main.getSession().getState().frameSize == FrameSize::f64);
+            expectEquals (lobby.bufferBox.getText(), juce::String ("64"));
+            expect (statusText (main).contains ("Buffer ajustado a 64"), "status: " + statusText (main));
+
+            main.getSession().onLeave();
+            expect (! main.isInSession());
         }
 
         beginTest ("session view renders from a state alone");

@@ -648,8 +648,15 @@ void MainComponent::wireClient()
     client.onJoined = [this]
     {
         setConnecting (false);
-        engine.setTransport (&client);
         const auto& s = client.getState();
+        juce::String frameNote;
+
+        // Must happen before the transport is attached: a 64-sample client in a 128-sample session would send
+        // packets the server rejects and decode the mix with the wrong frame size (silence, no message).
+        if (! matchSessionFrameSize (s.frameSize, frameNote))
+            return;
+
+        engine.setTransport (&client);
         SessionLink link { host != nullptr ? firstLanAddress() : s.host, s.port, s.sessionId };
         currentLink = link.toString();
         settings.lastLink = currentLink;
@@ -664,7 +671,8 @@ void MainComponent::wireClient()
         session.setState (s);
         sessionStartMs = juce::Time::getMillisecondCounter();
         showSession();
-        setStatus (host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId);
+        setStatus ((host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId)
+                   + (frameNote.isNotEmpty() ? ". " + frameNote : juce::String()));
         queueGain (0, { settings.trackDb, settings.trackDb, settings.trackMuted });
         flushGains (true);
     };
@@ -690,6 +698,70 @@ void MainComponent::setConnecting (bool pending)
     lobby.joinButton.setEnabled (! pending);
 }
 
+FrameSize MainComponent::localFrameSize() const noexcept
+{
+    if (deviceOpen && engine.getDevice() != nullptr)
+        return engine.getFrameSize();
+
+    return settings.bufferSize == 64 ? FrameSize::f64 : FrameSize::f128;
+}
+
+bool MainComponent::matchSessionFrameSize (FrameSize wanted, juce::String& note)
+{
+    if (localFrameSize() == wanted)
+        return true;
+
+    const int samples = frameSamples (wanted);
+    settings.bufferSize = samples;
+    markSettingsDirty();
+    note = "Buffer ajustado a " + juce::String (samples) + ES (" muestras para coincidir con la sesión");
+
+    // Test mode, no device open yet, or the fake device: only the setting changes (used on the next open).
+    if (testMode || ! deviceOpen || engine.getDevice() == nullptr || engine.getFakeDevice() != nullptr)
+    {
+        refreshDeviceCombos();
+        return true;
+    }
+
+    // Same device and rate, new block size. The frame hook is a member of the engine and survives the reopen;
+    // audioDeviceAboutToStart rebuilds the codecs for the new size before the first callback.
+    const auto error = engine.openDevice ("ASIO", settings.deviceName, settings.sampleRate, samples);
+
+    if (error.isNotEmpty())
+    {
+        audioError = true;
+        deviceOpen = false;
+        refreshDeviceCombos();
+        teardownConnection();
+        showLobby();
+        setStatus ("No se pudo ajustar el buffer a " + juce::String (samples) + " muestras: " + error, true, true);
+        return false;
+    }
+
+    deviceOpen = true;
+    audioError = false;
+    refreshDeviceCombos();
+
+    if (auto* device = engine.getDevice())
+    {
+        settings.sampleRate = device->getCurrentSampleRate();
+        settings.bufferSize = device->getCurrentBufferSizeSamples();
+    }
+
+    engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
+
+    if (engine.getFrameSize() != wanted)   // the driver kept its own block size (e.g. fixed at 256 for a 64 session)
+    {
+        teardownConnection();
+        showLobby();
+        setStatus ("El dispositivo no admite bloques de " + juce::String (samples) + ES (" muestras (la sesión usa ")
+                   + juce::String (samples) + ES ("); cambialo en el Panel ASIO"), true, true);
+        return false;
+    }
+
+    return true;
+}
+
 void MainComponent::createSession()
 {
     applyLobbyToSettings();
@@ -706,7 +778,7 @@ void MainComponent::createSession()
 
     ServerConfig config;
     config.tcpPort = config.udpPort = settings.hostPort;
-    config.frameSize = engine.getFrameSize();
+    config.frameSize = localFrameSize();
     host = std::make_unique<ServerHost> (config);
     const auto result = host->start();
 
