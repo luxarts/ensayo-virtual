@@ -13,15 +13,57 @@
 #include "core/Sha1.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
+#include <unordered_map>
 
 namespace ensayo
 {
 namespace
 {
-    constexpr size_t maxLineBytes = 64 * 1024;
+    constexpr size_t maxLineBytes = 8 * 1024;    // longer control lines drop the connection
+    constexpr int maxNestingDepth = 32;          // juce::JSON::parse recurses per level: deeper lines never reach it
     constexpr int64_t maxUploadBytes = 512LL * 1024 * 1024;
     constexpr int64_t endpointSilenceMs = 2000;
+    constexpr size_t maxConnections = 64;        // live TCP connections (joined or not); more are closed on accept
+
+    // Linear scan of the bracket/brace nesting (ignoring characters inside strings). Unbalanced closers are
+    // left to the parser; only the depth matters here.
+    bool nestsDeeperThan (const char* data, size_t len, int maxDepth) noexcept
+    {
+        int depth = 0;
+        bool inString = false, escaped = false;
+
+        for (size_t i = 0; i < len; ++i)
+        {
+            const char c = data[i];
+
+            if (inString)
+            {
+                if (escaped)            escaped = false;
+                else if (c == '\\')     escaped = true;
+                else if (c == '"')      inString = false;
+
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = true;
+            }
+            else if (c == '[' || c == '{')
+            {
+                if (++depth > maxDepth)
+                    return true;
+            }
+            else if (c == ']' || c == '}')
+            {
+                --depth;
+            }
+        }
+
+        return false;
+    }
 
     juce::var errorMessage (const juce::String& text)
     {
@@ -46,14 +88,20 @@ namespace
         return juce::var (array);
     }
 
+    bool isUsableFileName (const juce::String& name) noexcept
+    {
+        return name.isNotEmpty() && name != "." && name != "..";
+    }
+
     juce::String sanitizeFileName (const juce::String& name)
     {
-        auto clean = juce::File::createLegalFileName (name.trim()).replaceCharacters ("/\\", "__");
+        const auto trimmed = name.trim();
 
-        if (clean.isEmpty())
-            clean = "track";
+        if (! isUsableFileName (trimmed))
+            return "track";
 
-        return clean.substring (0, 120);
+        auto clean = juce::File::createLegalFileName (trimmed).replaceCharacters ("/\\", "__").substring (0, 120);
+        return isUsableFileName (clean) ? clean : "track";
     }
 
     uint64_t packAddress (const sockaddr_in& address) noexcept
@@ -92,6 +140,13 @@ struct ServerHost::Session
         sender = [this] (uint32_t clientId, const uint8_t* data, size_t len) { host.sendMix (*this, clientId, data, len); };
     }
 
+    ~Session()
+    {
+        // Uploaded tracks live in a folder named after the session: gone with it.
+        if (isValidSessionId (id))
+            host.config.uploadDirectory.getChildFile (id).deleteRecursively();
+    }
+
     Endpoint* findEndpoint (uint32_t clientId) noexcept
     {
         for (auto& e : endpoints)
@@ -106,15 +161,36 @@ struct ServerHost::Session
     MixServer mix;
     MixServer::Sender sender;
     std::vector<std::shared_ptr<Connection>> connections;
-    std::vector<Endpoint> endpoints;
+    std::vector<Endpoint> endpoints;                // fixed size: slots are stable for the session's lifetime
+    int missedTicks = 0;                            // tick thread only: blocks owed after a MixServer back-off
+};
+
+// Immutable snapshot of the live sessions and the clientId -> audio slot map, rebuilt by control threads under
+// sessionsLock and read lock-free by tick() and the UDP loop. A snapshot keeps its sessions alive while in use.
+struct ServerHost::Registry
+{
+    struct Slot
+    {
+        Session* session;
+        Session::Endpoint* endpoint;
+    };
+
+    std::vector<std::shared_ptr<Session>> sessions;
+    std::unordered_map<uint32_t, Slot> endpoints;
 };
 
 //==============================================================================
 struct ServerHost::Connection : public juce::Thread
 {
+    static constexpr int64_t maxWriteStallMs = 2000;   // a peer that does not drain its socket for this long is dropped
+
     Connection (ServerHost& h, juce::StreamingSocket* s)
         : juce::Thread ("EnsayoConnection"), host (h), socket (s)
     {
+        // Non-blocking from the start (JUCE's read (..., false) would switch it anyway) so writeAll() never
+        // parks a broadcaster inside ::send.
+        u_long nonBlocking = 1;
+        ioctlsocket ((SOCKET) socket->getRawSocketHandle(), (long) FIONBIO, &nonBlocking);
     }
 
     ~Connection() override
@@ -126,8 +202,50 @@ struct ServerHost::Connection : public juce::Thread
     void send (const juce::var& message)
     {
         const auto line = makeLine (message);
+        writeAll (line.toRawUTF8(), line.getNumBytesAsUTF8());
+    }
+
+    // Writes the whole buffer, retrying partial writes and WSAEWOULDBLOCK with short sleeps for at most
+    // maxWriteStallMs in total. On failure or timeout the connection is marked dead and closed, which makes
+    // run() leave the session and finish; later sends return immediately. Called from any thread.
+    bool writeAll (const char* data, size_t len)
+    {
         const juce::ScopedLock scoped (writeLock);
-        socket->write (line.toRawUTF8(), (int) line.getNumBytesAsUTF8());
+
+        if (dead.load (std::memory_order_acquire))
+            return false;
+
+        const auto handle = (SOCKET) socket->getRawSocketHandle();
+        const auto deadline = nowMs() + maxWriteStallMs;
+
+        while (len > 0)
+        {
+            const int n = ::send (handle, data, (int) std::min<size_t> (len, 1u << 20), 0);
+
+            if (n > 0)
+            {
+                data += n;
+                len -= (size_t) n;
+                continue;
+            }
+
+            if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK && nowMs() < deadline)
+            {
+                juce::Thread::sleep (2);
+                continue;
+            }
+
+            markDead();
+            return false;
+        }
+
+        return true;
+    }
+
+    void markDead()
+    {
+        if (! dead.exchange (true, std::memory_order_acq_rel))
+            socket->close();   // the reader loop sees the closed socket and leaves the session the normal way
     }
 
     void run() override
@@ -169,7 +287,15 @@ struct ServerHost::Connection : public juce::Thread
             if (newline == pending.end())
                 return pending.size() <= maxLineBytes;
 
-            const juce::String line = juce::String::fromUTF8 (pending.data(), (int) (newline - pending.begin()));
+            const auto lineLen = (size_t) (newline - pending.begin());
+
+            if (lineLen > maxLineBytes || nestsDeeperThan (pending.data(), lineLen, maxNestingDepth))
+            {
+                send (errorMessage ("Mensaje demasiado grande"));
+                return false;
+            }
+
+            const juce::String line = juce::String::fromUTF8 (pending.data(), (int) lineLen);
             pending.erase (pending.begin(), newline + 1);
 
             if (auto message = parseLine (line))
@@ -220,6 +346,7 @@ struct ServerHost::Connection : public juce::Thread
     std::shared_ptr<Session> session;         // set while joined (under sessionsLock)
     uint32_t clientId = 0;
     juce::String name;
+    std::atomic<bool> dead { false };         // set by writeAll() on a stalled or failed write
     std::atomic<bool> finished { false };
 };
 
@@ -427,8 +554,11 @@ void ServerHost::stop()
         udpThread.join();
 
     {
+        // The clock and the UDP thread are gone: nothing reads the registry any more.
         const juce::SpinLock::ScopedLockType scoped (sessionsLock);
         sessions.clear();
+        retiredSessions.clear();
+        publishRegistry();
     }
 
     boundUdpPort = 0;
@@ -452,22 +582,46 @@ void ServerHost::startInternalClock()
 
 void ServerHost::tick() noexcept
 {
-    const juce::SpinLock::ScopedTryLockType scoped (sessionsLock);
+    // Lock-free and allocation-free: loading the snapshot copies a shared_ptr (a reference count), and the
+    // snapshot stays valid for the whole tick even if a control thread publishes a new one meanwhile.
+    const auto snapshot = registry.load (std::memory_order_acquire);
 
-    if (! scoped.isLocked())
-    {
-        // A control or UDP thread holds the lock: remember the frame and produce it on the next tick, so the
-        // mix stream keeps one block per period and the clients' jitter buffers do not drain by one block
-        // every time this happens.
-        missedTicks.fetch_add (1, std::memory_order_relaxed);
+    if (snapshot == nullptr)
         return;
-    }
 
-    const int catchUp = std::min (maxCatchUpTicks, missedTicks.exchange (0, std::memory_order_relaxed));
+    for (auto& session : snapshot->sessions)
+    {
+        // Safety net: a block MixServer skipped because a control mutation (join/leave/gain) was in flight is
+        // reproduced on the next tick, so the mix stream keeps one block per period and the clients' jitter
+        // buffers do not drain. With no lock on this path it should essentially never trigger.
+        const int rounds = 1 + std::min (maxCatchUpTicks, session->missedTicks);
+        session->missedTicks = 0;
 
-    for (int i = 0; i <= catchUp; ++i)
-        for (auto& session : sessions)
+        for (int round = 0; round < rounds; ++round)
+        {
+            const auto backoffs = session->mix.getBackoffCount();
             session->mix.tick (session->sender);
+
+            if (session->mix.getBackoffCount() != backoffs)
+            {
+                session->missedTicks = rounds - round;
+                break;
+            }
+        }
+    }
+}
+
+void ServerHost::publishRegistry()
+{
+    auto next = std::make_shared<Registry>();
+    next->sessions = sessions;
+
+    for (auto& session : sessions)
+        for (auto& endpoint : session->endpoints)
+            if (const auto id = endpoint.clientId.load (std::memory_order_acquire); id != 0)
+                next->endpoints.emplace (id, Registry::Slot { session.get(), &endpoint });
+
+    registry.store (std::move (next), std::memory_order_release);
 }
 
 int ServerHost::getSessionCount() const
@@ -499,6 +653,19 @@ std::shared_ptr<ServerHost::Session> ServerHost::findSession (const juce::String
 //==============================================================================
 void ServerHost::onConnectionAccepted (juce::StreamingSocket* socket)
 {
+    {
+        const juce::ScopedLock scoped (connectionsLock);
+        const auto live = (size_t) std::count_if (connections.begin(), connections.end(),
+                                                  [] (const auto& c) { return ! c->finished.load (std::memory_order_acquire); });
+
+        if (live >= maxConnections)
+        {
+            const std::unique_ptr<juce::StreamingSocket> refused (socket);
+            log ("conexion rechazada desde " + socket->getHostName() + ": limite de " + juce::String (maxConnections));
+            return;
+        }
+    }
+
     auto connection = std::make_shared<Connection> (*this, socket);
 
     {
@@ -536,6 +703,28 @@ void ServerHost::housekeeping()
         c->stopThread (2000);
 
     dead.clear();
+
+    // Destroy retired sessions once nothing else (a snapshot still held by a tick in flight) owns them.
+    std::vector<std::shared_ptr<Session>> expired;
+
+    {
+        const juce::SpinLock::ScopedLockType scoped (sessionsLock);
+
+        for (auto it = retiredSessions.begin(); it != retiredSessions.end();)
+        {
+            if (it->use_count() == 1)
+            {
+                expired.push_back (std::move (*it));
+                it = retiredSessions.erase (it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    expired.clear();   // Session destructors run here, on the housekeeping thread
 
     // Periodic stats + transport state.
     std::vector<std::shared_ptr<Session>> current;
@@ -663,6 +852,7 @@ void ServerHost::handleCreate (Connection& connection, const juce::var& message)
             }
 
             sessions.push_back (session);
+            publishRegistry();
         }
     }
 
@@ -738,14 +928,17 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
         {
             // An empty session nobody can enter is useless: drop it.
             if (session->connections.empty())
+            {
                 sessions.erase (std::remove (sessions.begin(), sessions.end(), session), sessions.end());
+                retiredSessions.push_back (session);
+            }
         }
         else
         {
 
-        session->mix.setNextParticipantId (nextClientId.load());
-        clientId = session->mix.addParticipant (name.isEmpty() ? "Musico " + juce::String (nextClientId.load()) : name, role);
-        nextClientId.store (clientId + 1);
+        // Random ids: the UDP endpoint binds to the first datagram carrying the id, so it must not be guessable.
+        clientId = allocateClientId();
+        session->mix.addParticipantWithId (clientId, name.isEmpty() ? "Musico " + juce::String (session->connections.size() + 1) : name, role);
 
         slot->address.store (0);
         slot->lastSeenMs.store (0);
@@ -764,6 +957,8 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
         o->setProperty ("frameSize", frameSamples (config.frameSize));
         o->setProperty ("participants", participantsToVar (session->mix.getParticipants()));
         }
+
+        publishRegistry();
     }
 
     if (full)
@@ -776,6 +971,27 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
     broadcastParticipants (*session);
     broadcastTransport (*session);
     log (name + " (" + juce::String (clientId) + ") entro a " + session->id);
+}
+
+bool ServerHost::isClientIdInUse (uint32_t clientId) const noexcept
+{
+    for (const auto& session : sessions)
+        if (session->findEndpoint (clientId) != nullptr)
+            return true;
+
+    return false;
+}
+
+uint32_t ServerHost::allocateClientId()
+{
+    // [1, 2^31 - 1]: travels as a JSON number, so it stays within int32. Unique across every session on this host.
+    for (;;)
+    {
+        const auto id = (uint32_t) (1 + random.nextInt (std::numeric_limits<int32_t>::max()));
+
+        if (! isClientIdInUse (id))
+            return id;
+    }
 }
 
 void ServerHost::leaveSession (Connection& connection)
@@ -805,8 +1021,11 @@ void ServerHost::leaveSession (Connection& connection)
         if (session->connections.empty())
         {
             sessions.erase (std::remove (sessions.begin(), sessions.end(), session), sessions.end());
+            retiredSessions.push_back (session);
             sessionDied = true;
         }
+
+        publishRegistry();
     }
 
     log (connection.name + " (" + juce::String (connection.clientId) + ") salio de " + session->id);
@@ -968,33 +1187,39 @@ void ServerHost::udpLoop()
         const auto now = nowMs();
         const double arrivalMs = juce::Time::getMillisecondCounterHiRes();
 
-        const juce::SpinLock::ScopedLockType scoped (sessionsLock);
+        // Lock-free lookup in the current snapshot: never contends with tick() or the control threads.
+        const auto snapshot = registry.load (std::memory_order_acquire);
 
-        for (auto& session : sessions)
+        if (snapshot == nullptr)
+            continue;
+
+        const auto it = snapshot->endpoints.find (view.clientId);
+
+        if (it == snapshot->endpoints.end())
+            continue;
+
+        auto* endpoint = it->second.endpoint;
+
+        // The slot may have been handed to someone else since this snapshot was built.
+        if (endpoint->clientId.load (std::memory_order_acquire) != view.clientId)
+            continue;
+
+        const auto known = endpoint->address.load (std::memory_order_acquire);
+
+        if (known != 0 && known != packed)
         {
-            auto* endpoint = session->findEndpoint (view.clientId);
+            if (now - endpoint->lastSeenMs.load (std::memory_order_relaxed) < endpointSilenceMs)
+                continue;   // someone else is still sending from the recorded address
 
-            if (endpoint == nullptr)
-                continue;
-
-            const auto known = endpoint->address.load (std::memory_order_acquire);
-
-            if (known != 0 && known != packed)
-            {
-                if (now - endpoint->lastSeenMs.load (std::memory_order_relaxed) < endpointSilenceMs)
-                    break;   // someone else is still sending from the recorded address
-
-                endpoint->address.store (packed, std::memory_order_release);
-            }
-            else if (known == 0)
-            {
-                endpoint->address.store (packed, std::memory_order_release);
-            }
-
-            endpoint->lastSeenMs.store (now, std::memory_order_relaxed);
-            session->mix.pushAudio (view, arrivalMs);
-            break;
+            endpoint->address.store (packed, std::memory_order_release);
         }
+        else if (known == 0)
+        {
+            endpoint->address.store (packed, std::memory_order_release);
+        }
+
+        endpoint->lastSeenMs.store (now, std::memory_order_relaxed);
+        it->second.session->mix.pushAudio (view, arrivalMs);
     }
 
     if (mmcss != nullptr)
@@ -1014,6 +1239,11 @@ void ServerHost::sendMix (Session& session, uint32_t clientId, const uint8_t* da
         return;
 
     const auto address = unpackAddress (packed);
+
+    // Accepted v1 trade-off (spec section 3.4): the tick runs on the host's audio callback in the embedded server and
+    // the mix leaves through sendto() right here, i.e. a syscall on the audio thread. On a bound UDP socket with a large
+    // SO_SNDBUF the call never blocks (datagrams are dropped, not queued, when the buffer is full), and it saves one
+    // thread hop (~one scheduler quantum of jitter) per block. Moving it behind an SPSC queue is the v2 option.
     sendto ((SOCKET) udpSocket, (const char*) data, (int) len, 0, (const sockaddr*) &address, sizeof (address));
 }
 }

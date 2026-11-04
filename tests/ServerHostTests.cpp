@@ -103,6 +103,18 @@ public:
             return true;
         }
 
+        // True when the server closes the connection within timeoutMs (replies received meanwhile are queued).
+        bool waitForClose (int timeoutMs)
+        {
+            const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+
+            while (juce::Time::getMillisecondCounter() < deadline)
+                if (! pump (100))
+                    return true;
+
+            return false;
+        }
+
         juce::StreamingSocket socket;
         std::string pending;
         std::deque<juce::var> queue;
@@ -208,8 +220,9 @@ public:
 
         Client one, two;
         juce::String sessionId;
+        uint32_t clientOne = 0, clientTwo = 0;
 
-        beginTest ("create returns joined with a session id and client 1");
+        beginTest ("create returns joined with a session id and a random client id");
         {
             expect (one.connect());
             one.send (object ({ { "t", "create" }, { "name", "Ana" }, { "role", "both" } }));
@@ -217,7 +230,9 @@ public:
             expect (! joined.isVoid(), "no joined message");
             sessionId = joined["session"].toString();
             expect (isValidSessionId (sessionId), "session id " + sessionId);
-            expectEquals ((int) joined["clientId"], 1);
+            clientOne = (uint32_t) (juce::int64) joined["clientId"];
+            expect (clientOne > 0 && clientOne <= 0x7FFFFFFFu, "clientId = " + juce::String ((juce::int64) clientOne));
+            expect (clientOne != 1, "client ids must not be the guessable sequence 1, 2, 3...");
             expectEquals ((int) joined["udpPort"], udpPort);
             expectEquals ((int) joined["frameSize"], 128);
             expectEquals (participantCount (joined), 1);
@@ -231,7 +246,9 @@ public:
             two.send (object ({ { "t", "join" }, { "session", sessionId.toLowerCase() }, { "name", "Beto" }, { "role", "voice" } }));
             const auto joined = two.waitFor ("joined");
             expect (! joined.isVoid(), "no joined message");
-            expectEquals ((int) joined["clientId"], 2);
+            clientTwo = (uint32_t) (juce::int64) joined["clientId"];
+            expect (clientTwo > 0 && clientTwo <= 0x7FFFFFFFu, "clientId = " + juce::String ((juce::int64) clientTwo));
+            expect (clientTwo != clientOne, "client ids must be unique");
             expectEquals (joined["session"].toString(), sessionId);
 
             const auto p1 = one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 2; });
@@ -242,7 +259,7 @@ public:
             if (! p1.isVoid())
             {
                 const auto& list = *p1["participants"].getArray();
-                expectEquals ((int) list[0]["id"], 1);
+                expectEquals ((juce::int64) list[0]["id"], (juce::int64) clientOne);
                 expectEquals (list[0]["name"].toString(), juce::String ("Ana"));
                 expectEquals (list[1]["role"].toString(), juce::String ("voice"));
             }
@@ -265,6 +282,41 @@ public:
             expectEquals (host.getSessionCount(), 1);
         }
 
+        beginTest ("oversized or deeply nested control lines disconnect the client without crashing");
+        {
+            // juce::JSON::parse recurses per nesting level: a line of 60 000 '[' (or 4 000, still under the 8 KB
+            // line cap) must never reach it.
+            Client huge;
+            expect (huge.connect());
+            std::string line (60000, '[');
+            line += '\n';
+            huge.sendRaw (line.data(), (int) line.size());
+            expect (huge.waitForClose (3000), "60 000-byte line did not disconnect the client");
+
+            Client nested;
+            expect (nested.connect());
+            std::string deep (4000, '[');
+            deep += '\n';
+            nested.sendRaw (deep.data(), (int) deep.size());
+            expect (nested.waitForClose (3000), "4 000-level line did not disconnect the client");
+
+            // An ordinary 100-level line is fine for the parser but over the depth cap: also dropped.
+            Client overCap;
+            expect (overCap.connect());
+            std::string capped = "{\"t\":\"ping\",\"x\":" + std::string (40, '[') + std::string (40, ']') + "}\n";
+            overCap.sendRaw (capped.data(), (int) capped.size());
+            expect (overCap.waitForClose (3000), "41-level line did not disconnect the client");
+
+            // A legitimately nested message under the cap still parses.
+            Client under;
+            expect (under.connect());
+            std::string ok = "{\"t\":\"ping\",\"t0\":7,\"x\":" + std::string (20, '[') + std::string (20, ']') + "}\n";
+            under.sendRaw (ok.data(), (int) ok.size());
+            expect (! under.waitFor ("pong").isVoid(), "21-level line was not answered");
+
+            expectEquals (host.getSessionCount(), 1);
+        }
+
         beginTest ("ping returns pong with the same t0");
         {
             one.send (object ({ { "t", "ping" }, { "t0", 1234.5 } }));
@@ -275,7 +327,7 @@ public:
 
         beginTest ("gain messages are accepted");
         {
-            one.send (object ({ { "t", "gain" }, { "target", 2 }, { "voice", -6.0 }, { "instrument", 0.0 }, { "mute", false } }));
+            one.send (object ({ { "t", "gain" }, { "target", (juce::int64) clientTwo }, { "voice", -6.0 }, { "instrument", 0.0 }, { "mute", false } }));
             one.send (object ({ { "t", "gain" }, { "target", "track" }, { "voice", -3.0 }, { "instrument", -3.0 }, { "mute", true } }));
             one.send (object ({ { "t", "jitter" }, { "clientBlocks", 4 } }));
             expect (one.waitFor ("error", 300).isVoid(), "gain produced an error");
@@ -299,7 +351,7 @@ public:
                 view.flags = AudioFlags::voice | AudioFlags::instrument;
                 view.frameSize = FrameSize::f128;
                 view.seq = (uint16_t) i;
-                view.clientId = 1;
+                view.clientId = clientOne;
                 view.sampleTime = (uint32_t) (i * 128);
                 view.voiceLen = voice.encode (pcm.data(), voiceBytes, sizeof (voiceBytes));
                 view.voice = voiceBytes;
@@ -371,12 +423,117 @@ public:
             expect (! one.waitFor ("error", 5000).isVoid(), "corrupt upload not rejected");
             expect (! config.uploadDirectory.getChildFile (sessionId).getChildFile ("bad.wav").existsAsFile());
             expect (config.uploadDirectory.getChildFile (sessionId).getChildFile ("click.wav").existsAsFile());
+
+            // Names that would leave the session folder fall back to "track" (which the decoder then rejects, having
+            // no extension); the folder itself and the loaded track are untouched.
+            for (const char* bad : { "..", ".", "  " })
+            {
+                one.send (object ({ { "t", "track_upload_begin" }, { "name", bad }, { "size", (juce::int64) wav.getSize() }, { "sha1", sha1 } }));
+                one.sendRaw (wav.getData(), (int) wav.getSize());
+                expect (! one.waitFor ("error", 5000).isVoid(), juce::String ("upload named '") + bad + "' not rejected");
+            }
+
+            expect (config.uploadDirectory.getChildFile (sessionId).isDirectory());
+            expect (config.uploadDirectory.getChildFile (sessionId).getChildFile ("click.wav").existsAsFile());
+            expect (! config.uploadDirectory.getChildFile (sessionId).getChildFile ("track").exists());
+            expect (one.waitFor ("error", 300).isVoid(), "stray error after the rejected uploads");
+        }
+
+        beginTest ("more than 64 TCP connections are refused");
+        {
+            std::vector<std::unique_ptr<Client>> extra;
+            int refused = 0;
+
+            for (int i = 0; i < 70; ++i)
+            {
+                auto client = std::make_unique<Client>();
+
+                if (client->connect())
+                    extra.push_back (std::move (client));
+                else
+                    ++refused;
+            }
+
+            // A refused connection is accepted by the OS and closed by the server right away: its ping is never answered.
+            for (auto& client : extra)
+            {
+                client->send (object ({ { "t", "ping" }, { "t0", 1.0 } }));
+
+                if (client->waitFor ("pong", 1500).isVoid())
+                    ++refused;
+            }
+
+            logMessage ("refused connections: " + juce::String (refused));
+            expect (refused >= 6 && refused <= 12, "refused = " + juce::String (refused));   // 70 - (64 - live ones)
+
+            one.send (object ({ { "t", "ping" }, { "t0", 2.0 } }));
+            expect (! one.waitFor ("pong").isVoid(), "joined client lost service under the connection cap");
+            // Closing them frees their slots as soon as their threads notice.
+            extra.clear();
+            const auto freed = juce::Time::getMillisecondCounter();
+            bool slotFree = false;
+
+            while (! slotFree && juce::Time::getMillisecondCounter() - freed < 6000)
+            {
+                Client probe;
+
+                if (probe.connect())
+                {
+                    probe.send (object ({ { "t", "ping" }, { "t0", 3.0 } }));
+                    slotFree = ! probe.waitFor ("pong", 500).isVoid();
+                }
+
+                if (! slotFree)
+                    juce::Thread::sleep (100);
+            }
+
+            logMessage ("slot free after " + juce::String (juce::Time::getMillisecondCounter() - freed) + " ms");
+            expect (slotFree, "closing connections did not free a slot within 6 s");
         }
 
         beginTest ("periodic stats and transport_state");
         {
             expect (! two.waitFor ("stats", 2500).isVoid(), "no stats within 2.5 s");
             expect (! two.waitFor ("transport_state", 2500).isVoid(), "no periodic transport_state");
+        }
+
+        beginTest ("a peer that stops reading is dropped within the stall bound without blocking the others");
+        {
+            Client slow;
+            expect (slow.connect());
+            slow.send (object ({ { "t", "join" }, { "session", sessionId }, { "name", "Lento" }, { "role", "voice" } }));
+            expect (! slow.waitFor ("joined").isVoid(), "slow client did not join");
+            expect (! one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 3; }).isVoid());
+            expect (! two.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 3; }).isVoid());
+
+            // Flood pings and never read the pongs: the server's send buffer towards `slow` fills up and every
+            // write to it would block. The connection must be dropped after the bounded stall (2 s) and the
+            // other participants must keep receiving their broadcasts meanwhile.
+            const auto ping = makeLine (object ({ { "t", "ping" }, { "t0", 0.0 } }));
+            const auto start = juce::Time::getMillisecondCounter();
+            int sent = 0;
+            juce::var dropped;
+
+            while (dropped.isVoid() && juce::Time::getMillisecondCounter() - start < 20000)
+            {
+                for (int i = 0; i < 200; ++i)
+                {
+                    if (slow.socket.write (ping.toRawUTF8(), (int) ping.getNumBytesAsUTF8()) > 0)
+                        ++sent;
+                    else
+                        juce::Thread::sleep (1);
+                }
+
+                dropped = two.waitFor ("participants", 1, [] (const juce::var& m) { return participantCount (m) == 2; });
+            }
+
+            const auto elapsed = juce::Time::getMillisecondCounter() - start;
+            logMessage ("slow peer dropped after " + juce::String (elapsed) + " ms, " + juce::String (sent) + " pings sent");
+            expect (! dropped.isVoid(), "slow peer was not dropped");
+            expect (elapsed < 15000, "drop took " + juce::String (elapsed) + " ms");
+            expect (! one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 2; }).isVoid());
+            expect (! one.waitFor ("stats", 2500).isVoid(), "client 1 stopped receiving stats");
+            expectEquals (host.getSessionCount(), 1);
         }
 
         beginTest ("closing a connection removes the participant and empty sessions die");
@@ -386,7 +543,7 @@ public:
             expect (! p.isVoid(), "client 2 did not get participants with 1 entry");
 
             if (! p.isVoid())
-                expectEquals ((int) (*p["participants"].getArray())[0]["id"], 2);
+                expectEquals ((juce::int64) (*p["participants"].getArray())[0]["id"], (juce::int64) clientTwo);
 
             expectEquals (host.getSessionCount(), 1);
             two.socket.close();
@@ -397,6 +554,14 @@ public:
                 juce::Thread::sleep (20);
 
             expectEquals (host.getSessionCount(), 0);
+
+            // The session's upload folder goes with it.
+            const auto uploads = config.uploadDirectory.getChildFile (sessionId);
+
+            while (uploads.exists() && juce::Time::getMillisecondCounter() < deadline)
+                juce::Thread::sleep (20);
+
+            expect (! uploads.exists(), "upload folder survived the session");
         }
 
         beginTest ("stop and restart");
@@ -408,7 +573,8 @@ public:
             again.send (object ({ { "t", "create" }, { "name", "Dani" }, { "role", "instrument" } }));
             const auto joined = again.waitFor ("joined");
             expect (! joined.isVoid());
-            expect ((int) joined["clientId"] > 2, "client ids keep increasing across sessions");
+            const auto again1 = (juce::int64) joined["clientId"];
+            expect (again1 > 0 && again1 <= 0x7FFFFFFFLL, "clientId = " + juce::String (again1));
             host.stop();
             expectEquals (host.getSessionCount(), 0);
         }

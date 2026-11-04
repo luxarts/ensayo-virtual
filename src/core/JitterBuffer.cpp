@@ -21,7 +21,7 @@ namespace
 JitterBuffer::JitterBuffer (int blockBytesToUse, double blockDurationMsToUse)
     : blockBytes (std::max (1, blockBytesToUse)),
       blockDurationMs (blockDurationMsToUse > 0.0 ? blockDurationMsToUse : 1.0),
-      storage ((size_t) blockBytes * (size_t) maxBlocks, 0)
+      storage ((size_t) blockBytes * (size_t) numSlots, 0)
 {
     for (auto& tag : tags)
         tag.store (0, std::memory_order_relaxed);
@@ -123,7 +123,7 @@ void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arri
         estimator.consecutiveLate = 0;
     }
 
-    const size_t slot = (size_t) (seq % (uint16_t) maxBlocks);
+    const size_t slot = slotOf (seq);
     tags[slot].store (0, std::memory_order_release);
     std::memcpy (storage.data() + slot * (size_t) blockBytes, data, (size_t) len);
     lengths[slot].store (len, std::memory_order_relaxed);
@@ -247,7 +247,7 @@ bool JitterBuffer::pop (uint8_t* out, int& len) noexcept
         appliedSize = size;
     }
 
-    const size_t slot = (size_t) (seq % (uint16_t) maxBlocks);
+    const size_t slot = slotOf (seq);
     const uint32_t expected = taggedSeq (seq);
     bool ok = false;
 

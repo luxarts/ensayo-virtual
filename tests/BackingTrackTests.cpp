@@ -1,6 +1,8 @@
 #include "server/BackingTrack.h"
 
+#include <atomic>
 #include <cmath>
+#include <thread>
 #include <vector>
 
 namespace ensayo
@@ -57,9 +59,9 @@ public:
 
     void runTest() override
     {
-        const auto file = writeClickWav (*this);
-
+        // expect() needs a current test: beginTest() must precede the fixture (which asserts the file was written).
         beginTest ("load converts to 48 kHz stereo");
+        const auto file = writeClickWav (*this);
         BackingTrack track;
         {
             expect (! track.getState().loaded);
@@ -138,6 +140,72 @@ public:
             const int wrapIndex = (int) (state.length - 47000);
             const int idx = peakIndex (l, wrapIndex - 8, 4096);
             expect (std::abs (idx - wrapIndex) <= 8, "wrapped click at " + juce::String (idx));
+        }
+
+        beginTest ("getState from another thread never makes render skip a block");
+        {
+            // The audio thread try-locks: a control reader that took the same lock would make render drop the block
+            // (track stalls by 120 samples per overlap). Hammer getState while rendering 10 s of looped clicks and
+            // check that every block was produced: the clicks stay on their 12000-sample grid and the position
+            // advanced by exactly the amount rendered.
+            track.setLoop (true);
+            track.stop();
+            track.play();
+
+            constexpr int blockSize = 120, numBlocks = 4000;   // 480 000 samples = 10 s
+            std::vector<float> l ((size_t) blockSize * numBlocks, 0.0f), r (l.size(), 0.0f);
+            std::atomic<bool> stopReader { false };
+            std::atomic<int> reads { 0 };
+
+            std::thread reader ([&]
+            {
+                while (! stopReader.load (std::memory_order_relaxed) || reads.load (std::memory_order_relaxed) < 10000)
+                {
+                    const auto state = track.getState();
+
+                    if (state.loaded)
+                        reads.fetch_add (1, std::memory_order_relaxed);
+                }
+            });
+
+            for (int i = 0; i < numBlocks; ++i)
+                track.render (l.data() + i * blockSize, r.data() + i * blockSize, blockSize);
+
+            stopReader.store (true);
+            reader.join();
+            expect (reads.load() >= 10000, "reads = " + juce::String (reads.load()));
+
+            const auto state = track.getState();
+            const long long rendered = (long long) blockSize * numBlocks;
+            // The loop wraps lazily: landing exactly on the end reads `length` until the next block.
+            const long long expectedPosition = rendered % state.length;
+            expect (state.position == expectedPosition || (expectedPosition == 0 && state.position == state.length),
+                    "position = " + juce::String (state.position));
+
+            // One click per 12000-sample cell, on the grid (a skipped block would shift it by 120), nothing between.
+            int clicks = 0, offGrid = 0, stray = 0;
+            const int cells = (int) (rendered / 12000);
+
+            for (int k = 0; k < cells; ++k)
+            {
+                const int centre = k * 12000;
+                const int from = juce::jmax (0, centre - 50), to = juce::jmin ((int) l.size(), centre + 50);
+                const int idx = peakIndex (l, from, to);
+
+                if (l[(size_t) idx] > 0.5f)
+                    ++clicks;
+
+                if (std::abs (idx - centre) > 8)
+                    ++offGrid;
+
+                for (int i = to; i < juce::jmin ((int) l.size(), centre + 12000 - 50); ++i)
+                    if (l[(size_t) i] > 0.5f)
+                        ++stray;
+            }
+
+            expectEquals (clicks, cells);
+            expectEquals (offGrid, 0);
+            expectEquals (stray, 0);
         }
 
         beginTest ("stop pauses and rewinds");

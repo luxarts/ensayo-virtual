@@ -204,6 +204,31 @@ public:
             expectEquals ((int) buffer.getStats().underruns, 0);
         }
 
+        beginTest ("5c. slots do not alias across the 16-bit wrap at the maximum size");
+        {
+            // With 20 slots indexed by seq % 20 the slot sequence breaks at the wrap (65535 % 20 = 15, then 0), so
+            // packets 16 apart share a slot and a full 20-block window overwrites blocks it has not consumed yet.
+            JitterBuffer buffer (blockBytes, blockMs);
+            buffer.setAutoSize (false);
+            buffer.setSizeBlocks (JitterBuffer::maxBlocks);
+            const uint16_t start = 65500;
+
+            for (int i = 0; i < JitterBuffer::maxBlocks; ++i)
+                pushSeq (buffer, (uint16_t) (start + i));
+
+            // Steady state with the producer a full window ahead of the consumer, crossing 65535 -> 0.
+            for (int i = 0; i < 100; ++i)
+            {
+                expect (popExpecting (buffer, (uint16_t) (start + i)), "wrap pop at full size, i = " + juce::String (i));
+                pushSeq (buffer, (uint16_t) (start + JitterBuffer::maxBlocks + i));
+            }
+
+            const auto stats = buffer.getStats();
+            expectEquals ((int) stats.underruns, 0);
+            expectEquals ((int) stats.late, 0);
+            expectEquals ((int) stats.resyncs, 0);
+        }
+
         beginTest ("6. auto size grows with jitter and shrinks with clean arrivals");
         {
             JitterBuffer buffer (blockBytes, blockMs);

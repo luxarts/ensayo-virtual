@@ -11,6 +11,10 @@ class JitterBuffer
 {
 public:
     static constexpr int minBlocks = 2, maxBlocks = 20, initialBlocks = 4;
+    // Ring slots. A power of two so `seq & (numSlots - 1)` stays contiguous across the 16-bit wrap (65536 % 20 = 16
+    // would alias seqs 16 apart near the wrap). Must exceed maxBlocks: the live window never spans more than that.
+    static constexpr int numSlots = 32;
+    static_assert ((numSlots & (numSlots - 1)) == 0 && numSlots > maxBlocks && 65536 % numSlots == 0);
     static constexpr int lateResyncThreshold = 8;   // consecutive late packets that re-anchor the window on the stream
     JitterBuffer (int blockBytes, double blockDurationMs);
     void setAutoSize (bool enabled) noexcept;      // default true
@@ -24,7 +28,7 @@ public:
     struct Stats { int sizeBlocks = 0; uint32_t underruns = 0, late = 0, resyncs = 0; double jitterMs = 0.0; bool primed = false; };
     Stats getStats() const noexcept;
 private:
-    // storage: maxBlocks slots of blockBytes + len + valid + seq; readSeq; primed flag that waits for sizeBlocks
+    // storage: numSlots slots of blockBytes + len + valid + seq; readSeq; primed flag that waits for sizeBlocks
     // packets before the first pop; jitter estimator: EWMA of |arrival interval - blockDurationMs| and its
     // max over the last second; target = clamp(ceil((mean + 3*stddev + max) / blockDurationMs) + 1).
 
@@ -35,6 +39,7 @@ private:
     static constexpr uint32_t taggedSeq (uint16_t seq) noexcept { return validTag | seq; }
     static constexpr uint16_t seqOf (uint32_t tag) noexcept { return (uint16_t) (tag & 0xFFFFu); }
     static constexpr int seqDistance (uint16_t from, uint16_t to) noexcept { return (int16_t) (uint16_t) (to - from); }
+    static constexpr size_t slotOf (uint16_t seq) noexcept { return (size_t) (seq & (uint16_t) (numSlots - 1)); }
 
     void evaluateTarget() noexcept;
     void clearSlots() noexcept;
@@ -42,9 +47,9 @@ private:
 
     const int blockBytes;
     const double blockDurationMs;
-    std::vector<uint8_t> storage;                                  // maxBlocks * blockBytes, sized once
-    std::array<std::atomic<uint32_t>, maxBlocks> tags;
-    std::array<std::atomic<int>, maxBlocks> lengths;
+    std::vector<uint8_t> storage;                                  // numSlots * blockBytes, sized once
+    std::array<std::atomic<uint32_t>, numSlots> tags;
+    std::array<std::atomic<int>, numSlots> lengths;
 
     // Shared configuration / statistics.
     std::atomic<bool> autoSize { true };

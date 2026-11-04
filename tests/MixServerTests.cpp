@@ -334,6 +334,22 @@ public:
             // Ids never repeat.
             expectEquals ((int) server.addParticipant ("D", Role::both), 4);
         }
+
+        beginTest ("addParticipantWithId takes caller-chosen ids and keeps the counter above them");
+        {
+            MixServer other (size);
+            expect (! other.addParticipantWithId (0, "zero", Role::both), "id 0 must be rejected");
+            expect (other.addParticipantWithId (0x7FFFFFF0u, "X", Role::both));
+            expect (! other.addParticipantWithId (0x7FFFFFF0u, "X again", Role::voice), "duplicate id must be rejected");
+            expect (other.addParticipantWithId (77, "Y", Role::voice));
+            const auto list = other.getParticipants();
+            expectEquals ((int) list.size(), 2);
+            expectEquals ((long long) list[0].id, 0x7FFFFFF0LL);
+            expectEquals ((long long) list[1].id, 77LL);
+            expectEquals ((long long) other.addParticipant ("Z", Role::both), 0x7FFFFFF1LL);
+            other.removeParticipant (77);
+            expectEquals ((int) other.getParticipants().size(), 2);
+        }
     }
 };
 

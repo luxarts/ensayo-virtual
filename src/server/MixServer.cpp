@@ -117,6 +117,24 @@ uint32_t MixServer::addParticipant (const juce::String& name, Role role)
     return id;
 }
 
+bool MixServer::addParticipantWithId (uint32_t id, const juce::String& name, Role role)
+{
+    if (id == 0)
+        return false;
+
+    const std::scoped_lock control (controlMutex);
+
+    if (findUnlocked (id) != nullptr)
+        return false;
+
+    auto participant = std::make_unique<Participant> (mode, id, name, role);
+    nextId = juce::jmax (nextId, id + 1);
+
+    const ControlMutation mutation (*this);
+    participants.push_back (std::move (participant));
+    return true;
+}
+
 void MixServer::removeParticipant (uint32_t id)
 {
     std::unique_ptr<Participant> removed;
@@ -203,7 +221,10 @@ void MixServer::pushAudio (const AudioPacketView& view, double arrivalMs) noexce
 int MixServer::tick (const Sender& send) noexcept
 {
     if (! tryEnterRealtime())
+    {
+        backoffs.fetch_add (1, std::memory_order_relaxed);
         return 0;
+    }
 
     // 1. Decode one block per participant (PLC on gaps), apply the fade-in and measure peaks.
     for (auto& ptr : participants)
@@ -353,5 +374,10 @@ std::vector<ParticipantStats> MixServer::getStats() const
 uint32_t MixServer::getTrackPosition() const noexcept
 {
     return trackPosition.load (std::memory_order_relaxed);
+}
+
+uint32_t MixServer::getBackoffCount() const noexcept
+{
+    return backoffs.load (std::memory_order_relaxed);
 }
 }

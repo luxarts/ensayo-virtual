@@ -32,10 +32,12 @@ private:
 
     void swapIn (std::shared_ptr<const Audio> newAudio);
 
-    // The audio thread try-locks `lock` and keeps a raw pointer to the current Audio while rendering;
-    // control threads replace `audio` only while holding `lock`, so the pointer stays valid during a render.
-    mutable juce::SpinLock lock;
-    std::shared_ptr<const Audio> audio;
+    // The audio thread try-locks `lock` and renders from `current` (a raw pointer); only swapIn() takes the
+    // lock, to replace `current` and release the old buffer after any render in flight. Control readers
+    // (getState) never take it: they load `audio` atomically, so they cannot make render() drop a block.
+    juce::SpinLock lock;
+    std::atomic<const Audio*> current { nullptr };
+    std::atomic<std::shared_ptr<const Audio>> audio;
 
     std::atomic<int64_t> position { 0 };
     std::atomic<int64_t> length { 0 };
