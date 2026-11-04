@@ -22,16 +22,26 @@ namespace
     constexpr size_t maxLineBytes = 64 * 1024;
     constexpr int uploadChunkBytes = 64 * 1024;
 
-    // juce::StreamingSocket::write is a bare send(); the socket turns non-blocking after the first
-    // non-blocking read, so writes can be partial or fail with WSAEWOULDBLOCK and must be retried.
+    constexpr int writeStallTimeoutMs = 10000;
+
+    // juce::StreamingSocket::write is a bare send() on a non-blocking socket, so writes can be partial or fail
+    // with WSAEWOULDBLOCK and must be retried. The retry must NOT use waitUntilReady: JUCE implements it with a
+    // try-lock on the socket's read lock, which the control thread holds almost permanently inside its own
+    // waitUntilReady (true, 100) loop, so a writer waiting that way fails as soon as the send buffer is full
+    // (and, when it does win the lock, makes the reader's wait fail instead). A short sleep is enough: the
+    // kernel drains the send buffer independently of this thread.
     bool writeAll (juce::StreamingSocket& socket, const void* data, int len, const juce::Thread* thread = nullptr)
     {
         const auto* bytes = static_cast<const char*> (data);
         int written = 0;
+        int stalledMs = 0;
 
         while (written < len)
         {
             if (thread != nullptr && thread->threadShouldExit())
+                return false;
+
+            if (! socket.isConnected())
                 return false;
 
             const int w = socket.write (bytes + written, len - written);
@@ -39,6 +49,7 @@ namespace
             if (w > 0)
             {
                 written += w;
+                stalledMs = 0;
                 continue;
             }
 
@@ -50,8 +61,11 @@ namespace
                 return false;
            #endif
 
-            if (socket.waitUntilReady (false, 100) < 0)
+            if (stalledMs >= writeStallTimeoutMs)
                 return false;
+
+            juce::Thread::sleep (2);
+            stalledMs += 2;
         }
 
         return true;
