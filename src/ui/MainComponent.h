@@ -106,11 +106,13 @@ private:
 
     AppSettings settings;
     juce::File settingsFile;
-    AudioEngine engine;
+    // Declaration order matters for destruction: the engine (and with it the audio device, whose callback reads
+    // `client` through the transport pointer and `host` through the frame hook) must die before them.
     SessionClient client;
     std::unique_ptr<ServerHost> host;
     std::atomic<ServerHost*> activeHost { nullptr };   // read by the frame hook; only ever set in createSession
     std::atomic<bool> hookTicking { false };           // raised by the frame hook around tick(); see detachHostFromAudioThread
+    AudioEngine engine;
     YouTubeImporter importer;
 
     LobbyView lobby;

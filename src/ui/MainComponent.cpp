@@ -198,8 +198,14 @@ MainComponent::~MainComponent()
     client.onStateChanged = nullptr;
     client.onError = nullptr;
     client.onJoined = nullptr;
+
+    // Audio thread first: nothing may be inside processFrame (transport → client, hook → host) once the device
+    // is closed, so the client's threads and the host can be stopped and the members destroyed safely after.
+    detachHostFromAudioThread();
+    engine.setTransport (nullptr);
+    engine.getDeviceManager().closeAudioDevice();
     teardownConnection();
-    saveSettingsNow();
+    saveSettingsNow();   // settings also persist on change, debounced 1 s in timerCallback
 }
 
 void MainComponent::paint (juce::Graphics& g)
