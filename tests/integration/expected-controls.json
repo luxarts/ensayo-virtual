@@ -1,0 +1,23 @@
+{
+  "lobby": [
+    "lobby.name", "lobby.role", "lobby.create", "lobby.link", "lobby.join",
+    "audio.device", "audio.rate", "audio.buffer", "audio.panel", "audio.mic", "audio.instrument",
+    "audio.output", "audio.latency",
+    "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
+    "status.text", "status.retry"
+  ],
+  "session": [
+    "session.link", "session.copy", "session.leave", "session.editor",
+    "me.voice.fader", "me.voice.mute", "me.voice.meter",
+    "me.instrument.fader", "me.instrument.mute", "me.instrument.meter",
+    "participant.1.name", "participant.1.role", "participant.1.voice.fader", "participant.1.voice.mute",
+    "participant.1.instrument.fader", "participant.1.instrument.mute", "participant.1.meter",
+    "participant.2.name", "participant.2.role", "participant.2.voice.fader", "participant.2.voice.mute",
+    "participant.2.instrument.fader", "participant.2.instrument.mute", "participant.2.meter",
+    "participant.3.name", "participant.3.role", "participant.3.voice.fader", "participant.3.voice.mute",
+    "participant.3.instrument.fader", "participant.3.instrument.mute", "participant.3.meter",
+    "track.load", "track.url", "track.download", "track.name", "track.play", "track.stop", "track.loop",
+    "track.position", "track.time", "track.fader", "track.mute", "track.progress",
+    "status.ping", "status.jitter", "status.latency", "status.loss", "status.cpu", "status.text", "status.retry"
+  ]
+}
