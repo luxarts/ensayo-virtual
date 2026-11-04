@@ -356,6 +356,50 @@ public:
             expect (popExpecting (buffer, 1000));
         }
 
+        beginTest ("4b. a run of late packets re-anchors the window instead of dropping the stream");
+        {
+            JitterBuffer buffer (blockBytes, blockMs);
+            buffer.setAutoSize (false);
+
+            for (uint16_t seq = 0; seq < 4; ++seq)
+                pushSeq (buffer, seq);
+
+            for (uint16_t seq = 0; seq < 4; ++seq)
+                expect (popExpecting (buffer, seq));
+
+            // The producer stalls: the consumer keeps popping (underruns) and runs 10 blocks ahead.
+            for (int i = 0; i < 10; ++i)
+                expect (! popDiscarding (buffer));
+
+            expectEquals ((int) buffer.getStats().underruns, 10);
+
+            // The stream resumes where it left off: every packet is behind the read position.
+            for (uint16_t seq = 4; seq < 4 + JitterBuffer::lateResyncThreshold; ++seq)
+                pushSeq (buffer, seq);
+
+            expectEquals ((int) buffer.getStats().late, JitterBuffer::lateResyncThreshold);
+            expectEquals ((int) buffer.getStats().resyncs, 1);
+
+            const uint16_t anchor = (uint16_t) (4 + JitterBuffer::lateResyncThreshold - 1);   // the packet that triggered it
+
+            for (uint16_t seq = (uint16_t) (anchor + 1); seq < anchor + 4; ++seq)
+                pushSeq (buffer, seq);
+
+            for (uint16_t seq = anchor; seq < anchor + 4; ++seq)
+                expect (popExpecting (buffer, seq), "post-late-resync pop " + juce::String (seq));
+
+            expectEquals ((int) buffer.getStats().underruns, 10);
+            expectEquals ((int) buffer.getStats().late, JitterBuffer::lateResyncThreshold);
+
+            // Isolated reordering is still just "late".
+            pushSeq (buffer, (uint16_t) (anchor + 4));
+            pushSeq (buffer, 1);
+            pushSeq (buffer, (uint16_t) (anchor + 5));
+            pushSeq (buffer, 2);
+            expectEquals ((int) buffer.getStats().late, JitterBuffer::lateResyncThreshold + 2);
+            expectEquals ((int) buffer.getStats().resyncs, 1);
+        }
+
         beginTest ("oversized and empty blocks are ignored");
         {
             JitterBuffer buffer (blockBytes, blockMs);

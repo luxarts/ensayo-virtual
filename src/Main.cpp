@@ -21,7 +21,8 @@ class EnsayoVirtualApplication : public juce::JUCEApplication
 public:
     const juce::String getApplicationName() override       { return "Ensayo Virtual"; }
     const juce::String getApplicationVersion() override    { return "0.1.0"; }
-    bool moreThanOneInstanceAllowed() override             { return false; }
+    // Headless instances (tests, latency probes) must be able to run side by side on one machine.
+    bool moreThanOneInstanceAllowed() override             { return getCommandLineParameterArray().contains ("--headless"); }
 
     void initialise (const juce::String& commandLine) override
     {
@@ -38,7 +39,7 @@ public:
             const auto options = parseHeadlessOptions (args, error);
 
             if (! options)
-                std::cerr << error << std::endl;
+                headlessPrint ("error " + error);
 
             setApplicationReturnValue (options ? runHeadless (*options) : 2);
            #else

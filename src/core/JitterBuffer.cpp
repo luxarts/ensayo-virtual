@@ -100,16 +100,27 @@ void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arri
         if (distance < 0)
         {
             late.fetch_add (1, std::memory_order_relaxed);
-            return;
-        }
 
-        if (distance >= maxBlocks)
+            // A single late packet is reordering; a run of them means the consumer ran ahead of the stream
+            // (the producer stalled for longer than the buffer) and would otherwise drop every packet from
+            // now on. Re-anchor the window on the current packet.
+            if (++estimator.consecutiveLate < lateResyncThreshold)
+                return;
+
+            resyncs.fetch_add (1, std::memory_order_relaxed);
+            clearSlots();
+            pendingResync.store (taggedSeq (seq), std::memory_order_release);
+            highestSeq.store (0, std::memory_order_relaxed);
+        }
+        else if (distance >= maxBlocks)
         {
             resyncs.fetch_add (1, std::memory_order_relaxed);
             clearSlots();
             pendingResync.store (taggedSeq (seq), std::memory_order_release);
             highestSeq.store (0, std::memory_order_relaxed);
         }
+
+        estimator.consecutiveLate = 0;
     }
 
     const size_t slot = (size_t) (seq % (uint16_t) maxBlocks);
