@@ -34,8 +34,9 @@ function Test-ControlList
 
     $controls = @((Get-Content -Raw $ControlsJson | ConvertFrom-Json))
     $expected = Get-Content -Raw $ExpectedJson | ConvertFrom-Json
-    $byName = @{}
-    foreach ($c in $controls) { $byName[$c.name] = $c }
+    # controls.json holds one entry per control per rendered view, so look names up per view.
+    $byViewAndName = @{}
+    foreach ($c in $controls) { $byViewAndName["$($c.view)/$($c.name)"] = $c }
 
     $problems = @()
     foreach ($view in @('lobby', 'session'))
@@ -43,11 +44,11 @@ function Test-ControlList
         $names = @($expected.$view)
         foreach ($n in $names)
         {
-            if (-not $byName.ContainsKey($n)) { $problems += "$n missing"; continue }
-            $c = $byName[$n]
-            if (-not $c.visible) { $problems += "$n not visible" }
-            if ($c.w -le 0 -or $c.h -le 0) { $problems += "$n has empty bounds ($($c.w)x$($c.h))" }
-            if ($c.view -ne $view) { $problems += "$n reported in view '$($c.view)', expected '$view'" }
+            $key = "$view/$n"
+            if (-not $byViewAndName.ContainsKey($key)) { $problems += "$n missing in view '$view'"; continue }
+            $c = $byViewAndName[$key]
+            if (-not $c.visible) { $problems += "$n not visible in view '$view'" }
+            if ($c.w -le 0 -or $c.h -le 0) { $problems += "$n has empty bounds ($($c.w)x$($c.h)) in view '$view'" }
         }
         Write-Host ("  {0}: {1} expected controls checked" -f $view, $names.Count)
     }
