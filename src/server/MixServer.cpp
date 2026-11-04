@@ -117,6 +117,24 @@ uint32_t MixServer::addParticipant (const juce::String& name, Role role)
     return id;
 }
 
+bool MixServer::addParticipantWithId (uint32_t id, const juce::String& name, Role role)
+{
+    if (id == 0)
+        return false;
+
+    const std::scoped_lock control (controlMutex);
+
+    if (findUnlocked (id) != nullptr)
+        return false;
+
+    auto participant = std::make_unique<Participant> (mode, id, name, role);
+    nextId = juce::jmax (nextId, id + 1);
+
+    const ControlMutation mutation (*this);
+    participants.push_back (std::move (participant));
+    return true;
+}
+
 void MixServer::removeParticipant (uint32_t id)
 {
     std::unique_ptr<Participant> removed;

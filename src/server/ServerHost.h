@@ -49,6 +49,8 @@ private:
     void handleUpload (Connection&, const juce::var&);
     void joinSession (Connection&, std::shared_ptr<Session>, const juce::String& name, Role);
     void leaveSession (Connection&);
+    uint32_t allocateClientId();                            // random, unused on this host; caller holds sessionsLock
+    bool isClientIdInUse (uint32_t) const noexcept;         // caller holds sessionsLock
     void broadcast (Session&, const juce::var&);
     void broadcastParticipants (Session&);
     void broadcastTransport (Session&);
@@ -61,8 +63,7 @@ private:
 
     ServerConfig config;
     std::atomic<bool> running { false };
-    std::atomic<uint32_t> nextClientId { 1 };
-    juce::Random random;
+    juce::Random random;                                    // seeded randomly; used under sessionsLock
 
     // Protects `sessions`, each session's connection list and endpoint table. tick() try-locks it.
     mutable juce::SpinLock sessionsLock;

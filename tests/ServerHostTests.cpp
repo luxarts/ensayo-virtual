@@ -220,8 +220,9 @@ public:
 
         Client one, two;
         juce::String sessionId;
+        uint32_t clientOne = 0, clientTwo = 0;
 
-        beginTest ("create returns joined with a session id and client 1");
+        beginTest ("create returns joined with a session id and a random client id");
         {
             expect (one.connect());
             one.send (object ({ { "t", "create" }, { "name", "Ana" }, { "role", "both" } }));
@@ -229,7 +230,9 @@ public:
             expect (! joined.isVoid(), "no joined message");
             sessionId = joined["session"].toString();
             expect (isValidSessionId (sessionId), "session id " + sessionId);
-            expectEquals ((int) joined["clientId"], 1);
+            clientOne = (uint32_t) (juce::int64) joined["clientId"];
+            expect (clientOne > 0 && clientOne <= 0x7FFFFFFFu, "clientId = " + juce::String ((juce::int64) clientOne));
+            expect (clientOne != 1, "client ids must not be the guessable sequence 1, 2, 3...");
             expectEquals ((int) joined["udpPort"], udpPort);
             expectEquals ((int) joined["frameSize"], 128);
             expectEquals (participantCount (joined), 1);
@@ -243,7 +246,9 @@ public:
             two.send (object ({ { "t", "join" }, { "session", sessionId.toLowerCase() }, { "name", "Beto" }, { "role", "voice" } }));
             const auto joined = two.waitFor ("joined");
             expect (! joined.isVoid(), "no joined message");
-            expectEquals ((int) joined["clientId"], 2);
+            clientTwo = (uint32_t) (juce::int64) joined["clientId"];
+            expect (clientTwo > 0 && clientTwo <= 0x7FFFFFFFu, "clientId = " + juce::String ((juce::int64) clientTwo));
+            expect (clientTwo != clientOne, "client ids must be unique");
             expectEquals (joined["session"].toString(), sessionId);
 
             const auto p1 = one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 2; });
@@ -254,7 +259,7 @@ public:
             if (! p1.isVoid())
             {
                 const auto& list = *p1["participants"].getArray();
-                expectEquals ((int) list[0]["id"], 1);
+                expectEquals ((juce::int64) list[0]["id"], (juce::int64) clientOne);
                 expectEquals (list[0]["name"].toString(), juce::String ("Ana"));
                 expectEquals (list[1]["role"].toString(), juce::String ("voice"));
             }
@@ -322,7 +327,7 @@ public:
 
         beginTest ("gain messages are accepted");
         {
-            one.send (object ({ { "t", "gain" }, { "target", 2 }, { "voice", -6.0 }, { "instrument", 0.0 }, { "mute", false } }));
+            one.send (object ({ { "t", "gain" }, { "target", (juce::int64) clientTwo }, { "voice", -6.0 }, { "instrument", 0.0 }, { "mute", false } }));
             one.send (object ({ { "t", "gain" }, { "target", "track" }, { "voice", -3.0 }, { "instrument", -3.0 }, { "mute", true } }));
             one.send (object ({ { "t", "jitter" }, { "clientBlocks", 4 } }));
             expect (one.waitFor ("error", 300).isVoid(), "gain produced an error");
@@ -346,7 +351,7 @@ public:
                 view.flags = AudioFlags::voice | AudioFlags::instrument;
                 view.frameSize = FrameSize::f128;
                 view.seq = (uint16_t) i;
-                view.clientId = 1;
+                view.clientId = clientOne;
                 view.sampleTime = (uint32_t) (i * 128);
                 view.voiceLen = voice.encode (pcm.data(), voiceBytes, sizeof (voiceBytes));
                 view.voice = voiceBytes;
@@ -538,7 +543,7 @@ public:
             expect (! p.isVoid(), "client 2 did not get participants with 1 entry");
 
             if (! p.isVoid())
-                expectEquals ((int) (*p["participants"].getArray())[0]["id"], 2);
+                expectEquals ((juce::int64) (*p["participants"].getArray())[0]["id"], (juce::int64) clientTwo);
 
             expectEquals (host.getSessionCount(), 1);
             two.socket.close();
@@ -568,7 +573,8 @@ public:
             again.send (object ({ { "t", "create" }, { "name", "Dani" }, { "role", "instrument" } }));
             const auto joined = again.waitFor ("joined");
             expect (! joined.isVoid());
-            expect ((int) joined["clientId"] > 2, "client ids keep increasing across sessions");
+            const auto again1 = (juce::int64) joined["clientId"];
+            expect (again1 > 0 && again1 <= 0x7FFFFFFFLL, "clientId = " + juce::String (again1));
             host.stop();
             expectEquals (host.getSessionCount(), 0);
         }

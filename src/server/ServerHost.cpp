@@ -13,6 +13,7 @@
 #include "core/Sha1.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 namespace ensayo
@@ -866,9 +867,9 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
         else
         {
 
-        session->mix.setNextParticipantId (nextClientId.load());
-        clientId = session->mix.addParticipant (name.isEmpty() ? "Musico " + juce::String (nextClientId.load()) : name, role);
-        nextClientId.store (clientId + 1);
+        // Random ids: the UDP endpoint binds to the first datagram carrying the id, so it must not be guessable.
+        clientId = allocateClientId();
+        session->mix.addParticipantWithId (clientId, name.isEmpty() ? "Musico " + juce::String (session->connections.size() + 1) : name, role);
 
         slot->address.store (0);
         slot->lastSeenMs.store (0);
@@ -899,6 +900,27 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
     broadcastParticipants (*session);
     broadcastTransport (*session);
     log (name + " (" + juce::String (clientId) + ") entro a " + session->id);
+}
+
+bool ServerHost::isClientIdInUse (uint32_t clientId) const noexcept
+{
+    for (const auto& session : sessions)
+        if (session->findEndpoint (clientId) != nullptr)
+            return true;
+
+    return false;
+}
+
+uint32_t ServerHost::allocateClientId()
+{
+    // [1, 2^31 - 1]: travels as a JSON number, so it stays within int32. Unique across every session on this host.
+    for (;;)
+    {
+        const auto id = (uint32_t) (1 + random.nextInt (std::numeric_limits<int32_t>::max()));
+
+        if (! isClientIdInUse (id))
+            return id;
+    }
 }
 
 void ServerHost::leaveSession (Connection& connection)

@@ -25,6 +25,10 @@ public:
     FrameSize frameSize() const noexcept;
 
     uint32_t addParticipant (const juce::String& name, Role);   // ids start at 1 and never repeat
+    // Extra (not part of the plan contract): adds a participant under a caller-chosen id (a host hands out random
+    // ids so audio endpoints cannot be guessed). False, and nothing added, when id is 0 or already present.
+    // Sequential ids handed out later by addParticipant() stay above it.
+    bool addParticipantWithId (uint32_t id, const juce::String& name, Role);
     void removeParticipant (uint32_t id);
     std::vector<ParticipantInfo> getParticipants() const;
     bool isEmpty() const;
