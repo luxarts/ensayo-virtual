@@ -34,6 +34,8 @@ FetchContent_MakeAvailable(opus)
 # Sources shared by the app, the server and the test runner. Each marker is owned by one task.
 set(ENSAYO_CORE_SOURCES
     # T2
+    src/core/Protocol.cpp
+    src/core/MixMath.cpp
     # T3
     # T4
     # T6
@@ -51,6 +53,8 @@ set(ENSAYO_TEST_SOURCES
     tests/TestMain.cpp
     tests/BuildConfigTests.cpp
     # T2-tests
+    tests/ProtocolTests.cpp
+    tests/MixMathTests.cpp
     # T3-tests
     # T4-tests
     # T5-tests
