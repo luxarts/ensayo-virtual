@@ -103,6 +103,18 @@ public:
             return true;
         }
 
+        // True when the server closes the connection within timeoutMs (replies received meanwhile are queued).
+        bool waitForClose (int timeoutMs)
+        {
+            const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+
+            while (juce::Time::getMillisecondCounter() < deadline)
+                if (! pump (100))
+                    return true;
+
+            return false;
+        }
+
         juce::StreamingSocket socket;
         std::string pending;
         std::deque<juce::var> queue;
@@ -262,6 +274,41 @@ public:
             expect (! three.waitFor ("error").isVoid(), "no error when not joined");
             three.send (object ({ { "t", "nonsense" } }));
             expect (! three.waitFor ("error").isVoid(), "no error for unknown message");
+            expectEquals (host.getSessionCount(), 1);
+        }
+
+        beginTest ("oversized or deeply nested control lines disconnect the client without crashing");
+        {
+            // juce::JSON::parse recurses per nesting level: a line of 60 000 '[' (or 4 000, still under the 8 KB
+            // line cap) must never reach it.
+            Client huge;
+            expect (huge.connect());
+            std::string line (60000, '[');
+            line += '\n';
+            huge.sendRaw (line.data(), (int) line.size());
+            expect (huge.waitForClose (3000), "60 000-byte line did not disconnect the client");
+
+            Client nested;
+            expect (nested.connect());
+            std::string deep (4000, '[');
+            deep += '\n';
+            nested.sendRaw (deep.data(), (int) deep.size());
+            expect (nested.waitForClose (3000), "4 000-level line did not disconnect the client");
+
+            // An ordinary 100-level line is fine for the parser but over the depth cap: also dropped.
+            Client overCap;
+            expect (overCap.connect());
+            std::string capped = "{\"t\":\"ping\",\"x\":" + std::string (40, '[') + std::string (40, ']') + "}\n";
+            overCap.sendRaw (capped.data(), (int) capped.size());
+            expect (overCap.waitForClose (3000), "41-level line did not disconnect the client");
+
+            // A legitimately nested message under the cap still parses.
+            Client under;
+            expect (under.connect());
+            std::string ok = "{\"t\":\"ping\",\"t0\":7,\"x\":" + std::string (20, '[') + std::string (20, ']') + "}\n";
+            under.sendRaw (ok.data(), (int) ok.size());
+            expect (! under.waitFor ("pong").isVoid(), "21-level line was not answered");
+
             expectEquals (host.getSessionCount(), 1);
         }
 

@@ -19,9 +19,48 @@ namespace ensayo
 {
 namespace
 {
-    constexpr size_t maxLineBytes = 64 * 1024;
+    constexpr size_t maxLineBytes = 8 * 1024;    // longer control lines drop the connection
+    constexpr int maxNestingDepth = 32;          // juce::JSON::parse recurses per level: deeper lines never reach it
     constexpr int64_t maxUploadBytes = 512LL * 1024 * 1024;
     constexpr int64_t endpointSilenceMs = 2000;
+
+    // Linear scan of the bracket/brace nesting (ignoring characters inside strings). Unbalanced closers are
+    // left to the parser; only the depth matters here.
+    bool nestsDeeperThan (const char* data, size_t len, int maxDepth) noexcept
+    {
+        int depth = 0;
+        bool inString = false, escaped = false;
+
+        for (size_t i = 0; i < len; ++i)
+        {
+            const char c = data[i];
+
+            if (inString)
+            {
+                if (escaped)            escaped = false;
+                else if (c == '\\')     escaped = true;
+                else if (c == '"')      inString = false;
+
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = true;
+            }
+            else if (c == '[' || c == '{')
+            {
+                if (++depth > maxDepth)
+                    return true;
+            }
+            else if (c == ']' || c == '}')
+            {
+                --depth;
+            }
+        }
+
+        return false;
+    }
 
     juce::var errorMessage (const juce::String& text)
     {
@@ -169,7 +208,15 @@ struct ServerHost::Connection : public juce::Thread
             if (newline == pending.end())
                 return pending.size() <= maxLineBytes;
 
-            const juce::String line = juce::String::fromUTF8 (pending.data(), (int) (newline - pending.begin()));
+            const auto lineLen = (size_t) (newline - pending.begin());
+
+            if (lineLen > maxLineBytes || nestsDeeperThan (pending.data(), lineLen, maxNestingDepth))
+            {
+                send (errorMessage ("Mensaje demasiado grande"));
+                return false;
+            }
+
+            const juce::String line = juce::String::fromUTF8 (pending.data(), (int) lineLen);
             pending.erase (pending.begin(), newline + 1);
 
             if (auto message = parseLine (line))
