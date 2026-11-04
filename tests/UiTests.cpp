@@ -1,9 +1,28 @@
 #include "ui/MainComponent.h"
+#include "MessagePump.h"
 
 namespace ensayo
 {
 namespace
 {
+    // Pumps the message loop until the predicate holds or the timeout passes.
+    bool waitFor (const std::function<bool()>& predicate, int timeoutMs)
+    {
+        const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+
+        while (juce::Time::getMillisecondCounter() < deadline)
+        {
+            if (predicate())
+                return true;
+
+            pumpMessages (10);
+        }
+
+        return predicate();
+    }
+
+    juce::String statusText (juce::Component& root);
+
     juce::Component* findByName (juce::Component& root, const juce::String& name)
     {
         if (root.getName() == name)
@@ -28,6 +47,14 @@ namespace
         }
 
         return false;
+    }
+
+    juce::String statusText (juce::Component& root)
+    {
+        if (auto* label = dynamic_cast<juce::Label*> (findByName (root, "status.text")))
+            return label->getText();
+
+        return {};
     }
 
     const char* const lobbyNames[] = {
@@ -110,6 +137,31 @@ public:
             auto& session = main.getSession();
             expect (session.getState().sessionId == "DEMO42");
             expect (findByName (main, "session.link")->getName() == "session.link");
+        }
+
+        beginTest ("a second Crear sesion while the first join is pending tears the first attempt down");
+        {
+            MainComponent main;
+            main.setVisible (true);
+            main.setSize (1100, 760);
+            auto& lobby = main.getLobby();
+            lobby.nameEditor.setText ("Ana", juce::dontSendNotification);
+
+            lobby.createButton.onClick();
+            expect (! main.isInSession());
+            expect (! lobby.createButton.isEnabled() && ! lobby.joinButton.isEnabled(), "buttons stay enabled while connecting");
+            expect (statusText (main).contains ("Conectando"), "status: " + statusText (main));
+
+            // What a queued click or an ensayo:// link arriving while the first join is pending does: the first host
+            // and client attempt must be torn down (not replaced underneath the frame hook) and the second must win.
+            lobby.createButton.onClick();
+            expect (waitFor ([&] { return main.isInSession(); }, 5000), "embedded session never joined: " + statusText (main));
+            expect (lobby.createButton.isEnabled() && lobby.joinButton.isEnabled(), "buttons not re-enabled after joined");
+            expect (main.getSession().getState().participants.size() == 1);
+
+            main.getSession().onLeave();
+            expect (! main.isInSession());
+            expect (lobby.createButton.isEnabled());
         }
 
         beginTest ("session view renders from a state alone");

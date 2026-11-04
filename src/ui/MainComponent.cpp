@@ -141,11 +141,18 @@ MainComponent::MainComponent()
                             : defaultSettingsFile();
     settings = loadSettings (settingsFile);
 
-    // The hook stays installed for the lifetime of the engine; it only ticks while an embedded host is active.
+    // The hook stays installed for the lifetime of the engine (device reopens keep it); it only ticks while an
+    // embedded host is active. Handshake with detachHostFromAudioThread(): the flag is raised BEFORE the pointer
+    // is read, and the message thread clears the pointer BEFORE it waits on the flag (both seq_cst), so either
+    // this call sees nullptr or the teardown sees the flag and waits for tick() to return.
     engine.setFrameHook ([this]
     {
-        if (auto* h = activeHost.load (std::memory_order_acquire))
+        hookTicking.store (true, std::memory_order_seq_cst);
+
+        if (auto* h = activeHost.load (std::memory_order_seq_cst))
             h->tick();
+
+        hookTicking.store (false, std::memory_order_release);
     });
 
     addAndMakeVisible (lobby);
@@ -191,9 +198,7 @@ MainComponent::~MainComponent()
     client.onStateChanged = nullptr;
     client.onError = nullptr;
     client.onJoined = nullptr;
-    engine.setTransport (nullptr);
-    client.leave();
-    stopEmbeddedHost();
+    teardownConnection();
     saveSettingsNow();
 }
 
@@ -642,6 +647,7 @@ void MainComponent::wireClient()
 {
     client.onJoined = [this]
     {
+        setConnecting (false);
         engine.setTransport (&client);
         const auto& s = client.getState();
         SessionLink link { host != nullptr ? firstLanAddress() : s.host, s.port, s.sessionId };
@@ -671,12 +677,17 @@ void MainComponent::wireClient()
 
     client.onError = [this] (const juce::String& message)
     {
-        engine.setTransport (nullptr);
-        client.leave();
-        stopEmbeddedHost();
+        teardownConnection();
         showLobby();
         setStatus (message, true, true);
     };
+}
+
+void MainComponent::setConnecting (bool pending)
+{
+    connecting = pending;
+    lobby.createButton.setEnabled (! pending);
+    lobby.joinButton.setEnabled (! pending);
 }
 
 void MainComponent::createSession()
@@ -689,8 +700,9 @@ void MainComponent::createSession()
         return;
     }
 
-    if (inSession)
-        leaveSession();
+    // Unconditional: a second click while the previous TCP join is still pending must not replace `host` under
+    // the frame hook's feet, nor leave the old client threads running.
+    teardownConnection();
 
     ServerConfig config;
     config.tcpPort = config.udpPort = settings.hostPort;
@@ -712,7 +724,8 @@ void MainComponent::createSession()
         host->startInternalClock();
 
     lastWasCreate = true;
-    setStatus (ES ("Creando sesión…"));
+    setConnecting (true);
+    setStatus (ES ("Creando sesión… Conectando…"));
     client.create ("127.0.0.1", settings.hostPort, settings.name, settings.role);
 }
 
@@ -736,24 +749,44 @@ void MainComponent::joinFromLink (const SessionLink& link)
     if (settings.name.isEmpty())
         settings.name = "Invitado";
 
-    if (inSession)
-        leaveSession();
+    teardownConnection();   // unconditional, see createSession
 
     lobby.linkEditor.setText (link.toString(), juce::dontSendNotification);
     lastJoinLink = link;
     lastWasCreate = false;
+    setConnecting (true);
     setStatus ("Conectando a " + link.host + ":" + juce::String (link.port) + ES ("…"));
     client.join (link, settings.name, settings.role);
 }
 
 void MainComponent::leaveSession()
 {
-    client.leave();
-    engine.setTransport (nullptr);
-    stopEmbeddedHost();
-    demoMode = false;
+    teardownConnection();
     showLobby();
     setStatus (ES ("Saliste de la sesión"));
+}
+
+// Safe order: the audio thread stops ticking the host, then stops sending through the client, then the client's
+// threads go away, then the host. Safe to call when nothing is connected.
+void MainComponent::teardownConnection()
+{
+    detachHostFromAudioThread();
+    engine.setTransport (nullptr);
+    client.leave();
+    stopEmbeddedHost();
+    demoMode = false;
+    setConnecting (false);
+}
+
+void MainComponent::detachHostFromAudioThread()
+{
+    activeHost.store (nullptr, std::memory_order_seq_cst);
+
+    // A tick() that loaded the old pointer before our store has already raised hookTicking (seq_cst on both
+    // sides), so spinning here guarantees it has returned before the host can be destroyed. A tick is a few
+    // microseconds; the device being stopped simply leaves the flag down.
+    while (hookTicking.load (std::memory_order_seq_cst))
+        juce::Thread::yield();
 }
 
 void MainComponent::stopEmbeddedHost()
@@ -761,8 +794,7 @@ void MainComponent::stopEmbeddedHost()
     if (host == nullptr)
         return;
 
-    activeHost.store (nullptr, std::memory_order_release);
-    juce::Thread::sleep (20);   // let an in-flight tick() finish before the host goes away
+    detachHostFromAudioThread();
     host->stop();
     host = nullptr;
 }
