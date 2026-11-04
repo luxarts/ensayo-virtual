@@ -42,6 +42,9 @@ set(ENSAYO_CORE_SOURCES
     # T4
     # T6
     # T7
+    src/client/SessionLink.cpp
+    src/client/SessionClient.cpp
+    src/client/YouTubeImporter.cpp
     # T8
     # T10
 )
@@ -65,6 +68,9 @@ set(ENSAYO_TEST_SOURCES
     # T5-tests
     # T6-tests
     # T7-tests
+    tests/SessionLinkTests.cpp
+    tests/SessionClientTests.cpp
+    tests/YouTubeImporterTests.cpp
     # T8-tests
     # T10-tests
 )
