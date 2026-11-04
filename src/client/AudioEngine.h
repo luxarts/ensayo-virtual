@@ -6,6 +6,7 @@
 #include "core/MixMath.h"
 #include "PluginSlot.h"
 #include "FakeAudioDevice.h"
+#include "AudioTransportInterface.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <array>
 #include <atomic>
@@ -13,16 +14,6 @@
 #include <memory>
 namespace ensayo
 {
-// What the engine needs from the network side. SessionClient (Task 7) implements it.
-class AudioTransport
-{
-public:
-    virtual ~AudioTransport() = default;
-    virtual void sendAudio (const uint8_t* packet, size_t len) noexcept = 0;   // audio thread → queue
-    virtual JitterBuffer& receiveBuffer() noexcept = 0;                        // filled by the network thread
-    virtual uint32_t getClientId() const noexcept = 0;
-    virtual uint32_t getTrackPosition() const noexcept = 0;
-};
 // Called once per frame from the audio thread when this client hosts the embedded server (ServerHost::tick).
 using FrameHook = std::function<void()>;
 
