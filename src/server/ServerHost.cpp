@@ -23,6 +23,7 @@ namespace
     constexpr int maxNestingDepth = 32;          // juce::JSON::parse recurses per level: deeper lines never reach it
     constexpr int64_t maxUploadBytes = 512LL * 1024 * 1024;
     constexpr int64_t endpointSilenceMs = 2000;
+    constexpr size_t maxConnections = 64;        // live TCP connections (joined or not); more are closed on accept
 
     // Linear scan of the bracket/brace nesting (ignoring characters inside strings). Unbalanced closers are
     // left to the parser; only the depth matters here.
@@ -85,14 +86,20 @@ namespace
         return juce::var (array);
     }
 
+    bool isUsableFileName (const juce::String& name) noexcept
+    {
+        return name.isNotEmpty() && name != "." && name != "..";
+    }
+
     juce::String sanitizeFileName (const juce::String& name)
     {
-        auto clean = juce::File::createLegalFileName (name.trim()).replaceCharacters ("/\\", "__");
+        const auto trimmed = name.trim();
 
-        if (clean.isEmpty())
-            clean = "track";
+        if (! isUsableFileName (trimmed))
+            return "track";
 
-        return clean.substring (0, 120);
+        auto clean = juce::File::createLegalFileName (trimmed).replaceCharacters ("/\\", "__").substring (0, 120);
+        return isUsableFileName (clean) ? clean : "track";
     }
 
     uint64_t packAddress (const sockaddr_in& address) noexcept
@@ -129,6 +136,13 @@ struct ServerHost::Session
         : host (h), id (std::move (sessionId)), mix (frameSize), endpoints ((size_t) juce::jmax (1, maxParticipants))
     {
         sender = [this] (uint32_t clientId, const uint8_t* data, size_t len) { host.sendMix (*this, clientId, data, len); };
+    }
+
+    ~Session()
+    {
+        // Uploaded tracks live in a folder named after the session: gone with it.
+        if (isValidSessionId (id))
+            host.config.uploadDirectory.getChildFile (id).deleteRecursively();
     }
 
     Endpoint* findEndpoint (uint32_t clientId) noexcept
@@ -595,6 +609,19 @@ std::shared_ptr<ServerHost::Session> ServerHost::findSession (const juce::String
 //==============================================================================
 void ServerHost::onConnectionAccepted (juce::StreamingSocket* socket)
 {
+    {
+        const juce::ScopedLock scoped (connectionsLock);
+        const auto live = (size_t) std::count_if (connections.begin(), connections.end(),
+                                                  [] (const auto& c) { return ! c->finished.load (std::memory_order_acquire); });
+
+        if (live >= maxConnections)
+        {
+            const std::unique_ptr<juce::StreamingSocket> refused (socket);
+            log ("conexion rechazada desde " + socket->getHostName() + ": limite de " + juce::String (maxConnections));
+            return;
+        }
+    }
+
     auto connection = std::make_shared<Connection> (*this, socket);
 
     {

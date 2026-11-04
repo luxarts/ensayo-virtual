@@ -418,6 +418,72 @@ public:
             expect (! one.waitFor ("error", 5000).isVoid(), "corrupt upload not rejected");
             expect (! config.uploadDirectory.getChildFile (sessionId).getChildFile ("bad.wav").existsAsFile());
             expect (config.uploadDirectory.getChildFile (sessionId).getChildFile ("click.wav").existsAsFile());
+
+            // Names that would leave the session folder fall back to "track" (which the decoder then rejects, having
+            // no extension); the folder itself and the loaded track are untouched.
+            for (const char* bad : { "..", ".", "  " })
+            {
+                one.send (object ({ { "t", "track_upload_begin" }, { "name", bad }, { "size", (juce::int64) wav.getSize() }, { "sha1", sha1 } }));
+                one.sendRaw (wav.getData(), (int) wav.getSize());
+                expect (! one.waitFor ("error", 5000).isVoid(), juce::String ("upload named '") + bad + "' not rejected");
+            }
+
+            expect (config.uploadDirectory.getChildFile (sessionId).isDirectory());
+            expect (config.uploadDirectory.getChildFile (sessionId).getChildFile ("click.wav").existsAsFile());
+            expect (! config.uploadDirectory.getChildFile (sessionId).getChildFile ("track").exists());
+            expect (one.waitFor ("error", 300).isVoid(), "stray error after the rejected uploads");
+        }
+
+        beginTest ("more than 64 TCP connections are refused");
+        {
+            std::vector<std::unique_ptr<Client>> extra;
+            int refused = 0;
+
+            for (int i = 0; i < 70; ++i)
+            {
+                auto client = std::make_unique<Client>();
+
+                if (client->connect())
+                    extra.push_back (std::move (client));
+                else
+                    ++refused;
+            }
+
+            // A refused connection is accepted by the OS and closed by the server right away: its ping is never answered.
+            for (auto& client : extra)
+            {
+                client->send (object ({ { "t", "ping" }, { "t0", 1.0 } }));
+
+                if (client->waitFor ("pong", 1500).isVoid())
+                    ++refused;
+            }
+
+            logMessage ("refused connections: " + juce::String (refused));
+            expect (refused >= 6 && refused <= 12, "refused = " + juce::String (refused));   // 70 - (64 - live ones)
+
+            one.send (object ({ { "t", "ping" }, { "t0", 2.0 } }));
+            expect (! one.waitFor ("pong").isVoid(), "joined client lost service under the connection cap");
+            // Closing them frees their slots as soon as their threads notice.
+            extra.clear();
+            const auto freed = juce::Time::getMillisecondCounter();
+            bool slotFree = false;
+
+            while (! slotFree && juce::Time::getMillisecondCounter() - freed < 6000)
+            {
+                Client probe;
+
+                if (probe.connect())
+                {
+                    probe.send (object ({ { "t", "ping" }, { "t0", 3.0 } }));
+                    slotFree = ! probe.waitFor ("pong", 500).isVoid();
+                }
+
+                if (! slotFree)
+                    juce::Thread::sleep (100);
+            }
+
+            logMessage ("slot free after " + juce::String (juce::Time::getMillisecondCounter() - freed) + " ms");
+            expect (slotFree, "closing connections did not free a slot within 6 s");
         }
 
         beginTest ("periodic stats and transport_state");
@@ -483,6 +549,14 @@ public:
                 juce::Thread::sleep (20);
 
             expectEquals (host.getSessionCount(), 0);
+
+            // The session's upload folder goes with it.
+            const auto uploads = config.uploadDirectory.getChildFile (sessionId);
+
+            while (uploads.exists() && juce::Time::getMillisecondCounter() < deadline)
+                juce::Thread::sleep (20);
+
+            expect (! uploads.exists(), "upload folder survived the session");
         }
 
         beginTest ("stop and restart");
