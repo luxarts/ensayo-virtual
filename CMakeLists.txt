@@ -52,7 +52,6 @@ set(ENSAYO_CORE_SOURCES
     src/client/SessionClient.cpp
     src/client/YouTubeImporter.cpp
     # T8
-    # T10
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
@@ -64,6 +63,8 @@ set(ENSAYO_UI_SOURCES
     src/ui/LobbyView.cpp
     src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
+    # T10
+    src/ui/Screenshot.cpp
 )
 set(ENSAYO_TEST_SOURCES
     tests/TestMain.cpp
@@ -94,6 +95,7 @@ set(ENSAYO_TEST_SOURCES
     # T8-tests
     tests/UiTests.cpp
     # T10-tests
+    tests/ScreenshotTests.cpp
 )
 
 set(ENSAYO_MODULES
