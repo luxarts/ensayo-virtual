@@ -36,12 +36,53 @@ public:
 
             const juce::StringArray expected { "C:\\tools\\yt-dlp.exe", "-x", "--audio-format", "mp3",
                                                "--audio-quality", "0", "--no-playlist", "-o",
-                                               "C:\\tmp\\ensayo\\%(title)s.%(ext)s", "https://youtu.be/abc" };
+                                               "C:\\tmp\\ensayo\\%(title)s.%(ext)s", "--", "https://youtu.be/abc" };
 
             expectEquals (command.size(), expected.size());
 
             for (int i = 0; i < juce::jmin (command.size(), expected.size()); ++i)
                 expectEquals (command[i], expected[i]);
+
+            // The URL always follows "--", so it can never be parsed as an option.
+            const auto hostile = YouTubeImporter::buildCommand (ytDlp, "--exec=calc", outDir);
+            expectEquals (hostile[hostile.size() - 2], juce::String ("--"));
+            expectEquals (hostile[hostile.size() - 1], juce::String ("--exec=calc"));
+        }
+
+        beginTest ("start refuses a URL that is not YouTube");
+        {
+            const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                  .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("ytdlp-refuse");
+            temp.deleteRecursively();
+            temp.createDirectory();
+
+            // A fake yt-dlp that leaves a marker: it must never run.
+            const auto marker = temp.getChildFile ("ran.txt");
+            const auto fake = temp.getChildFile ("yt-dlp.cmd");
+            expect (fake.replaceWithText ("@echo off\r\necho ran > \"" + marker.getFullPathName() + "\"\r\n"));
+
+            for (const auto* url : { "--exec=calc", "https://vimeo.com/12345", "C:\\music\\song.mp3", "" })
+            {
+                YouTubeImporter importer;
+                juce::String error;
+                bool finished = false, done = false;
+                importer.onFinished = [&] (const juce::File&) { finished = true; done = true; };
+                importer.onError = [&] (const juce::String& e) { error = e; done = true; };
+
+                importer.start (fake, url, temp.getChildFile ("out"));
+
+                const auto deadline = juce::Time::getMillisecondCounter() + 5000;
+
+                while (! done && juce::Time::getMillisecondCounter() < deadline)
+                    pump (20);
+
+                expect (done && ! finished, juce::String ("no error for url '") + url + "'");
+                expectEquals (error, juce::String ("URL de YouTube no valida"));
+            }
+
+            pump (100);
+            expect (! marker.existsAsFile(), "yt-dlp was executed for a refused URL");
+            temp.deleteRecursively();
         }
 
         beginTest ("findYtDlp");
