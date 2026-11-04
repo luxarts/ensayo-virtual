@@ -974,7 +974,25 @@ void MainComponent::downloadTrack (const juce::String& url)
 void MainComponent::retry()
 {
     if (inSession)
+    {
+        // §3.7: the session survives a device error; Reintentar only reopens the device, at the session's block
+        // size. An embedded host keeps the internal clock it was handed in timerCallback.
+        if (demoMode || deviceOpen)
+            return;
+
+        settings.bufferSize = frameSamples (client.getState().frameSize);
+        openAudioFromSettings();
+
+        if (! deviceOpen)
+            return;
+
+        juce::String note;
+
+        if (matchSessionFrameSize (client.getState().frameSize, note))   // tears down + explains if the driver refused the size
+            setStatus ("Audio restablecido: " + settings.deviceName + " @ " + juce::String (settings.bufferSize) + " muestras");
+
         return;
+    }
 
     if (! deviceOpen)
         openAudioFromSettings();
@@ -1078,7 +1096,20 @@ void MainComponent::timerCallback()
     {
         audioError = true;
         deviceOpen = false;
-        setStatus ("Error de audio: " + error, true, true);
+        juce::String suffix;
+
+        // Spec §3.7: the session is kept. The embedded host was clocked only by this device's callback, so hand it
+        // to its internal clock or every participant's mix stops. ServerHost has no stopInternalClock(), so from
+        // here on the host stays on its own clock for the rest of its life: a later successful Reintentar reopens
+        // the device but never re-attaches the hook (activeHost is only set in createSession). Same mix stream.
+        if (host != nullptr && activeHost.load (std::memory_order_seq_cst) != nullptr)
+        {
+            detachHostFromAudioThread();
+            host->startInternalClock();
+            suffix = ES (". La sesión sigue con el reloj interno del servidor");
+        }
+
+        setStatus ("Error de audio: " + error + suffix, true, true);
     }
 
     flushGains (false);
