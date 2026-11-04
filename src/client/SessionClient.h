@@ -49,16 +49,20 @@ private:
     class ControlThread;
     class UdpThread;
     class UploadThread;
+    class WriterThread;
     friend class ControlThread;
     friend class UdpThread;
     friend class UploadThread;
+    friend class WriterThread;
 
     void connect (const juce::String& host, int port, const juce::var& hello);
     void stopThreads();
-    void sendLine (const juce::var& message);                    // any thread; serialised by writeLock
-    bool trySendLine (const juce::var& message);                 // skipped while an upload holds the socket
+    void sendLine (const juce::var& message);                    // any thread; queued for the writer thread, returns at once
+    bool trySendLine (const juce::var& message);                 // false (nothing queued) while an upload is on the wire
     void post (std::function<void()> fn);                        // message thread, dropped after leave()
     void notifyStateChanged();
+    void postUploadStatus (const juce::String& text, float progress);   // any thread → message thread
+    void postUploadError (const juce::String& message);
 
     // Control thread → message thread.
     void handleLine (const juce::String& line);
@@ -73,7 +77,7 @@ private:
     std::atomic<uint32_t> clientId { 0 }, trackPosition { 0 };
 
     juce::StreamingSocket socket;
-    juce::CriticalSection writeLock;
+    std::unique_ptr<WriterThread> writer;           // the only thread that writes to the socket
     std::unique_ptr<ControlThread> control;
     std::unique_ptr<UdpThread> udp;
     std::unique_ptr<UploadThread> upload;

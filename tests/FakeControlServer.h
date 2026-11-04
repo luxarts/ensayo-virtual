@@ -84,6 +84,9 @@ public:
     juce::String getLastUploadSha1() const { const juce::ScopedLock lock (stateLock); return lastUploadSha1; }
     TransportState getTransport() const { const juce::ScopedLock lock (stateLock); return transport; }
 
+    // Sleeps this long after every 64 KB read of an upload, so a test can keep an upload on the wire for a while.
+    void setUploadReadDelayMs (int ms) { uploadReadDelayMs = ms; }
+
 private:
     struct Participant { uint32_t id; juce::String name; juce::String role; };
 
@@ -353,6 +356,9 @@ private:
                     return false;
 
                 data.append (chunk.data(), (size_t) n);
+
+                if (const int delay = uploadReadDelayMs.load(); delay > 0 && n > 0)
+                    juce::Thread::sleep (delay);
             }
 
             if ((juce::int64) data.getSize() > size)
@@ -464,6 +470,6 @@ private:
     uint32_t nextClientId = 1;
     TransportState transport;
     juce::String lastUploadSha1;
-    std::atomic<int> udpPacketsReceived { 0 }, uploadedBytes { 0 };
+    std::atomic<int> udpPacketsReceived { 0 }, uploadedBytes { 0 }, uploadReadDelayMs { 0 };
 };
 }
