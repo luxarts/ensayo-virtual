@@ -65,7 +65,7 @@ namespace
         "status.text", "status.retry" };
 
     const char* const sessionNames[] = {
-        "session.link", "session.copy", "session.leave",
+        "session.link", "session.copy", "session.leave", "session.editor",
         "me.voice.fader", "me.voice.mute", "me.voice.meter", "me.instrument.fader", "me.instrument.mute", "me.instrument.meter",
         "participant.1.name", "participant.1.role", "participant.1.voice.fader", "participant.1.voice.mute",
         "participant.1.instrument.fader", "participant.1.instrument.mute", "participant.1.meter",

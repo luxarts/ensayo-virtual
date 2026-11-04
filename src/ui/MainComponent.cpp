@@ -240,13 +240,33 @@ void MainComponent::saveSettingsNow()
     saveSettings (settings, settingsFile);
 }
 
+// The address other people on the LAN can reach: a private (RFC 1918) IPv4 first, then any other routable IPv4.
+// Link-local 169.254.x.x comes from adapters without a network (virtual switches, unplugged ports) and is never useful.
 juce::String MainComponent::firstLanAddress()
 {
-    for (const auto& address : juce::IPAddress::getAllAddresses (false))
-        if (! address.isIPv6 && address != juce::IPAddress::local() && address.toString() != "0.0.0.0")
-            return address.toString();
+    juce::String fallback;
 
-    return "127.0.0.1";
+    for (const auto& address : juce::IPAddress::getAllAddresses (false))
+    {
+        if (address.isIPv6 || address == juce::IPAddress::local())
+            continue;
+
+        const auto text = address.toString();
+        const auto a = address.address[0], b = address.address[1];
+
+        if (text == "0.0.0.0" || (a == 169 && b == 254))
+            continue;
+
+        const bool isPrivate = (a == 10) || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31);
+
+        if (isPrivate)
+            return text;
+
+        if (fallback.isEmpty())
+            fallback = text;
+    }
+
+    return fallback.isNotEmpty() ? fallback : "127.0.0.1";
 }
 
 //==============================================================================
@@ -581,11 +601,14 @@ void MainComponent::updatePluginButtons()
     lobby.removeButton.setEnabled (loaded);
     lobby.bypassButton.setEnabled (loaded);
     lobby.editorButton.setButtonText (pluginWindow != nullptr ? "Cerrar editor" : "Abrir editor");
+    session.setPluginEditorState (loaded, pluginWindow != nullptr);
 }
 
 //==============================================================================
 void MainComponent::wireSession()
 {
+    session.onToggleEditor = [this] { togglePluginEditor(); };
+
     session.onCopyLink = [this]
     {
         juce::SystemClipboard::copyTextToClipboard (currentLink);

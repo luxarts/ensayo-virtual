@@ -155,6 +155,55 @@ public:
             temp.deleteRecursively();
         }
 
+        beginTest ("parseDestinationLine");
+        {
+            expectEquals (YouTubeImporter::parseDestinationLine ("[download] Destination: C:\\tmp\\Song.m4a"), juce::String ("C:\\tmp\\Song.m4a"));
+            expectEquals (YouTubeImporter::parseDestinationLine ("[download] C:\\tmp\\Song.m4a has already been downloaded"), juce::String ("C:\\tmp\\Song.m4a"));
+            expectEquals (YouTubeImporter::parseDestinationLine ("[ExtractAudio] Destination: out.mp3"), juce::String ("out.mp3"));
+            expectEquals (YouTubeImporter::parseDestinationLine ("[download]  42.0% of 3.00MiB"), juce::String());
+            expectEquals (YouTubeImporter::parseDestinationLine ("[youtube] abc: Downloading webpage"), juce::String());
+        }
+
+        beginTest ("a video yt-dlp already had (old file, 'already been downloaded') is still delivered");
+        {
+            const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                  .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("ytdlp-cached");
+            temp.deleteRecursively();
+            temp.createDirectory();
+            const auto outDir = temp.getChildFile ("out");
+            outDir.createDirectory();
+
+            // The "download" is a file that already exists, with a modification time long before the run.
+            const auto cached = outDir.getChildFile ("Cached song.m4a");
+            expect (cached.replaceWithText ("old"));
+            expect (cached.setLastModificationTime (juce::Time::getCurrentTime() - juce::RelativeTime::days (400)));
+
+            const auto fake = temp.getChildFile ("yt-dlp.cmd");
+            juce::String script;
+            script << "@echo off\r\n"
+                   << "echo [download] " << cached.getFullPathName() << " has already been downloaded\r\n"
+                   << "echo [download] 100%% of 3.00MiB\r\n";
+            expect (fake.replaceWithText (script));
+
+            YouTubeImporter importer;
+            juce::File finished;
+            juce::String error;
+            bool done = false;
+            importer.onFinished = [&] (const juce::File& f) { finished = f; done = true; };
+            importer.onError = [&] (const juce::String& e) { error = e; done = true; };
+            importer.start (fake, "https://www.youtube.com/watch?v=abc", outDir);
+
+            const auto deadline = juce::Time::getMillisecondCounter() + 15000;
+
+            while (! done && juce::Time::getMillisecondCounter() < deadline)
+                pump (20);
+
+            expect (done, "importer never finished");
+            expect (error.isEmpty(), "importer failed: " + error);
+            expect (finished == cached, "delivered " + finished.getFullPathName());
+            temp.deleteRecursively();
+        }
+
         beginTest ("findDeno looks next to yt-dlp first");
         {
             const auto temp = juce::File::getSpecialLocation (juce::File::tempDirectory)

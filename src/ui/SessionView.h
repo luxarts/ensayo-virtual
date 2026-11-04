@@ -57,7 +57,10 @@ public:
     int getNumParticipantStrips() const noexcept           { return (int) participantStrips.size(); }
     FaderStrip& getLocalStrip() noexcept                   { return meStrip; }
 
-    std::function<void()> onCopyLink, onLeave, onLoadFile;
+    // The VST editor is also reachable from the session (the lobby is hidden while playing).
+    void setPluginEditorState (bool pluginLoaded, bool editorOpen);
+
+    std::function<void()> onCopyLink, onLeave, onLoadFile, onToggleEditor;
     std::function<void (const juce::String& url)> onDownload;
     std::function<void (const ChannelGain& voice, const ChannelGain& instrument)> onMonitorChanged;
     std::function<void (uint32_t id, const ChannelGain&)> onParticipantGain;   // voiceDb + instrumentDb + muted (any)
@@ -74,7 +77,7 @@ private:
     bool hasState = false;
 
     juce::Label linkTitle, linkLabel, hintLabel;
-    juce::TextButton copyButton, leaveButton;
+    juce::TextButton copyButton, leaveButton, editorButton;
 
     FaderStrip meStrip;
     juce::Viewport stripViewport;

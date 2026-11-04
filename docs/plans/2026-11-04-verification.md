@@ -16,7 +16,7 @@ Cobertura por unidad: BuildConfig (4), Protocol (9), MixMath (6), OpusCodec (6),
 SpscQueue (5), BackingTrack, MixServer, ServerHost (incl. HighResClock), PluginSlot,
 FakeAudioDevice, AudioEngine, Settings, SessionLink, SessionClient (contra servidor falso TCP/UDP),
 YouTubeImporter (con yt-dlp falso), HeadlessClient (incl. prueba de latencia de dos clientes en
-proceso: mediana 23–28 ms), Ui (lobby 20 controles, sesión 49), Screenshot.
+proceso: mediana 23–28 ms), Ui (lobby 20 controles, sesión 49; 50 desde que la sesión tiene "Abrir editor VST"), Screenshot.
 
 ## Integración (Release, `tests\integration\run-all.ps1`)
 
@@ -153,6 +153,37 @@ Media Foundation (`src/server/MediaFoundationAudioFormat.*`).
   pico de audio 0.471. Suite completa (7 scripts) PASS: two-instances 13.09 ms, embedded-host
   14.16 ms, packet-loss 13.45 ms, asio-loopback 37.46 ms.
 - Zip 0.1.1: 72 MB (deno 98 MB y yt-dlp 24 MB sin comprimir).
+
+## Uso real en la ventana (UI Automation, 2026-11-04)
+
+Primer reporte de uso: "Descargar muestra Descargando, pasa a listo y no pasa nada". Para
+reproducirlo sin intervención se automatizó la ventana real con UI Automation de Windows
+(`AutomationElement` por nombre de botón, `InvokePattern`, SendKeys en los editores, capturas con
+PrintWindow): crear sesión con el MiniFuse, pegar la URL, Descargar, esperar, Play, Salir.
+
+Hallazgos y correcciones:
+
+1. **Descarga repetida descartada**: con el video ya en caché yt-dlp imprime "`<archivo> has
+   already been downloaded`" y deja el archivo con su fecha vieja; el importador sólo aceptaba
+   archivos modificados después de arrancar → "yt-dlp falló (0)" aunque el proceso saliera bien.
+   Ahora toma la ruta que yt-dlp imprime (`Destination:` / `has already been downloaded`) y
+   recién si no hay ninguna busca el audio más nuevo de la carpeta sin filtrar por fecha.
+2. **Link con IP inútil**: `firstLanAddress` devolvía la primera IPv4 no-loopback, que en esta
+   máquina es `169.254.206.134` (adaptador sin red). Ahora prefiere direcciones privadas
+   (10/8, 172.16/12, 192.168/16), ignora 169.254/16 y cae a cualquier otra ruteable.
+3. **Editor VST desde la sesión**: nuevo botón `session.editor` ("Abrir editor VST" / "Cerrar
+   editor VST") en la cabecera de la sesión, habilitado cuando hay plugin cargado; abre la
+   misma ventana que el botón del lobby. Probado con TONE3000 real: aparece la ventana
+   `'TONE3000' 1040x653`, el botón pasa a "Cerrar editor VST" y al cerrarlo desaparece.
+4. **Estado tras cargar**: "Listo" se leía como "terminó"; ahora dice "Listo: Play para
+   reproducir" (cargar no reproduce; cualquier participante aprieta Play).
+
+Resultado del flujo completo con el build corregido (`tests/integration/out/gui-youtube/`):
+sesión creada con link `ensayo://192.168.0.141:22140/…`, descarga del video de 4:09 (en caché),
+nombre y duración en pantalla, Play → botón "Pausa" y posición 0:04 / 4:09 avanzando;
+`settings.json` persiste nombre, buffer 64, plugin y su estado. Unitarias **153 / 0 fallos**;
+integración 7/7 PASS (two-instances 13.63 ms, embedded-host 12.47 ms, packet-loss 11.70 ms,
+asio-loopback 37.39 ms).
 
 ## Pendiente de verificar con hardware
 

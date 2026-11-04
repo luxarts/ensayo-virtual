@@ -32,6 +32,10 @@ public:
 
     // Parses one line of yt-dlp output; returns the fraction (0..1) when the line carries download progress.
     static std::optional<float> parseProgressLine (const juce::String& line);
+    // The file yt-dlp names in "[download] Destination: X", "[download] X has already been downloaded" (a repeat of
+    // the same video keeps the old file, with its old mtime) or a post-processor line; empty for any other line.
+    // The finished file is that one when it exists, else the newest audio file in the output folder.
+    static juce::String parseDestinationLine (const juce::String& line);
 
 private:
     class Worker;

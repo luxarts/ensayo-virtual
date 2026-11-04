@@ -1,6 +1,7 @@
 ﻿#include "client/YouTubeImporter.h"
 
 #include <juce_events/juce_events.h>
+#include <cstring>
 
 namespace ensayo
 {
@@ -17,8 +18,10 @@ namespace
         return ext == ".exe" || ext == ".cmd" || ext == ".bat" || ext == ".com";
     }
 
-    // The newest audio file yt-dlp wrote into dir after the download started (whatever container it chose).
-    juce::File newestAudioIn (const juce::File& dir, juce::Time notBefore)
+    // Fallback when yt-dlp's output named no file: the newest audio file in dir (whatever container it chose).
+    // No "modified after we started" filter: yt-dlp keeps a file it already has ("has already been downloaded")
+    // and may give a fresh file the upload date of the video as its mtime.
+    juce::File newestAudioIn (const juce::File& dir)
     {
         juce::File newest;
         juce::Time newestTime;
@@ -32,9 +35,6 @@ namespace
                 continue;
 
             const auto modified = entry.getModificationTime();
-
-            if (modified < notBefore - juce::RelativeTime::seconds (2))
-                continue;
 
             if (newest == juce::File() || modified > newestTime)
             {
@@ -79,7 +79,6 @@ public:
             return;
         }
 
-        const auto started = juce::Time::getCurrentTime();
         auto command = buildCommand (ytDlp, url, outDir, deno);
 
         // Batch files need the command interpreter.
@@ -97,7 +96,7 @@ public:
             return;
         }
 
-        juce::String pending, lastLines;
+        juce::String pending, lastLines, destination;
         juce::MemoryBlock chunk (4096);
 
         auto consumeLine = [&] (const juce::String& line)
@@ -108,6 +107,9 @@ public:
                 return;
 
             lastLines = (lastLines + "\n" + trimmed).getLastCharacters (2000);
+
+            if (const auto named = parseDestinationLine (trimmed); named.isNotEmpty())
+                destination = named;
 
             if (const auto progress = parseProgressLine (trimmed))
                 report (*progress);
@@ -158,7 +160,18 @@ public:
 
         consumeLine (pending);
         const auto exitCode = process.getExitCode();
-        const auto produced = newestAudioIn (outDir, started);
+        juce::File produced;
+
+        if (destination.isNotEmpty())
+        {
+            const juce::File named = juce::File::isAbsolutePath (destination) ? juce::File (destination)
+                                                                               : outDir.getChildFile (destination);
+            if (named.existsAsFile())
+                produced = named;
+        }
+
+        if (produced == juce::File())
+            produced = newestAudioIn (outDir);
 
         if (exitCode != 0 || produced == juce::File())
         {
@@ -334,6 +347,20 @@ juce::StringArray YouTubeImporter::buildCommand (const juce::File& ytDlp, const 
     // "--" ends option parsing, so a URL that starts with '-' can never be taken for a yt-dlp option.
     command.addArray ({ "--", url.trim() });
     return command;
+}
+
+juce::String YouTubeImporter::parseDestinationLine (const juce::String& line)
+{
+    const auto trimmed = line.trim();
+
+    for (const auto* prefix : { "[download] Destination: ", "[ExtractAudio] Destination: ", "[Merger] Merging formats into \"" })
+        if (trimmed.startsWith (prefix))
+            return trimmed.substring ((int) std::strlen (prefix)).trim().unquoted();
+
+    if (trimmed.startsWith ("[download] ") && trimmed.endsWith (" has already been downloaded"))
+        return trimmed.substring (11, trimmed.length() - 28).trim();
+
+    return {};
 }
 
 std::optional<float> YouTubeImporter::parseProgressLine (const juce::String& line)

@@ -214,7 +214,7 @@ public:
             expect (sendMs < 50.0, "sendGain blocked for " + juce::String (sendMs, 1) + " ms during an upload");
 
             const bool bigLoaded = waitFor ([&] { return a.getState().transport.name == big.getFileName()
-                                                        && a.getState().trackUploadStatus == "Listo"; }, 60000);
+                                                        && a.getState().trackUploadStatus.startsWith ("Listo"); }, 60000);
             expect (bigLoaded, "big upload did not complete: " + aError + " / " + a.getState().trackUploadStatus);
             expectEquals ((juce::int64) server.getUploadedBytes(), big.getSize());
             expectEquals (server.getLastUploadSha1(), Sha1::hexOfFile (big));

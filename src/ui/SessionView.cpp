@@ -198,6 +198,12 @@ SessionView::SessionView() : meStrip ("me", true)
     leaveButton.onClick = [this] { if (onLeave) onLeave(); };
     addAndMakeVisible (leaveButton);
 
+    editorButton.setName ("session.editor");
+    editorButton.setButtonText ("Abrir editor VST");
+    editorButton.setEnabled (false);
+    editorButton.onClick = [this] { if (onToggleEditor) onToggleEditor(); };
+    addAndMakeVisible (editorButton);
+
     meStrip.nameLabel.setText ("Yo (monitoreo)", juce::dontSendNotification);
     meStrip.roleLabel.setText ("", juce::dontSendNotification);
     meStrip.onChanged = [this]
@@ -342,6 +348,12 @@ void SessionView::setTrackGain (const ChannelGain& gain, juce::NotificationType 
 {
     trackFader.setValue ((double) gain.voiceDb, n);
     trackMute.setToggleState (gain.muted, n);
+}
+
+void SessionView::setPluginEditorState (bool pluginLoaded, bool editorOpen)
+{
+    editorButton.setEnabled (pluginLoaded);
+    editorButton.setButtonText (editorOpen ? "Cerrar editor VST" : "Abrir editor VST");
 }
 
 void SessionView::setUploadProgress (const juce::String& text, float fraction)
@@ -498,6 +510,8 @@ void SessionView::resized()
     {
         auto row = area.removeFromTop (rowH);
         leaveButton.setBounds (row.removeFromRight (90));
+        row.removeFromRight (gap);
+        editorButton.setBounds (row.removeFromRight (140));
         row.removeFromRight (gap);
         copyButton.setBounds (row.removeFromRight (110));
         row.removeFromRight (gap);

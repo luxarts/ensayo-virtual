@@ -998,7 +998,7 @@ void SessionClient::handleLine (const juce::String& line)
             state.transport.loaded = true;
             state.transport.name = name;
             state.transport.length = length;
-            state.trackUploadStatus = "Listo";
+            state.trackUploadStatus = "Listo: Play para reproducir";
             state.trackUploadProgress = 1.0f;
             notifyStateChanged();
         });
