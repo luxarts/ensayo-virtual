@@ -426,6 +426,45 @@ public:
             expect (! two.waitFor ("transport_state", 2500).isVoid(), "no periodic transport_state");
         }
 
+        beginTest ("a peer that stops reading is dropped within the stall bound without blocking the others");
+        {
+            Client slow;
+            expect (slow.connect());
+            slow.send (object ({ { "t", "join" }, { "session", sessionId }, { "name", "Lento" }, { "role", "voice" } }));
+            expect (! slow.waitFor ("joined").isVoid(), "slow client did not join");
+            expect (! one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 3; }).isVoid());
+            expect (! two.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 3; }).isVoid());
+
+            // Flood pings and never read the pongs: the server's send buffer towards `slow` fills up and every
+            // write to it would block. The connection must be dropped after the bounded stall (2 s) and the
+            // other participants must keep receiving their broadcasts meanwhile.
+            const auto ping = makeLine (object ({ { "t", "ping" }, { "t0", 0.0 } }));
+            const auto start = juce::Time::getMillisecondCounter();
+            int sent = 0;
+            juce::var dropped;
+
+            while (dropped.isVoid() && juce::Time::getMillisecondCounter() - start < 20000)
+            {
+                for (int i = 0; i < 200; ++i)
+                {
+                    if (slow.socket.write (ping.toRawUTF8(), (int) ping.getNumBytesAsUTF8()) > 0)
+                        ++sent;
+                    else
+                        juce::Thread::sleep (1);
+                }
+
+                dropped = two.waitFor ("participants", 1, [] (const juce::var& m) { return participantCount (m) == 2; });
+            }
+
+            const auto elapsed = juce::Time::getMillisecondCounter() - start;
+            logMessage ("slow peer dropped after " + juce::String (elapsed) + " ms, " + juce::String (sent) + " pings sent");
+            expect (! dropped.isVoid(), "slow peer was not dropped");
+            expect (elapsed < 15000, "drop took " + juce::String (elapsed) + " ms");
+            expect (! one.waitFor ("participants", 3000, [] (const juce::var& m) { return participantCount (m) == 2; }).isVoid());
+            expect (! one.waitFor ("stats", 2500).isVoid(), "client 1 stopped receiving stats");
+            expectEquals (host.getSessionCount(), 1);
+        }
+
         beginTest ("closing a connection removes the participant and empty sessions die");
         {
             one.socket.close();

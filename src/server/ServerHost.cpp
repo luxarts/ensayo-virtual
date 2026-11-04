@@ -151,9 +151,15 @@ struct ServerHost::Session
 //==============================================================================
 struct ServerHost::Connection : public juce::Thread
 {
+    static constexpr int64_t maxWriteStallMs = 2000;   // a peer that does not drain its socket for this long is dropped
+
     Connection (ServerHost& h, juce::StreamingSocket* s)
         : juce::Thread ("EnsayoConnection"), host (h), socket (s)
     {
+        // Non-blocking from the start (JUCE's read (..., false) would switch it anyway) so writeAll() never
+        // parks a broadcaster inside ::send.
+        u_long nonBlocking = 1;
+        ioctlsocket ((SOCKET) socket->getRawSocketHandle(), (long) FIONBIO, &nonBlocking);
     }
 
     ~Connection() override
@@ -165,8 +171,50 @@ struct ServerHost::Connection : public juce::Thread
     void send (const juce::var& message)
     {
         const auto line = makeLine (message);
+        writeAll (line.toRawUTF8(), line.getNumBytesAsUTF8());
+    }
+
+    // Writes the whole buffer, retrying partial writes and WSAEWOULDBLOCK with short sleeps for at most
+    // maxWriteStallMs in total. On failure or timeout the connection is marked dead and closed, which makes
+    // run() leave the session and finish; later sends return immediately. Called from any thread.
+    bool writeAll (const char* data, size_t len)
+    {
         const juce::ScopedLock scoped (writeLock);
-        socket->write (line.toRawUTF8(), (int) line.getNumBytesAsUTF8());
+
+        if (dead.load (std::memory_order_acquire))
+            return false;
+
+        const auto handle = (SOCKET) socket->getRawSocketHandle();
+        const auto deadline = nowMs() + maxWriteStallMs;
+
+        while (len > 0)
+        {
+            const int n = ::send (handle, data, (int) std::min<size_t> (len, 1u << 20), 0);
+
+            if (n > 0)
+            {
+                data += n;
+                len -= (size_t) n;
+                continue;
+            }
+
+            if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK && nowMs() < deadline)
+            {
+                juce::Thread::sleep (2);
+                continue;
+            }
+
+            markDead();
+            return false;
+        }
+
+        return true;
+    }
+
+    void markDead()
+    {
+        if (! dead.exchange (true, std::memory_order_acq_rel))
+            socket->close();   // the reader loop sees the closed socket and leaves the session the normal way
     }
 
     void run() override
@@ -267,6 +315,7 @@ struct ServerHost::Connection : public juce::Thread
     std::shared_ptr<Session> session;         // set while joined (under sessionsLock)
     uint32_t clientId = 0;
     juce::String name;
+    std::atomic<bool> dead { false };         // set by writeAll() on a stalled or failed write
     std::atomic<bool> finished { false };
 };
 
