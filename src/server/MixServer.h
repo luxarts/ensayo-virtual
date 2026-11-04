@@ -43,6 +43,9 @@ public:
     int tick (const Sender& send) noexcept;
     std::vector<ParticipantStats> getStats() const;
     uint32_t getTrackPosition() const noexcept;
+    // Extra (not part of the plan contract): how many ticks returned without producing a block because a control
+    // mutation was in flight. Lets the clock thread reproduce the missed block on its next tick.
+    uint32_t getBackoffCount() const noexcept;
 
     // Extra (not part of the plan contract): the id the next addParticipant() hands out, so a host that
     // multiplexes several sessions on one UDP port can keep ids unique across sessions. Only raises the counter.
@@ -67,6 +70,7 @@ private:
     mutable std::mutex controlMutex;                 // serialises control calls between themselves
     std::atomic<bool> writerActive { false };
     std::atomic<int> readers { 0 };
+    std::atomic<uint32_t> backoffs { 0 };
 
     std::vector<std::unique_ptr<Participant>> participants;
     uint32_t nextId = 1;

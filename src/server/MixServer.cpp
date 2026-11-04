@@ -221,7 +221,10 @@ void MixServer::pushAudio (const AudioPacketView& view, double arrivalMs) noexce
 int MixServer::tick (const Sender& send) noexcept
 {
     if (! tryEnterRealtime())
+    {
+        backoffs.fetch_add (1, std::memory_order_relaxed);
         return 0;
+    }
 
     // 1. Decode one block per participant (PLC on gaps), apply the fade-in and measure peaks.
     for (auto& ptr : participants)
@@ -371,5 +374,10 @@ std::vector<ParticipantStats> MixServer::getStats() const
 uint32_t MixServer::getTrackPosition() const noexcept
 {
     return trackPosition.load (std::memory_order_relaxed);
+}
+
+uint32_t MixServer::getBackoffCount() const noexcept
+{
+    return backoffs.load (std::memory_order_relaxed);
 }
 }

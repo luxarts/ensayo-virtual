@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <limits>
 #include <string>
+#include <unordered_map>
 
 namespace ensayo
 {
@@ -160,7 +161,22 @@ struct ServerHost::Session
     MixServer mix;
     MixServer::Sender sender;
     std::vector<std::shared_ptr<Connection>> connections;
-    std::vector<Endpoint> endpoints;
+    std::vector<Endpoint> endpoints;                // fixed size: slots are stable for the session's lifetime
+    int missedTicks = 0;                            // tick thread only: blocks owed after a MixServer back-off
+};
+
+// Immutable snapshot of the live sessions and the clientId -> audio slot map, rebuilt by control threads under
+// sessionsLock and read lock-free by tick() and the UDP loop. A snapshot keeps its sessions alive while in use.
+struct ServerHost::Registry
+{
+    struct Slot
+    {
+        Session* session;
+        Session::Endpoint* endpoint;
+    };
+
+    std::vector<std::shared_ptr<Session>> sessions;
+    std::unordered_map<uint32_t, Slot> endpoints;
 };
 
 //==============================================================================
@@ -538,8 +554,11 @@ void ServerHost::stop()
         udpThread.join();
 
     {
+        // The clock and the UDP thread are gone: nothing reads the registry any more.
         const juce::SpinLock::ScopedLockType scoped (sessionsLock);
         sessions.clear();
+        retiredSessions.clear();
+        publishRegistry();
     }
 
     boundUdpPort = 0;
@@ -563,22 +582,46 @@ void ServerHost::startInternalClock()
 
 void ServerHost::tick() noexcept
 {
-    const juce::SpinLock::ScopedTryLockType scoped (sessionsLock);
+    // Lock-free and allocation-free: loading the snapshot copies a shared_ptr (a reference count), and the
+    // snapshot stays valid for the whole tick even if a control thread publishes a new one meanwhile.
+    const auto snapshot = registry.load (std::memory_order_acquire);
 
-    if (! scoped.isLocked())
-    {
-        // A control or UDP thread holds the lock: remember the frame and produce it on the next tick, so the
-        // mix stream keeps one block per period and the clients' jitter buffers do not drain by one block
-        // every time this happens.
-        missedTicks.fetch_add (1, std::memory_order_relaxed);
+    if (snapshot == nullptr)
         return;
-    }
 
-    const int catchUp = std::min (maxCatchUpTicks, missedTicks.exchange (0, std::memory_order_relaxed));
+    for (auto& session : snapshot->sessions)
+    {
+        // Safety net: a block MixServer skipped because a control mutation (join/leave/gain) was in flight is
+        // reproduced on the next tick, so the mix stream keeps one block per period and the clients' jitter
+        // buffers do not drain. With no lock on this path it should essentially never trigger.
+        const int rounds = 1 + std::min (maxCatchUpTicks, session->missedTicks);
+        session->missedTicks = 0;
 
-    for (int i = 0; i <= catchUp; ++i)
-        for (auto& session : sessions)
+        for (int round = 0; round < rounds; ++round)
+        {
+            const auto backoffs = session->mix.getBackoffCount();
             session->mix.tick (session->sender);
+
+            if (session->mix.getBackoffCount() != backoffs)
+            {
+                session->missedTicks = rounds - round;
+                break;
+            }
+        }
+    }
+}
+
+void ServerHost::publishRegistry()
+{
+    auto next = std::make_shared<Registry>();
+    next->sessions = sessions;
+
+    for (auto& session : sessions)
+        for (auto& endpoint : session->endpoints)
+            if (const auto id = endpoint.clientId.load (std::memory_order_acquire); id != 0)
+                next->endpoints.emplace (id, Registry::Slot { session.get(), &endpoint });
+
+    registry.store (std::move (next), std::memory_order_release);
 }
 
 int ServerHost::getSessionCount() const
@@ -660,6 +703,28 @@ void ServerHost::housekeeping()
         c->stopThread (2000);
 
     dead.clear();
+
+    // Destroy retired sessions once nothing else (a snapshot still held by a tick in flight) owns them.
+    std::vector<std::shared_ptr<Session>> expired;
+
+    {
+        const juce::SpinLock::ScopedLockType scoped (sessionsLock);
+
+        for (auto it = retiredSessions.begin(); it != retiredSessions.end();)
+        {
+            if (it->use_count() == 1)
+            {
+                expired.push_back (std::move (*it));
+                it = retiredSessions.erase (it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    expired.clear();   // Session destructors run here, on the housekeeping thread
 
     // Periodic stats + transport state.
     std::vector<std::shared_ptr<Session>> current;
@@ -787,6 +852,7 @@ void ServerHost::handleCreate (Connection& connection, const juce::var& message)
             }
 
             sessions.push_back (session);
+            publishRegistry();
         }
     }
 
@@ -862,7 +928,10 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
         {
             // An empty session nobody can enter is useless: drop it.
             if (session->connections.empty())
+            {
                 sessions.erase (std::remove (sessions.begin(), sessions.end(), session), sessions.end());
+                retiredSessions.push_back (session);
+            }
         }
         else
         {
@@ -888,6 +957,8 @@ void ServerHost::joinSession (Connection& connection, std::shared_ptr<Session> s
         o->setProperty ("frameSize", frameSamples (config.frameSize));
         o->setProperty ("participants", participantsToVar (session->mix.getParticipants()));
         }
+
+        publishRegistry();
     }
 
     if (full)
@@ -950,8 +1021,11 @@ void ServerHost::leaveSession (Connection& connection)
         if (session->connections.empty())
         {
             sessions.erase (std::remove (sessions.begin(), sessions.end(), session), sessions.end());
+            retiredSessions.push_back (session);
             sessionDied = true;
         }
+
+        publishRegistry();
     }
 
     log (connection.name + " (" + juce::String (connection.clientId) + ") salio de " + session->id);
@@ -1113,33 +1187,39 @@ void ServerHost::udpLoop()
         const auto now = nowMs();
         const double arrivalMs = juce::Time::getMillisecondCounterHiRes();
 
-        const juce::SpinLock::ScopedLockType scoped (sessionsLock);
+        // Lock-free lookup in the current snapshot: never contends with tick() or the control threads.
+        const auto snapshot = registry.load (std::memory_order_acquire);
 
-        for (auto& session : sessions)
+        if (snapshot == nullptr)
+            continue;
+
+        const auto it = snapshot->endpoints.find (view.clientId);
+
+        if (it == snapshot->endpoints.end())
+            continue;
+
+        auto* endpoint = it->second.endpoint;
+
+        // The slot may have been handed to someone else since this snapshot was built.
+        if (endpoint->clientId.load (std::memory_order_acquire) != view.clientId)
+            continue;
+
+        const auto known = endpoint->address.load (std::memory_order_acquire);
+
+        if (known != 0 && known != packed)
         {
-            auto* endpoint = session->findEndpoint (view.clientId);
+            if (now - endpoint->lastSeenMs.load (std::memory_order_relaxed) < endpointSilenceMs)
+                continue;   // someone else is still sending from the recorded address
 
-            if (endpoint == nullptr)
-                continue;
-
-            const auto known = endpoint->address.load (std::memory_order_acquire);
-
-            if (known != 0 && known != packed)
-            {
-                if (now - endpoint->lastSeenMs.load (std::memory_order_relaxed) < endpointSilenceMs)
-                    break;   // someone else is still sending from the recorded address
-
-                endpoint->address.store (packed, std::memory_order_release);
-            }
-            else if (known == 0)
-            {
-                endpoint->address.store (packed, std::memory_order_release);
-            }
-
-            endpoint->lastSeenMs.store (now, std::memory_order_relaxed);
-            session->mix.pushAudio (view, arrivalMs);
-            break;
+            endpoint->address.store (packed, std::memory_order_release);
         }
+        else if (known == 0)
+        {
+            endpoint->address.store (packed, std::memory_order_release);
+        }
+
+        endpoint->lastSeenMs.store (now, std::memory_order_relaxed);
+        it->second.session->mix.pushAudio (view, arrivalMs);
     }
 
     if (mmcss != nullptr)

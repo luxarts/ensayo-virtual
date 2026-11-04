@@ -33,6 +33,7 @@ public:
 private:
     struct Session;
     struct Connection;
+    struct Registry;
     class AcceptThread;
     class HousekeepingThread;
     friend struct Connection;
@@ -56,6 +57,7 @@ private:
     void broadcastTransport (Session&);
     void housekeeping();
     std::shared_ptr<Session> findSession (const juce::String& id) const;   // caller holds sessionsLock
+    void publishRegistry();                                                 // caller holds sessionsLock
 
     // UDP audio.
     void udpLoop();
@@ -65,9 +67,15 @@ private:
     std::atomic<bool> running { false };
     juce::Random random;                                    // seeded randomly; used under sessionsLock
 
-    // Protects `sessions`, each session's connection list and endpoint table. tick() try-locks it.
+    // Control threads only: protects `sessions`, `retiredSessions`, each session's connection list and the
+    // endpoint-slot assignment. The real-time paths (tick(), the UDP loop) never take it: they load `registry`,
+    // an immutable copy-on-write snapshot that publishRegistry() rebuilds under the lock after every mutation.
     mutable juce::SpinLock sessionsLock;
     std::vector<std::shared_ptr<Session>> sessions;
+    std::atomic<std::shared_ptr<const Registry>> registry;
+    // Sessions that died wait here until housekeeping sees no other owner, so a Session (its codecs, its
+    // upload folder) is never destroyed by the tick thread releasing an old snapshot.
+    std::vector<std::shared_ptr<Session>> retiredSessions;
 
     // All live connections (joined or not); reaped by housekeeping once their thread has finished.
     juce::CriticalSection connectionsLock;
@@ -77,8 +85,7 @@ private:
     std::unique_ptr<AcceptThread> acceptThread;
     std::unique_ptr<HousekeepingThread> housekeepingThread;
     std::unique_ptr<HighResClock> clock;
-    static constexpr int maxCatchUpTicks = 4;   // frames reproduced after ticks skipped on lock contention
-    std::atomic<int> missedTicks { 0 };
+    static constexpr int maxCatchUpTicks = 4;   // frames reproduced after a session's tick backed off a control mutation
 
     uintptr_t udpSocket = ~(uintptr_t) 0;     // SOCKET
     int boundUdpPort = 0;
