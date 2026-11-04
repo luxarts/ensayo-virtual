@@ -2,3 +2,5 @@ build/
 .vs/
 *.user
 out/
+tests/integration/out/
+tests/fixtures/
