@@ -35,6 +35,10 @@ buffer del servidor + tick + UDP + jitter buffer del cliente + salida).
 
 Salidas en `tests/integration/out/<script>/` (ignoradas por git).
 
+Las marcas de tiempo del click (emisión y detección) son las del inicio del bloque en cada
+extremo, así que cada medida tiene una granularidad de ±1 bloque (±2.7 ms); la mediana sobre
+≈ 40 clicks es representativa.
+
 Comparación con el presupuesto del spec (§2.4, ≈ 38 ms con ping 10 ms): en loopback el ping es
 ≈ 0, así que el resto del pipeline (≈ 22–25 ms) coincide con lo previsto: 2 × ~2.7 ms de bloque
 + jitter buffers de 3–4 bloques en cada extremo + codec.

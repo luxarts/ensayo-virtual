@@ -134,13 +134,15 @@ ASIO in instr ───┤► VST3 ─► instr L/R ┼─► monitor (fader ins
 **UDP — paquete de audio cliente→servidor** (little-endian):
 
 ```
-u8  magic = 0xEA   u8 version = 1   u8 flags (bit0 voz, bit1 instr)   u8 frameCode (0 = 64, 1 = 128)
+u8  magic = 0xEA   u8 version = 1   u8 flags (bit0 voz, bit1 instr, bit2 mezcla)   u8 frameCode (0 = 64, 1 = 128)
 u16 seq            u32 clientId     u32 sampleTime (contador de muestras del emisor)
-u16 lenVoz  u16 lenInstr   bytes voz   bytes instr
+u32 trackPosition (muestras; 0 en cliente→servidor)
+u8  lenVoz   u8 lenInstr   bytes voz   bytes instr          (encabezado fijo de 20 bytes)
 ```
 
 **UDP — servidor→cliente**: mismo encabezado con `flags` bit2 = mezcla estéreo, `clientId` = 0,
-`lenVoz` = largo del payload estéreo, `lenInstr` = 0, más `u32 trackPosition` (muestras, para la UI).
+`lenVoz` = largo del payload estéreo, `lenInstr` = 0 y `trackPosition` con la posición del
+backing track (para la UI).
 
 Tamaños CBR por frame (mono): 64 → 24 B, 128 → 48 B; estéreo: 64 → 48 B, 128 → 96 B
 (≈ 144–288 kbit/s por stream). El cliente aprende `clientId` al unirse por TCP; el servidor
