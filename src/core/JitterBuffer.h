@@ -11,6 +11,7 @@ class JitterBuffer
 {
 public:
     static constexpr int minBlocks = 2, maxBlocks = 20, initialBlocks = 4;
+    static constexpr int lateResyncThreshold = 8;   // consecutive late packets that re-anchor the window on the stream
     JitterBuffer (int blockBytes, double blockDurationMs);
     void setAutoSize (bool enabled) noexcept;      // default true
     void setSizeBlocks (int blocks) noexcept;      // manual; clamps; resets window
@@ -72,6 +73,7 @@ private:
         uint16_t lastSeq = 0;
         double mean = 0.0, variance = 0.0, windowMax = 0.0;
         int downCount = 0;
+        int consecutiveLate = 0;
     };
     Estimator estimator;
 };

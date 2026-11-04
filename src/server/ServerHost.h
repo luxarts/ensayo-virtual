@@ -76,6 +76,8 @@ private:
     std::unique_ptr<AcceptThread> acceptThread;
     std::unique_ptr<HousekeepingThread> housekeepingThread;
     std::unique_ptr<HighResClock> clock;
+    static constexpr int maxCatchUpTicks = 4;   // frames reproduced after ticks skipped on lock contention
+    std::atomic<int> missedTicks { 0 };
 
     uintptr_t udpSocket = ~(uintptr_t) 0;     // SOCKET
     int boundUdpPort = 0;

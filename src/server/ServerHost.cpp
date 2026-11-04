@@ -455,10 +455,19 @@ void ServerHost::tick() noexcept
     const juce::SpinLock::ScopedTryLockType scoped (sessionsLock);
 
     if (! scoped.isLocked())
+    {
+        // A control or UDP thread holds the lock: remember the frame and produce it on the next tick, so the
+        // mix stream keeps one block per period and the clients' jitter buffers do not drain by one block
+        // every time this happens.
+        missedTicks.fetch_add (1, std::memory_order_relaxed);
         return;
+    }
 
-    for (auto& session : sessions)
-        session->mix.tick (session->sender);
+    const int catchUp = std::min (maxCatchUpTicks, missedTicks.exchange (0, std::memory_order_relaxed));
+
+    for (int i = 0; i <= catchUp; ++i)
+        for (auto& session : sessions)
+            session->mix.tick (session->sender);
 }
 
 int ServerHost::getSessionCount() const
