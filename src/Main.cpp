@@ -1,18 +1,9 @@
 #include "ui/MainComponent.h"
+#include "ui/Screenshot.h"
+#include "client/HeadlessClient.h"
 #include "client/SessionLink.h"
 #include "client/Settings.h"
 #include <juce_gui_extra/juce_gui_extra.h>
-#include <iostream>
-
-#if __has_include("client/HeadlessClient.h")
- #include "client/HeadlessClient.h"
- #define ENSAYO_HAS_HEADLESS 1
-#endif
-
-#if __has_include("ui/Screenshot.h")
- #include "ui/Screenshot.h"
- #define ENSAYO_HAS_SCREENSHOT 1
-#endif
 
 namespace ensayo
 {
@@ -34,7 +25,6 @@ public:
 
         if (args.contains ("--headless"))
         {
-           #if ENSAYO_HAS_HEADLESS
             juce::String error;
             const auto options = parseHeadlessOptions (args, error);
 
@@ -42,29 +32,20 @@ public:
                 headlessPrint ("error " + error);
 
             setApplicationReturnValue (options ? runHeadless (*options) : 2);
-           #else
-            std::cerr << "--headless no esta disponible en esta compilacion" << std::endl;
-            setApplicationReturnValue (2);
-           #endif
             quit();
             return;
         }
 
         if (const int index = args.indexOf ("--screenshot"); index >= 0)
         {
-           #if ENSAYO_HAS_SCREENSHOT
             const auto dir = index + 1 < args.size() ? juce::File::getCurrentWorkingDirectory().getChildFile (args[index + 1])
                                                      : juce::File::getCurrentWorkingDirectory().getChildFile ("shots");
             const auto result = runScreenshots (dir);
 
             if (result.failed())
-                std::cerr << result.getErrorMessage() << std::endl;
+                headlessPrint ("error " + result.getErrorMessage());
 
             setApplicationReturnValue (result.wasOk() ? 0 : 1);
-           #else
-            std::cerr << "--screenshot no esta disponible en esta compilacion" << std::endl;
-            setApplicationReturnValue (2);
-           #endif
             quit();
             return;
         }
