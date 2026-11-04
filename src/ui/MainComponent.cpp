@@ -141,11 +141,18 @@ MainComponent::MainComponent()
                             : defaultSettingsFile();
     settings = loadSettings (settingsFile);
 
-    // The hook stays installed for the lifetime of the engine; it only ticks while an embedded host is active.
+    // The hook stays installed for the lifetime of the engine (device reopens keep it); it only ticks while an
+    // embedded host is active. Handshake with detachHostFromAudioThread(): the flag is raised BEFORE the pointer
+    // is read, and the message thread clears the pointer BEFORE it waits on the flag (both seq_cst), so either
+    // this call sees nullptr or the teardown sees the flag and waits for tick() to return.
     engine.setFrameHook ([this]
     {
-        if (auto* h = activeHost.load (std::memory_order_acquire))
+        hookTicking.store (true, std::memory_order_seq_cst);
+
+        if (auto* h = activeHost.load (std::memory_order_seq_cst))
             h->tick();
+
+        hookTicking.store (false, std::memory_order_release);
     });
 
     addAndMakeVisible (lobby);
@@ -191,10 +198,14 @@ MainComponent::~MainComponent()
     client.onStateChanged = nullptr;
     client.onError = nullptr;
     client.onJoined = nullptr;
+
+    // Audio thread first: nothing may be inside processFrame (transport → client, hook → host) once the device
+    // is closed, so the client's threads and the host can be stopped and the members destroyed safely after.
+    detachHostFromAudioThread();
     engine.setTransport (nullptr);
-    client.leave();
-    stopEmbeddedHost();
-    saveSettingsNow();
+    engine.getDeviceManager().closeAudioDevice();
+    teardownConnection();
+    saveSettingsNow();   // settings also persist on change, debounced 1 s in timerCallback
 }
 
 void MainComponent::paint (juce::Graphics& g)
@@ -642,8 +653,16 @@ void MainComponent::wireClient()
 {
     client.onJoined = [this]
     {
-        engine.setTransport (&client);
+        setConnecting (false);
         const auto& s = client.getState();
+        juce::String frameNote;
+
+        // Must happen before the transport is attached: a 64-sample client in a 128-sample session would send
+        // packets the server rejects and decode the mix with the wrong frame size (silence, no message).
+        if (! matchSessionFrameSize (s.frameSize, frameNote))
+            return;
+
+        engine.setTransport (&client);
         SessionLink link { host != nullptr ? firstLanAddress() : s.host, s.port, s.sessionId };
         currentLink = link.toString();
         settings.lastLink = currentLink;
@@ -658,7 +677,8 @@ void MainComponent::wireClient()
         session.setState (s);
         sessionStartMs = juce::Time::getMillisecondCounter();
         showSession();
-        setStatus (host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId);
+        setStatus ((host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId)
+                   + (frameNote.isNotEmpty() ? ". " + frameNote : juce::String()));
         queueGain (0, { settings.trackDb, settings.trackDb, settings.trackMuted });
         flushGains (true);
     };
@@ -671,12 +691,81 @@ void MainComponent::wireClient()
 
     client.onError = [this] (const juce::String& message)
     {
-        engine.setTransport (nullptr);
-        client.leave();
-        stopEmbeddedHost();
+        teardownConnection();
         showLobby();
         setStatus (message, true, true);
     };
+}
+
+void MainComponent::setConnecting (bool pending)
+{
+    connecting = pending;
+    lobby.createButton.setEnabled (! pending);
+    lobby.joinButton.setEnabled (! pending);
+}
+
+FrameSize MainComponent::localFrameSize() const noexcept
+{
+    if (deviceOpen && engine.getDevice() != nullptr)
+        return engine.getFrameSize();
+
+    return settings.bufferSize == 64 ? FrameSize::f64 : FrameSize::f128;
+}
+
+bool MainComponent::matchSessionFrameSize (FrameSize wanted, juce::String& note)
+{
+    if (localFrameSize() == wanted)
+        return true;
+
+    const int samples = frameSamples (wanted);
+    settings.bufferSize = samples;
+    markSettingsDirty();
+    note = "Buffer ajustado a " + juce::String (samples) + ES (" muestras para coincidir con la sesión");
+
+    // Test mode, no device open yet, or the fake device: only the setting changes (used on the next open).
+    if (testMode || ! deviceOpen || engine.getDevice() == nullptr || engine.getFakeDevice() != nullptr)
+    {
+        refreshDeviceCombos();
+        return true;
+    }
+
+    // Same device and rate, new block size. The frame hook is a member of the engine and survives the reopen;
+    // audioDeviceAboutToStart rebuilds the codecs for the new size before the first callback.
+    const auto error = engine.openDevice ("ASIO", settings.deviceName, settings.sampleRate, samples);
+
+    if (error.isNotEmpty())
+    {
+        audioError = true;
+        deviceOpen = false;
+        refreshDeviceCombos();
+        teardownConnection();
+        showLobby();
+        setStatus ("No se pudo ajustar el buffer a " + juce::String (samples) + " muestras: " + error, true, true);
+        return false;
+    }
+
+    deviceOpen = true;
+    audioError = false;
+    refreshDeviceCombos();
+
+    if (auto* device = engine.getDevice())
+    {
+        settings.sampleRate = device->getCurrentSampleRate();
+        settings.bufferSize = device->getCurrentBufferSizeSamples();
+    }
+
+    engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
+
+    if (engine.getFrameSize() != wanted)   // the driver kept its own block size (e.g. fixed at 256 for a 64 session)
+    {
+        teardownConnection();
+        showLobby();
+        setStatus ("El dispositivo no admite bloques de " + juce::String (samples) + ES (" muestras (la sesión usa ")
+                   + juce::String (samples) + ES ("); cambialo en el Panel ASIO"), true, true);
+        return false;
+    }
+
+    return true;
 }
 
 void MainComponent::createSession()
@@ -689,12 +778,13 @@ void MainComponent::createSession()
         return;
     }
 
-    if (inSession)
-        leaveSession();
+    // Unconditional: a second click while the previous TCP join is still pending must not replace `host` under
+    // the frame hook's feet, nor leave the old client threads running.
+    teardownConnection();
 
     ServerConfig config;
     config.tcpPort = config.udpPort = settings.hostPort;
-    config.frameSize = engine.getFrameSize();
+    config.frameSize = localFrameSize();
     host = std::make_unique<ServerHost> (config);
     const auto result = host->start();
 
@@ -712,7 +802,8 @@ void MainComponent::createSession()
         host->startInternalClock();
 
     lastWasCreate = true;
-    setStatus (ES ("Creando sesión…"));
+    setConnecting (true);
+    setStatus (ES ("Creando sesión… Conectando…"));
     client.create ("127.0.0.1", settings.hostPort, settings.name, settings.role);
 }
 
@@ -736,24 +827,44 @@ void MainComponent::joinFromLink (const SessionLink& link)
     if (settings.name.isEmpty())
         settings.name = "Invitado";
 
-    if (inSession)
-        leaveSession();
+    teardownConnection();   // unconditional, see createSession
 
     lobby.linkEditor.setText (link.toString(), juce::dontSendNotification);
     lastJoinLink = link;
     lastWasCreate = false;
+    setConnecting (true);
     setStatus ("Conectando a " + link.host + ":" + juce::String (link.port) + ES ("…"));
     client.join (link, settings.name, settings.role);
 }
 
 void MainComponent::leaveSession()
 {
-    client.leave();
-    engine.setTransport (nullptr);
-    stopEmbeddedHost();
-    demoMode = false;
+    teardownConnection();
     showLobby();
     setStatus (ES ("Saliste de la sesión"));
+}
+
+// Safe order: the audio thread stops ticking the host, then stops sending through the client, then the client's
+// threads go away, then the host. Safe to call when nothing is connected.
+void MainComponent::teardownConnection()
+{
+    detachHostFromAudioThread();
+    engine.setTransport (nullptr);
+    client.leave();
+    stopEmbeddedHost();
+    demoMode = false;
+    setConnecting (false);
+}
+
+void MainComponent::detachHostFromAudioThread()
+{
+    activeHost.store (nullptr, std::memory_order_seq_cst);
+
+    // A tick() that loaded the old pointer before our store has already raised hookTicking (seq_cst on both
+    // sides), so spinning here guarantees it has returned before the host can be destroyed. A tick is a few
+    // microseconds; the device being stopped simply leaves the flag down.
+    while (hookTicking.load (std::memory_order_seq_cst))
+        juce::Thread::yield();
 }
 
 void MainComponent::stopEmbeddedHost()
@@ -761,8 +872,7 @@ void MainComponent::stopEmbeddedHost()
     if (host == nullptr)
         return;
 
-    activeHost.store (nullptr, std::memory_order_release);
-    juce::Thread::sleep (20);   // let an in-flight tick() finish before the host goes away
+    detachHostFromAudioThread();
     host->stop();
     host = nullptr;
 }
@@ -855,6 +965,12 @@ void MainComponent::downloadTrack (const juce::String& url)
         return;
     }
 
+    if (! YouTubeImporter::looksLikeYouTubeUrl (url))
+    {
+        setStatus (ES ("URL de YouTube no válida"), true, false);
+        return;
+    }
+
     const auto ytDlp = YouTubeImporter::findYtDlp (settings.ytDlpPath);
 
     if (ytDlp == juce::File())
@@ -870,7 +986,25 @@ void MainComponent::downloadTrack (const juce::String& url)
 void MainComponent::retry()
 {
     if (inSession)
+    {
+        // §3.7: the session survives a device error; Reintentar only reopens the device, at the session's block
+        // size. An embedded host keeps the internal clock it was handed in timerCallback.
+        if (demoMode || deviceOpen)
+            return;
+
+        settings.bufferSize = frameSamples (client.getState().frameSize);
+        openAudioFromSettings();
+
+        if (! deviceOpen)
+            return;
+
+        juce::String note;
+
+        if (matchSessionFrameSize (client.getState().frameSize, note))   // tears down + explains if the driver refused the size
+            setStatus ("Audio restablecido: " + settings.deviceName + " @ " + juce::String (settings.bufferSize) + " muestras");
+
         return;
+    }
 
     if (! deviceOpen)
         openAudioFromSettings();
@@ -974,7 +1108,20 @@ void MainComponent::timerCallback()
     {
         audioError = true;
         deviceOpen = false;
-        setStatus ("Error de audio: " + error, true, true);
+        juce::String suffix;
+
+        // Spec §3.7: the session is kept. The embedded host was clocked only by this device's callback, so hand it
+        // to its internal clock or every participant's mix stops. ServerHost has no stopInternalClock(), so from
+        // here on the host stays on its own clock for the rest of its life: a later successful Reintentar reopens
+        // the device but never re-attaches the hook (activeHost is only set in createSession). Same mix stream.
+        if (host != nullptr && activeHost.load (std::memory_order_seq_cst) != nullptr)
+        {
+            detachHostFromAudioThread();
+            host->startInternalClock();
+            suffix = ES (". La sesión sigue con el reloj interno del servidor");
+        }
+
+        setStatus ("Error de audio: " + error + suffix, true, true);
     }
 
     flushGains (false);

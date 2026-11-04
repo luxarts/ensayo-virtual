@@ -81,7 +81,14 @@ private:
     void createSession();
     void joinFromLinkField();
     void leaveSession();
+    void teardownConnection();                         // abandons any session or pending attempt (hook → transport → client → host)
+    void detachHostFromAudioThread();                  // clears activeHost and waits until no tick() is in flight
     void stopEmbeddedHost();
+    void setConnecting (bool);                         // disables Crear/Unirse while a TCP join is pending
+    FrameSize localFrameSize() const noexcept;         // open device's frame size, else the one settings.bufferSize implies
+    // Reopens the device at the session's frame size when they differ (before any packet is sent). On failure the
+    // connection is torn down and an error shown; returns false. `note` receives the message for the status bar.
+    bool matchSessionFrameSize (FrameSize, juce::String& note);
     void showLobby();
     void showSession();
     void queueGain (uint32_t target, const ChannelGain&);
@@ -99,10 +106,13 @@ private:
 
     AppSettings settings;
     juce::File settingsFile;
-    AudioEngine engine;
+    // Declaration order matters for destruction: the engine (and with it the audio device, whose callback reads
+    // `client` through the transport pointer and `host` through the frame hook) must die before them.
     SessionClient client;
     std::unique_ptr<ServerHost> host;
-    std::atomic<ServerHost*> activeHost { nullptr };
+    std::atomic<ServerHost*> activeHost { nullptr };   // read by the frame hook; only ever set in createSession
+    std::atomic<bool> hookTicking { false };           // raised by the frame hook around tick(); see detachHostFromAudioThread
+    AudioEngine engine;
     YouTubeImporter importer;
 
     LobbyView lobby;
@@ -113,7 +123,7 @@ private:
     std::unique_ptr<PluginWindow> pluginWindow;
     juce::Array<juce::File> vst3Files;
 
-    bool inSession = false, demoMode = false, audioError = false, deviceOpen = false;
+    bool inSession = false, demoMode = false, audioError = false, deviceOpen = false, connecting = false;
     juce::String currentLink;
     SessionLink lastJoinLink;
     bool lastWasCreate = false;
