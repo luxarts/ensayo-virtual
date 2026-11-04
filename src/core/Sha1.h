@@ -78,18 +78,15 @@ public:
         return toHex (sha.finish());
     }
 
-    // Lower-case hex of a file's contents; empty string when the file cannot be read.
-    static juce::String hexOfFile (const juce::File& file)
+    static juce::String of (const void* data, size_t len)   { return hexOf (data, len); }
+
+    // Lower-case hex of everything left in the stream.
+    static juce::String of (juce::InputStream& in)
     {
-        juce::FileInputStream in (file);
-
-        if (! in.openedOk())
-            return {};
-
         Sha1 sha;
         std::array<uint8_t, 65536> chunk {};
 
-        while (! in.isExhausted())
+        for (;;)
         {
             const int n = in.read (chunk.data(), (int) chunk.size());
 
@@ -100,6 +97,13 @@ public:
         }
 
         return toHex (sha.finish());
+    }
+
+    // Lower-case hex of a file's contents; empty string when the file cannot be read.
+    static juce::String hexOfFile (const juce::File& file)
+    {
+        juce::FileInputStream in (file);
+        return in.openedOk() ? of (in) : juce::String();
     }
 
     static juce::String toHex (const std::array<uint8_t, 20>& digest)

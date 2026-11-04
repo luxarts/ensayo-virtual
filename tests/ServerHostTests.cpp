@@ -1,6 +1,6 @@
-#include "server/ServerHost.h"
+﻿#include "server/ServerHost.h"
 #include "server/HighResClock.h"
-#include "server/Sha1.h"
+#include "core/Sha1.h"
 
 #include <cmath>
 #include <deque>

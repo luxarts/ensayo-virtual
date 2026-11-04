@@ -1,4 +1,4 @@
-#ifndef WIN32_LEAN_AND_MEAN
+﻿#ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
 #endif
 #ifndef NOMINMAX
@@ -10,7 +10,7 @@
 #include <avrt.h>
 
 #include "ServerHost.h"
-#include "Sha1.h"
+#include "core/Sha1.h"
 
 #include <algorithm>
 #include <string>
