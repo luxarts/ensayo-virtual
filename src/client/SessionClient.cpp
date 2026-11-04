@@ -604,9 +604,9 @@ public:
             return;
         }
 
-        auto* writer = owner.writer.get();   // outlives this thread: stopThreads destroys the upload first
+        auto* target = owner.writer.get();   // outlives this thread: stopThreads destroys the upload first
 
-        if (writer == nullptr)
+        if (target == nullptr)
             return;
 
         auto begin = makeMessage ("track_upload_begin");
@@ -623,7 +623,7 @@ public:
         header.header = true;
         header.total = size;
 
-        if (! writer->enqueueChunk (std::move (header), *this))
+        if (! target->enqueueChunk (std::move (header), *this))
             return;
 
         juce::int64 sent = 0;
@@ -646,7 +646,7 @@ public:
             chunk.total = size;
             chunk.last = sent >= size;
 
-            if (! writer->enqueueChunk (std::move (chunk), *this))
+            if (! target->enqueueChunk (std::move (chunk), *this))
                 return;
         }
     }
