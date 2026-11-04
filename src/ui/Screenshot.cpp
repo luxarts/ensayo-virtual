@@ -89,6 +89,9 @@ juce::Result runScreenshots (const juce::File& outDir)
     const bool previousTestMode = MainComponent::isTestMode();
     MainComponent::setTestMode (true);
 
+    // Test mode shares a temp settings file with the unit tests; the screenshots must show the defaults.
+    juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("EnsayoVirtual-test-settings.json").deleteFile();
+
     juce::Array<juce::var> controls;
     juce::Result result = juce::Result::ok();
 

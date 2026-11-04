@@ -67,6 +67,31 @@ solapamientos a 1100×760.
 3. `SessionClient::writeAll` fallaba la subida de archivos mayores que el buffer de envío del
    socket (`waitUntilReady` de JUCE usa try-lock contra el hilo lector). Ahora reintenta con sleep.
 
+## Después de la revisión de código
+
+Se corrigieron 2 hallazgos críticos (orden de destrucción en el cliente headless; doble "Crear
+sesión" tickeando un servidor liberado) y 11 importantes (ajuste del buffer al tamaño de bloque de
+la sesión, registro de sesiones sin lock en el tick y el hilo UDP, ids de cliente aleatorios,
+límite de tamaño/anidamiento de líneas de control, escrituras parciales en el servidor, hilo
+escritor en el cliente para que la UI no se bloquee durante subidas, hilo de envío UDP despertado
+por el callback, lectura sin lock del estado del backing track, validación de la URL de YouTube,
+reloj interno del servidor embebido si falla el dispositivo del host, orden de destrucción en la
+UI) más 3 menores (ring de 32 slots en el jitter buffer, saneo de nombres de subida y borrado de
+la carpeta al morir la sesión, rechazo de hosts IPv6).
+
+Resultado: **145 resultados unitarios, 0 fallos** (3 corridas) y la suite de integración completa:
+
+| Script | Resultado | Latencia ida (ms) |
+|---|---|---|
+| two-instances | PASS | mediana 15.40, p95 30.88, n 38 |
+| embedded-host | PASS | mediana 14.26, p95 24.89, n 39 |
+| backing-track | PASS | — (16 clicks del track detectados, `trackPlaying:true`) |
+| packet-loss | PASS | mediana 12.99, p95 23.81, n 30 |
+| screenshots | PASS | 69 controles verificados + captura real |
+
+La mediana bajó de ≈ 22–25 ms a ≈ 13–15 ms gracias al envío UDP inmediato (antes esperaba el
+timeout de 2 ms del `recvfrom`) y al registro de sesiones sin contención con el tick.
+
 ## Pendiente de verificar con hardware
 
 Con una interfaz ASIO real: apertura del driver, canales, Panel ASIO, VST3 sobre el instrumento
