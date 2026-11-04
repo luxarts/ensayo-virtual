@@ -426,7 +426,14 @@ int runHeadless (const HeadlessOptions& o)
             return fail ("could not start the embedded server on port " + juce::String (o.hostPort) + ": " + result.getErrorMessage());
     }
 
-    // The engine is destroyed (device closed) before the host and the client thanks to declaration order.
+    // Declared before the guard: the device thread keeps calling them until the guard closes the device.
+    ClickLog emitted, detected;
+    ClickProbe probe;
+
+    // Runs on every exit path, in this order: detach the client from the audio thread, drop the device hooks and the
+    // client callbacks (they reference locals declared after this guard), close the device (joins the device thread,
+    // which also ends the frame hook into the host), then leave the session and stop the host. Members are destroyed
+    // afterwards, client first, when nothing can reach them any more.
     struct Guard
     {
         std::unique_ptr<ServerHost>& host;
@@ -436,7 +443,18 @@ int runHeadless (const HeadlessOptions& o)
         ~Guard()
         {
             engine.setTransport (nullptr);
-            engine.getDeviceManager().closeAudioDevice();   // stops the frame hook and the probe before host/client go away
+
+            if (auto* fake = engine.getFakeDevice())
+            {
+                fake->onOutputBlock = nullptr;
+                fake->onClickEmitted = nullptr;
+            }
+
+            engine.getDeviceManager().closeAudioDevice();
+
+            client.onJoined = nullptr;
+            client.onStateChanged = nullptr;
+            client.onError = nullptr;
             client.leave();
 
             if (host != nullptr)
@@ -467,9 +485,6 @@ int runHeadless (const HeadlessOptions& o)
 
     if (fake == nullptr)
         return fail ("fake audio device not available");
-
-    ClickLog emitted, detected;
-    ClickProbe probe;
 
     emitted.setFile (o.emitLog);
     detected.setFile (o.probeLog);
