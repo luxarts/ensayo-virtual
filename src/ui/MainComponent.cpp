@@ -702,6 +702,8 @@ void MainComponent::wireClient()
         sessionStartMs = juce::Time::getMillisecondCounter();
         participantSeenMs.clear();
         lastDiagnosis.clear();
+        lastMixCount = 0;
+        lastMixChangeMs = 0;
         showSession();
         setStatus ((host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId)
                    + (frameNote.isNotEmpty() ? ". " + frameNote : juce::String()));
@@ -1197,7 +1199,13 @@ void MainComponent::updateAudioDiagnosis()
     in.secondsInSession = (now - sessionStartMs) / 1000.0;
     in.udpFailure = client.getUdpFailure();
     in.mixPacketsReceived = client.getMixPacketsReceived();
-    in.receivePrimed = client.receiveBuffer().getStats().primed;
+    if (in.mixPacketsReceived != lastMixCount)
+    {
+        lastMixCount = in.mixPacketsReceived;
+        lastMixChangeMs = now;
+    }
+
+    in.secondsSinceLastMix = in.mixPacketsReceived == 0 ? 0.0 : (now - lastMixChangeMs) / 1000.0;
     in.participants = s.participants;
     in.stats = s.stats;
 

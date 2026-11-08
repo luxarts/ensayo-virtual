@@ -171,7 +171,7 @@ public:
             expect (popExpecting (buffer, 0));
             expect (popExpecting (buffer, 1));
 
-            const uint16_t jump = (uint16_t) (2 + JitterBuffer::maxBlocks + 5);
+            const uint16_t jump = (uint16_t) (2 + buffer.getMaxBlocks() + 5);
 
             for (uint16_t i = 0; i < JitterBuffer::initialBlocks; ++i)
                 pushSeq (buffer, (uint16_t) (jump + i));
@@ -210,17 +210,17 @@ public:
             // packets 16 apart share a slot and a full 20-block window overwrites blocks it has not consumed yet.
             JitterBuffer buffer (blockBytes, blockMs);
             buffer.setAutoSize (false);
-            buffer.setSizeBlocks (JitterBuffer::maxBlocks);
+            buffer.setSizeBlocks (buffer.getMaxBlocks());
             const uint16_t start = 65500;
 
-            for (int i = 0; i < JitterBuffer::maxBlocks; ++i)
+            for (int i = 0; i < buffer.getMaxBlocks(); ++i)
                 pushSeq (buffer, (uint16_t) (start + i));
 
             // Steady state with the producer a full window ahead of the consumer, crossing 65535 -> 0.
             for (int i = 0; i < 100; ++i)
             {
                 expect (popExpecting (buffer, (uint16_t) (start + i)), "wrap pop at full size, i = " + juce::String (i));
-                pushSeq (buffer, (uint16_t) (start + JitterBuffer::maxBlocks + i));
+                pushSeq (buffer, (uint16_t) (start + buffer.getMaxBlocks() + i));
             }
 
             const auto stats = buffer.getStats();
@@ -259,7 +259,7 @@ public:
             logMessage ("size after 2 s of jitter: " + juce::String (jitterySize) + " blocks, jitter "
                         + juce::String (buffer.getStats().jitterMs, 2) + " ms");
             expect (jitterySize > JitterBuffer::initialBlocks, "jitter must raise the size above initialBlocks");
-            expect (jitterySize <= JitterBuffer::maxBlocks);
+            expect (jitterySize <= buffer.getMaxBlocks());
             expect (buffer.getStats().jitterMs > 0.5);
 
             // 10 s of exact arrivals. Down moves need three consecutive lower evaluations (one per second),
@@ -309,12 +309,75 @@ public:
             expect (buffer.getSizeBlocks() > JitterBuffer::initialBlocks, "first evaluation must raise the size");
         }
 
+        beginTest ("6d. the cap is a duration: 80 ms at 64 and at 128 samples");
+        {
+            JitterBuffer at64 (24, 64.0 / 48.0), at128 (blockBytes, blockMs);
+            expectEquals (at64.getMaxBlocks(), 60);
+            expectEquals (at128.getMaxBlocks(), 30);
+            expect (at64.getMaxBlocks() * 64.0 / 48.0 >= 79.9 && at128.getMaxBlocks() * blockMs >= 79.9);
+            expect (at64.getMaxBlocks() < JitterBuffer::numSlots / 2 + 1);
+        }
+
+        beginTest ("6e. 64-sample stream with 30 ms spikes (Tailscale, 2026-11-08) stops dropping once sized");
+        {
+            // Measured path: ~7 ms with spikes to 16 and 32 ms. A spike delays a run of packets that then arrive
+            // together. With the old 20-block cap (27 ms at 64 samples) every 32 ms spike was an underrun.
+            const double frameMs = 64.0 / 48.0;
+            JitterBuffer buffer (24, frameMs);
+            juce::Random random (42);
+            const uint8_t payload[24] = {};
+            uint8_t out[64];
+            uint16_t seq = 0;
+            int pops = 0;
+            uint32_t underrunsAfterWarmup = 0, underrunsAtWarmup = 0;
+            double spikeUntilMs = -1.0;
+
+            // 20 s of 1.333 ms ticks; the producer pushes each packet when it "arrives", the consumer pops every tick.
+            std::vector<double> arrivals;
+
+            for (int i = 0; i < 15000; ++i)
+            {
+                const double sent = i * frameMs;
+
+                if (spikeUntilMs < sent && random.nextInt (400) == 0)   // a spike roughly every 0.5 s
+                    spikeUntilMs = sent + (random.nextBool() ? 16.0 : 32.0);
+
+                const double delay = 7.0 + random.nextDouble() * 2.0;
+                arrivals.push_back (std::max (sent + delay, spikeUntilMs > sent ? spikeUntilMs + delay : 0.0));
+            }
+
+            size_t next = 0;
+
+            for (int tick = 0; tick < 15000 + 100; ++tick)
+            {
+                const double now = 10.0 + tick * frameMs;
+
+                while (next < arrivals.size() && arrivals[next] <= now)
+                    buffer.push (seq++, payload, sizeof (payload), arrivals[next++]);
+
+                int len = 0;
+                buffer.pop (out, len);
+                ++pops;
+
+                if (tick == 5 * 750)   // after 5 s the estimator has seen the spikes
+                    underrunsAtWarmup = buffer.getStats().underruns;
+            }
+
+            underrunsAfterWarmup = buffer.getStats().underruns - underrunsAtWarmup;
+            const double lossPercent = 100.0 * underrunsAfterWarmup / (15000.0 - 5 * 750);
+            logMessage ("size " + juce::String (buffer.getSizeBlocks()) + " blocks ("
+                        + juce::String (buffer.getSizeBlocks() * frameMs, 1) + " ms), loss after warm-up "
+                        + juce::String (lossPercent, 2) + " %");
+            expect (buffer.getSizeBlocks() > 20, "the size must grow past the old 20-block cap");
+            expect (lossPercent < 1.0, "loss after warm-up must stay under 1 %, got " + juce::String (lossPercent, 2));
+        }
+
         beginTest ("6c. manual size clamps and disables auto changes");
         {
             JitterBuffer buffer (blockBytes, blockMs);
             buffer.setAutoSize (false);
             buffer.setSizeBlocks (100);
-            expectEquals (buffer.getSizeBlocks(), JitterBuffer::maxBlocks);
+            expectEquals (buffer.getSizeBlocks(), buffer.getMaxBlocks());
             buffer.setSizeBlocks (0);
             expectEquals (buffer.getSizeBlocks(), JitterBuffer::minBlocks);
             buffer.setSizeBlocks (6);

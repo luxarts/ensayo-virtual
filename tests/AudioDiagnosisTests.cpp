@@ -18,7 +18,6 @@ public:
         in.port = 22140;
         in.secondsInSession = 30;
         in.mixPacketsReceived = 5000;
-        in.receivePrimed = true;
         in.participants = { { me, "Yo", Role::both }, { other, "Amigo", Role::both } };
         ParticipantStats a; a.id = me; a.packets = 5000;
         ParticipantStats b; b.id = other; b.packets = 5000;
@@ -37,7 +36,6 @@ public:
             auto in = healthy();
             in.secondsInSession = 1.0;
             in.mixPacketsReceived = 0;
-            in.receivePrimed = false;
             in.stats[0].packets = 0;
             expect (diagnoseAudio (in).isEmpty());
         }
@@ -57,7 +55,6 @@ public:
             auto in = healthy();
             in.stats[0].packets = 0;
             in.mixPacketsReceived = 0;   // the server never learnt where to send the mix either
-            in.receivePrimed = false;
             const auto text = diagnoseAudio (in);
             logMessage (text);
             expect (text.contains ("El host no recibe tu audio"));
@@ -76,7 +73,6 @@ public:
         {
             auto in = healthy();
             in.mixPacketsReceived = 0;
-            in.receivePrimed = false;
             const auto text = diagnoseAudio (in);
             logMessage (text);
             expect (text.contains ("el suyo no llega a esta PC"));
@@ -88,10 +84,8 @@ public:
             in.stats[0].packets = ~0u;
             in.stats[1].packets = ~0u;
             in.mixPacketsReceived = 0;
-            in.receivePrimed = false;
             expectEquals (diagnoseAudio (in), juce::String ("Sin audio del servidor"));
             in.mixPacketsReceived = 100;
-            in.receivePrimed = true;
             expect (diagnoseAudio (in).isEmpty(), "unknown counters must not be read as zero");
         }
 
@@ -113,6 +107,17 @@ public:
             in.stats[1].packets = 0;
             in.secondsSinceJoined[other] = 1.0;
             expect (diagnoseAudio (in).isEmpty());
+        }
+
+        beginTest ("a short gap is a hiccup, a 2 s outage is no audio");
+        {
+            // Field report: "Sin audio del servidor" flashed on every dropout because it followed the jitter buffer
+            // re-priming. Momentary loss belongs to the loss % in the status bar.
+            auto in = healthy();
+            in.secondsSinceLastMix = 0.3;
+            expect (diagnoseAudio (in).isEmpty());
+            in.secondsSinceLastMix = 2.5;
+            expectEquals (diagnoseAudio (in), juce::String ("Sin audio del servidor"));
         }
 
         beginTest ("own problems are reported before other participants'");

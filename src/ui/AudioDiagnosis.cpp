@@ -71,7 +71,7 @@ juce::String diagnoseAudio (const AudioDiagnosisInput& in)
         }
     }
 
-    if (! in.receivePrimed)
+    if (in.secondsSinceLastMix > audioDiagnosisOutageSeconds)
         return "Sin audio del servidor";
 
     return {};

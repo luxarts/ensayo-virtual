@@ -132,6 +132,7 @@ private:
     juce::uint32 lastGainSendMs = 0, settingsDirtyAtMs = 0, sessionStartMs = 0;
     std::map<uint32_t, juce::uint32> participantSeenMs;   // first time each participant id appeared (audio diagnosis)
     juce::String lastDiagnosis;                           // what the status bar currently says about the audio
+    uint32_t lastMixCount = 0; juce::uint32 lastMixChangeMs = 0;   // when the mix stream last moved
     void updateAudioDiagnosis();
     bool settingsDirty = false;
 

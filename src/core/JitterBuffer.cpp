@@ -11,16 +11,17 @@ namespace
     constexpr double evaluationPeriodMs = 1000.0;
     constexpr double ewmaAlpha = 0.05;
     constexpr int downMovesRequired = 3;
+}
 
-    int clampBlocks (int blocks) noexcept
-    {
-        return std::clamp (blocks, JitterBuffer::minBlocks, JitterBuffer::maxBlocks);
-    }
+int JitterBuffer::clampBlocks (int blocks) const noexcept
+{
+    return std::clamp (blocks, minBlocks, maxBlocks);
 }
 
 JitterBuffer::JitterBuffer (int blockBytesToUse, double blockDurationMsToUse)
     : blockBytes (std::max (1, blockBytesToUse)),
       blockDurationMs (blockDurationMsToUse > 0.0 ? blockDurationMsToUse : 1.0),
+      maxBlocks (std::clamp ((int) std::ceil (maxBufferMs / blockDurationMs), minBlocks + 1, numSlots / 2)),
       storage ((size_t) blockBytes * (size_t) numSlots, 0)
 {
     for (auto& tag : tags)
