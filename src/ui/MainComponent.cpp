@@ -1,4 +1,5 @@
-#include "ui/MainComponent.h"
+﻿#include "ui/MainComponent.h"
+#include "ui/AudioDiagnosis.h"
 
 namespace ensayo
 {
@@ -699,6 +700,8 @@ void MainComponent::wireClient()
         session.setLink (currentLink, hint);
         session.setState (s);
         sessionStartMs = juce::Time::getMillisecondCounter();
+        participantSeenMs.clear();
+        lastDiagnosis.clear();
         showSession();
         setStatus ((host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId)
                    + (frameNote.isNotEmpty() ? ". " + frameNote : juce::String()));
@@ -1177,9 +1180,43 @@ void MainComponent::timerCallback()
     {
         updateNumbers();
 
-        if (! demoMode && ! audioError && engine.getDevice() != nullptr
-            && juce::Time::getMillisecondCounter() - sessionStartMs > 3000 && ! client.receiveBuffer().getStats().primed)
-            setStatus ("Sin audio del servidor", true, false);
+        if (! demoMode && ! audioError && engine.getDevice() != nullptr)
+            updateAudioDiagnosis();
     }
+}
+
+void MainComponent::updateAudioDiagnosis()
+{
+    const auto now = juce::Time::getMillisecondCounter();
+    const auto& s = client.getState();
+
+    AudioDiagnosisInput in;
+    in.clientId = s.clientId;
+    in.host = s.host;
+    in.port = s.port;
+    in.secondsInSession = (now - sessionStartMs) / 1000.0;
+    in.udpFailure = client.getUdpFailure();
+    in.mixPacketsReceived = client.getMixPacketsReceived();
+    in.receivePrimed = client.receiveBuffer().getStats().primed;
+    in.participants = s.participants;
+    in.stats = s.stats;
+
+    for (const auto& p : s.participants)
+    {
+        participantSeenMs.emplace (p.id, now);   // keeps the first time
+        in.secondsSinceJoined[p.id] = (now - participantSeenMs[p.id]) / 1000.0;
+    }
+
+    const auto diagnosis = diagnoseAudio (in);
+
+    if (diagnosis == lastDiagnosis)
+        return;
+
+    if (diagnosis.isNotEmpty())
+        setStatus (diagnosis, true, false);
+    else if (lastDiagnosis.isNotEmpty())
+        setStatus (ES ("Audio OK en las dos direcciones"), false, false);
+
+    lastDiagnosis = diagnosis;
 }
 }

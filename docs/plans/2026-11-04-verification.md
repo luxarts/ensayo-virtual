@@ -185,6 +185,38 @@ nombre y duración en pantalla, Play → botón "Pausa" y posición 0:04 / 4:09 
 integración 7/7 PASS (two-instances 13.63 ms, embedded-host 12.47 ms, packet-loss 11.70 ms,
 asio-loopback 37.39 ms).
 
+## Primera sesión real entre dos PCs (Tailscale, 2026-11-08)
+
+Reporte: el amigo se unió (TCP OK) pero el host escuchaba **sólo ruido** de él y él no escuchaba nada ("Sin
+audio del servidor"), aunque veía moverse su medidor.
+
+Diagnóstico desde el host: firewall con UDP/TCP 22140 permitidos en todos los perfiles, Tailscale como red
+Privada, sin reglas de bloqueo. Reproducción: un participante que se une por TCP (vía `100.116.198.119`, la IP
+de Tailscale del host) y **nunca manda UDP** produce en el host un ruido constante de pico 0.10 (≈ -20 dBFS): el
+servidor hacía PLC de Opus sobre un decodificador que nunca decodificó nada (ruido de confort). Y como el
+servidor aprende el destino UDP de cada cliente del primer datagrama que recibe, al no recibir ninguno nunca le
+manda la mezcla. Conclusión: el UDP del amigo no llegaba al host (TCP sí): firewall/antivirus de su PC o algo en
+el camino; la app no tenía forma de decirlo.
+
+Cambios:
+
+1. `MixServer`: cada flujo (voz/instrumento) sólo se oculta con PLC si ya decodificó un bloque real y por a lo
+   sumo ~50 ms; antes de eso o después, silencio.
+2. Contadores por participante en el servidor (`packets` aceptados, `wrongFrame` descartados por tamaño de
+   bloque) enviados en `stats`; el cliente cuenta las mezclas recibidas y registra si no pudo abrir su socket UDP.
+3. `diagnoseAudio` (`src/ui/AudioDiagnosis.*`) lo traduce a un mensaje por dirección: "El host no recibe tu
+   audio: el UDP a host:puerto no llega", "El host recibe tu audio pero el suyo no llega a esta PC", "No llega el
+   audio de <nombre>" (en el host), buffer distinto y socket UDP fallido; vuelve a "Audio OK en las dos
+   direcciones" cuando se arregla.
+4. `tools/udp-test.ps1`: eco UDP sin la app para separar red de aplicación.
+
+Verificación: unitarias **166 / 0 fallos** (nuevos `AudioDiagnosis` y tres de `MixServer`: sin ruido para quien
+no manda UDP, flujo que se corta → silencio, datagramas de otro bloque contados); integración nueva
+`udp-blocked.ps1` (participante sólo-TCP: el servidor reporta `packets 0` para él y 5152 para el host, que
+escucha pico 0); suite completa 8/8 PASS; ventana real del host con un participante sólo-TCP: la barra de estado
+muestra "No llega el audio de Amigo: su UDP no alcanza al servidor (firewall/antivirus en su PC)" a los 7 s.
+Pendiente: repetir la prueba real con el amigo usando esta versión en las dos PCs.
+
 ## Pendiente de verificar con hardware
 
 Con señal real por las entradas: Panel ASIO del driver, VST3 sobre el instrumento (editor,

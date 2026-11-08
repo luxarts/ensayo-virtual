@@ -31,7 +31,8 @@ namespace ensayo
 //   --duration S             seconds to stay in the session (default 10), then leaves and returns 0
 //   --stats <file>           one JSON line per second: t, pingMs, jitterBlocks, underruns, late, participants,
 //                            trackPlaying, trackPosition, peakVoice/peakInstrument/peakReceived/peakOutput (max of
-//                            that second, linear)
+//                            that second, linear), mixPackets (mix datagrams received), serverPacketsFromMe /
+//                            serverWrongFrameFromMe (what the server reports receiving from this client; -1 = no stats yet)
 //
 // Stdout lines: "link ...", "joined <session> client <id>", "participants N" (on every change), "latency ...",
 // "error <text>". Returns 0 on success, 1 on a runtime failure (bind/connect/device), 2 on bad arguments.

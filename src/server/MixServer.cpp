@@ -1,6 +1,7 @@
 #include "MixServer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <thread>
 
 namespace ensayo
@@ -8,6 +9,7 @@ namespace ensayo
 namespace
 {
     constexpr double fadeInSeconds = 0.2;
+    constexpr double maxConcealSeconds = 0.05;   // PLC covers gaps up to ~50 ms; longer is a dead stream → silence
 }
 
 struct MixServer::Participant
@@ -20,8 +22,34 @@ struct MixServer::Participant
           voice ((size_t) frameSamples (mode.frameSize()), 0.0f),
           instrument ((size_t) frameSamples (mode.frameSize()), 0.0f),
           popBuffer ((size_t) juce::jmax (codedBytesMono (mode.frameSize()), 64), 0),
-          fadeStep ((float) frameSamples (mode.frameSize()) / (float) (fadeInSeconds * sampleRate))
+          fadeStep ((float) frameSamples (mode.frameSize()) / (float) (fadeInSeconds * sampleRate)),
+          maxConcealed (juce::jmax (4, (int) std::ceil (maxConcealSeconds * sampleRate / frameSamples (mode.frameSize()))))
     {
+    }
+
+    // Opus PLC on a decoder that never decoded a real block (or long after the last one) is comfort noise, not
+    // concealment: a participant whose UDP never arrives would be heard by everyone as constant hiss.
+    struct Stream { bool primed = false; int lost = 0; };
+
+    void decode (JitterBuffer& jitter, OpusDecoder& decoder, Stream& stream, float* out, int frame) noexcept
+    {
+        int len = 0;
+
+        if (jitter.pop (popBuffer.data(), len))
+        {
+            decoder.decode (popBuffer.data(), len, out);
+            stream.primed = true;
+            stream.lost = 0;
+        }
+        else if (stream.primed && stream.lost < maxConcealed)
+        {
+            decoder.decode (nullptr, 0, out);
+            ++stream.lost;
+        }
+        else
+        {
+            std::fill (out, out + frame, 0.0f);
+        }
     }
 
     const uint32_t id;
@@ -37,8 +65,11 @@ struct MixServer::Participant
     std::map<uint32_t, ChannelGain> gains;               // what this client hears of each target (0 = track)
 
     std::atomic<float> voicePeak { 0.0f }, instrumentPeak { 0.0f };
+    std::atomic<uint32_t> packets { 0 }, wrongFrame { 0 };   // network thread writes, control thread reads
     float fade = 0.0f;
     const float fadeStep;
+    const int maxConcealed;
+    Stream voiceStream, instrumentStream;                    // clock thread only
     uint16_t outSeq = 0;
 };
 
@@ -200,14 +231,20 @@ void MixServer::setNextParticipantId (uint32_t id)
 
 void MixServer::pushAudio (const AudioPacketView& view, double arrivalMs) noexcept
 {
-    if (view.frameSize != size || (view.flags & AudioFlags::mix) != 0)
+    if ((view.flags & AudioFlags::mix) != 0)
         return;
 
     if (! tryEnterRealtime())
         return;
 
-    if (auto* p = findUnlocked (view.clientId))
+    if (auto* p = findUnlocked (view.clientId); p != nullptr && view.frameSize != size)
     {
+        p->wrongFrame.fetch_add (1, std::memory_order_relaxed);
+    }
+    else if (p != nullptr)
+    {
+        p->packets.fetch_add (1, std::memory_order_relaxed);
+
         if ((view.flags & AudioFlags::voice) != 0 && view.voice != nullptr && view.voiceLen > 0)
             p->voiceJitter.push (view.seq, view.voice, view.voiceLen, arrivalMs);
 
@@ -233,9 +270,7 @@ int MixServer::tick (const Sender& send) noexcept
 
         if (roleSendsVoice (p.role))
         {
-            int len = 0;
-            const bool got = p.voiceJitter.pop (p.popBuffer.data(), len);
-            p.voiceDecoder.decode (got ? p.popBuffer.data() : nullptr, got ? len : 0, p.voice.data());
+            p.decode (p.voiceJitter, p.voiceDecoder, p.voiceStream, p.voice.data(), frame);
         }
         else
         {
@@ -244,9 +279,7 @@ int MixServer::tick (const Sender& send) noexcept
 
         if (roleSendsInstrument (p.role))
         {
-            int len = 0;
-            const bool got = p.instrumentJitter.pop (p.popBuffer.data(), len);
-            p.instrumentDecoder.decode (got ? p.popBuffer.data() : nullptr, got ? len : 0, p.instrument.data());
+            p.decode (p.instrumentJitter, p.instrumentDecoder, p.instrumentStream, p.instrument.data(), frame);
         }
         else
         {
@@ -365,6 +398,8 @@ std::vector<ParticipantStats> MixServer::getStats() const
         stats.late = (useVoice ? voice.late : 0) + (useInstrument ? instrument.late : 0);
         stats.voicePeak = p->voicePeak.load (std::memory_order_relaxed);
         stats.instrumentPeak = p->instrumentPeak.load (std::memory_order_relaxed);
+        stats.packets = p->packets.load (std::memory_order_relaxed);
+        stats.wrongFrame = p->wrongFrame.load (std::memory_order_relaxed);
         result.push_back (stats);
     }
 

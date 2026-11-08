@@ -350,6 +350,77 @@ public:
             other.removeParticipant (77);
             expectEquals ((int) other.getParticipants().size(), 2);
         }
+
+        beginTest ("a participant whose UDP never arrives is silence, not PLC noise");
+        {
+            // Field report: the friend joined over TCP but his datagrams never reached the host; everybody heard a
+            // constant hiss for him (Opus PLC of a decoder that never decoded anything).
+            MixServer server2 (size);
+            OpusMode mode2 (size);
+            const auto host = server2.addParticipant ("Host", Role::both);
+            const auto friendId = server2.addParticipant ("Amigo", Role::both);
+            Feeder hostFeeder (mode2, host, Role::both);
+            const std::vector<float> quietBlock ((size_t) frame, 0.0f);
+            Collected c;
+
+            for (int i = 0; i < 100; ++i)
+            {
+                hostFeeder.push (server2, quietBlock.data(), quietBlock.data(), 0.0);   // the host sends silence
+                server2.tick (c.sender());                                       // the friend sends nothing
+            }
+
+            const auto hostMix = decodeAll (mode2, c.packets[host]);
+            logMessage ("host hears the silent-UDP friend at peak " + juce::String (peak (hostMix), 4));
+            expect (peak (hostMix) < 0.001f, "the host's mix must be silent, peak " + juce::String (peak (hostMix), 4));
+
+            const auto stats = server2.getStats();
+            expectEquals ((int) stats.size(), 2);
+            expectEquals ((int) stats[1].id, (int) friendId);
+            expectEquals ((int) stats[1].packets, 0);
+            expectEquals ((int) stats[0].packets, 100);
+        }
+
+        beginTest ("a stream that stops is concealed briefly, then silent");
+        {
+            MixServer server2 (size);
+            OpusMode mode2 (size);
+            const auto host = server2.addParticipant ("Host", Role::voice);
+            const auto friendId = server2.addParticipant ("Amigo", Role::voice);
+            Feeder friendFeeder (mode2, friendId, Role::voice);
+            Collected c;
+
+            for (int i = 0; i < 60; ++i)
+            {
+                const auto toneBlock = sineBlock (i, 440.0f);
+                friendFeeder.push (server2, toneBlock.data(), toneBlock.data(), 0.0);
+                server2.tick (c.sender());
+            }
+
+            for (int i = 0; i < 60; ++i)   // the friend's stream dies (0.16 s at 128 samples)
+                server2.tick (c.sender());
+
+            const auto hostMix = decodeAll (mode2, c.packets[host]);
+            const auto tail = std::vector<float> (hostMix.end() - 30 * frame * 2, hostMix.end());
+            expect (peak (std::vector<float> (hostMix.begin() + 30 * frame * 2, hostMix.begin() + 60 * frame * 2)) > 0.1f,
+                    "the sine must be heard while it arrives");
+            expect (peak (tail) < 0.001f, "the dead stream must end in silence, peak " + juce::String (peak (tail), 4));
+        }
+
+        beginTest ("datagrams with another block size are counted, not mixed");
+        {
+            MixServer server2 (FrameSize::f64);
+            const auto id = server2.addParticipant ("Amigo", Role::both);
+            OpusMode mode128 (FrameSize::f128);
+            Feeder feeder (mode128, id, Role::both);   // Feeder writes FrameSize::f128 packets
+            const auto toneBlock = sineBlock (0, 440.0f);
+
+            for (int i = 0; i < 5; ++i)
+                feeder.push (server2, toneBlock.data(), toneBlock.data(), 0.0);
+
+            const auto stats = server2.getStats();
+            expectEquals ((int) stats[0].packets, 0);
+            expectEquals ((int) stats[0].wrongFrame, 5);
+        }
     }
 };
 
