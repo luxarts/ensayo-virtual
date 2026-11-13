@@ -79,6 +79,10 @@ try
     Assert ((Wait-Proc $a 60) -eq 0) ("a failed: " + ((Get-OutputLines $a) -join ' | '))
     Assert ((Wait-Proc $c 60) -eq 0) ("c failed: " + ((Get-OutputLines $c) -join ' | '))
 
+    # A and C watch for a fixed time: both must have reached B's last version before their hashes are compared.
+    $versions = @((Get-LastVersion $a), (Get-LastVersion $b2), (Get-LastVersion $c))
+    Write-Host ("  last version A {0}, B {1}, C {2}" -f $versions[0], $versions[1], $versions[2])
+    Assert ($versions[1] -gt 0 -and $versions[0] -eq $versions[1] -and $versions[2] -eq $versions[1]) "A or C left before B's last version (raise their --duration)"
     $hashA = Get-LastValue $a 'project_hash'
     $hashB = Get-LastValue $b2 'project_hash'
     $hashC = Get-LastValue $c 'project_hash'

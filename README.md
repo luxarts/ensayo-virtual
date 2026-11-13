@@ -131,9 +131,11 @@ reconectar. Si la app se cierra de golpe, la toma se recupera la próxima vez qu
 
 ### Importar y exportar
 
-- **Importar archivo…** (WAV, MP3, FLAC, OGG, M4A; cualquier frecuencia, se convierte a 48 kHz)
-  crea una pista "Importada" con el audio desde el comienzo, y se sube a todos.
-- **URL de YouTube** + Enter: baja el audio con `yt-dlp` y lo importa igual.
+- **Importar archivo…** (WAV, FLAC, OGG, MP3, M4A/MP4/AAC; cualquier frecuencia, se convierte a
+  48 kHz) crea una pista nueva con el nombre del archivo (de tipo "Importada", sin grabación) con el
+  audio desde el comienzo, y se sube a todos.
+- **URL de YouTube** + Enter: baja el audio con `yt-dlp` y lo importa igual (la pista se llama como
+  el video).
 - **Exportar mezcla…** guarda la mezcla (lo que se oye, con mute/solo/volumen/paneo) en un WAV
   24 bits, 48 kHz, estéreo, desde el comienzo hasta el final de la última región.
 

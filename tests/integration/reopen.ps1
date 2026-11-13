@@ -32,7 +32,10 @@ try
         '--dump-project', (Join-Path $run 'before.json'))
     $procs += $b1
     Assert ((Wait-Proc $b1 60) -eq 0) ("b1 failed: " + ((Get-OutputLines $b1) -join ' | '))
+    # B1 is the recorder: it exits only once its region is in its replica, so this hash already includes it.
     $hashBefore = Get-LastValue $b1 'project_hash'
+    $beforeDump = Get-Content -Raw (Join-Path $run 'before.json') | ConvertFrom-Json
+    Assert (@(@($beforeDump.tracks)[0].regions).Count -eq 1) "B's region is not in the project B printed the hash of"
     Write-Host "  before the restart: project_hash $hashBefore"
 
     Assert ((Stop-ServerProc $server) -eq 0) 'the server did not exit cleanly'

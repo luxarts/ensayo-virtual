@@ -266,6 +266,15 @@ function Get-LastValue
     return $hit.Substring($Prefix.Length + 1).Trim()
 }
 
+# The highest "applied <version>" a headless client printed (-1 when it printed none after its welcome).
+function Get-LastVersion
+{
+    param ($Proc)
+    $max = -1
+    foreach ($line in (Get-OutputLines $Proc)) { if ($line -match '^applied (\d+)$') { $max = [math]::Max($max, [int] $Matches[1]) } }
+    return $max
+}
+
 # Writes one op object per line (ConvertTo-Json -Compress) to $Path.
 function Write-OpsFile
 {

@@ -1,6 +1,9 @@
 # asio-calibration (port 22245): real hardware. Needs the Arturia MiniFuse ("MiniFuse ASIO Driver"), whose LOOPBACK
-# outputs 2/3 come back as inputs 2/3. SKIPs when the driver is not installed, and also when it is installed but cannot
-# be opened (the interface is unplugged or another program, such as a running Ensayo Virtual, holds it).
+# outputs 2/3 come back as inputs 2/3. SKIPs only when the driver is not installed, or when step 1 cannot open the device
+# with one of the errors JUCE's ASIO layer gives for an absent or busy device ("No Driver", "Driver failed to initialise",
+# "No such device", "Can't start device", "Device didn't start correctly", printed by the headless client as
+# "error ASIO device: <reason>"), or "error ASIO device did not open". Any other failure, and any failure after step 1
+# opened the device, is a FAIL. (A driver that reports its own init error text also FAILs: only the texts above count.)
 # 1. --calibrate alone (--out 1 --mic 2 --inst 3 --mute-monitor): prints the measured calibration.
 # 2. A (the host user of an EnsayoServer project) opens the same device, calibrates again (the value is used for that
 #    run), imports a 4 s click track (44.1 kHz, a click every 250 ms) and records 4 s on its voice track at 1.0 s:
@@ -19,12 +22,13 @@ $procs = @()
 $status = 1
 $asioArgs = @('--asio', $Driver, '--out', '1', '--mic', '2', '--inst', '3', '--mute-monitor')
 
-# The device could not be opened (not plugged in, or held by another program): SKIP, not FAIL.
-function Get-OpenFailure
+# Step 1 could not open the device because it is absent or busy (unplugged, or held by a program that does not share
+# it): the exact lines HeadlessClient prints for StudioEngine::openDevice failures with JUCE's ASIO open/start errors.
+function Get-BusyFailure
 {
     param ($Proc)
-    $line = @(Get-OutputLines $Proc | Where-Object { $_ -match '^error (ASIO|audio device|fake audio)' }) | Select-Object -First 1
-    return $line
+    $pattern = '^error ASIO device( did not open|: (No Driver|Driver failed to initialise|No such device|Can''t start device|Device didn''t start correctly))$'
+    return @(Get-OutputLines $Proc | Where-Object { $_ -match $pattern }) | Select-Object -First 1
 }
 
 try
@@ -43,10 +47,10 @@ try
     $cal = Start-Headless -Name 'calibrate' -Client $bin.Client -RunDir $run -Arguments ($asioArgs + @('--calibrate'))
     $procs += $cal
     $calExit = Wait-Proc $cal 60
-    $openFailure = Get-OpenFailure $cal
-    if ($null -ne $openFailure)
+    $openFailure = Get-BusyFailure $cal
+    if ($calExit -ne 0 -and $null -ne $openFailure)
     {
-        Write-Skip $name "the '$Driver' device could not be opened (unplugged, or another program holds it): $openFailure"
+        Write-Skip $name "the '$Driver' device is absent or busy (unplugged, or another program holds it): $openFailure"
         exit 0
     }
     Assert ($calExit -eq 0) ("--calibrate failed: " + ((Get-OutputLines $cal) -join ' | '))
@@ -69,12 +73,6 @@ try
         '--duration', '0.5', '--dump-project', $dump))
     $procs += $a
     $aExit = Wait-Proc $a 120
-    $openFailure = Get-OpenFailure $a
-    if ($null -ne $openFailure)
-    {
-        Write-Skip $name "the '$Driver' device could not be opened for the recording: $openFailure"
-        exit 0
-    }
     Assert ($aExit -eq 0) ("recording through the loopback failed: " + ((Get-OutputLines $a) -join ' | '))
     $runCalibration = [int] (Get-LastValue $a 'calibration')
     $devA = Wait-ForLine $a '^device ' 1

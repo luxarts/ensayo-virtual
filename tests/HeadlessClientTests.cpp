@@ -575,7 +575,13 @@ public:
                     partial.insert (lines[i].fromLastOccurrenceOf (" ", false, false));
 
             expect (partial.size() >= 3, "segment counts seen before the take was complete: " + lines.joinIntoString (" | "));
-            expect (lines.contains ("cached " + take + " 4"), "the complete take is reported as cached");
+            // The complete take's own line comes after take_complete (a partial "cached <take> 4" may precede it).
+            bool completeCached = false;
+
+            for (int i = completeAt + 1; i < lines.size(); ++i)
+                completeCached = completeCached || lines[i] == "cached " + take + " 4";
+
+            expect (completeAt >= 0 && completeCached, "the complete take is reported as cached after take_complete: " + lines.joinIntoString (" | "));
             host.stop();
         }
 

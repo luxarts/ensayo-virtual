@@ -1,7 +1,8 @@
 # import-export (port 22244): A (the host user) imports a generated 44.1 kHz stereo WAV (3 s, a click every 250 ms)
 # and exports the mix. Then, only when yt-dlp.exe and deno.exe are in tools\ next to the built exe (or in the repo's
 # tools\), a second run imports a YouTube URL with --import-url and exports again; that part prints SKIP (and the
-# script still passes) when the tools are missing or the download fails.
+# script still passes) only when the tools are missing or the download fails for a network reason (resolve, connection,
+# HTTP error, timeout); any other yt-dlp/deno/import error is a FAIL.
 # Asserts for each export: PCM 24-bit, 48000 Hz, 2 channels, length = the project's end (max region end, from
 # --dump-project). The WAV import is resampled exactly: 144000 samples, and the exported clicks sit at k * 12000 (+-1).
 # The YouTube take is an imported stereo track whose region covers the whole take.
@@ -97,12 +98,17 @@ try
             '--import-url', $YouTubeUrl, '--duration', '0.5', '--export', $mix2, '--dump-project', $dump2)
         $procs += $a2
         $code = Wait-Proc $a2 600
-        $ytError = @(Get-OutputLines $a2 | Where-Object { $_ -match '^error youtube: ' }) | Select-Object -First 1
+        # The yt-dlp error spans several lines after "error youtube: "; only a network-class failure is a SKIP.
+        $out = Read-SharedFile $a2.StdOut
+        $ytAt = $out.IndexOf('error youtube: ')
+        $ytError = $null
+        if ($ytAt -ge 0) { $ytError = $out.Substring($ytAt).Trim() }
+        $network = '(?i)(unable to download|urlopen error|getaddrinfo|name resolution|failed to resolve|could not resolve|resolve host|connection (refused|reset|aborted|timed out)|timed out|HTTP Error \d+|network is unreachable|no route to host|temporary failure)'
 
-        if ($code -ne 0 -and $null -ne $ytError)
+        if ($code -ne 0 -and $null -ne $ytError -and $ytError -match $network)
         {
-            Write-Host "  youtube: SKIP (download failed: $ytError)"
-            $result += '; youtube SKIP (download failed)'
+            Write-Host ("  youtube: SKIP (network failure: {0})" -f (($ytError -split "`r?`n") -join ' / '))
+            $result += '; youtube SKIP (network failure)'
         }
         else
         {

@@ -99,6 +99,13 @@ try
     Assert (@($aLines | Where-Object { $_ -match "^cached $clickTake " }).Count -ge 1) "A has no cached line for the click take"
 
     # Same project everywhere.
+    # B is the recorder: it exits only once its take's region is in its replica (its pending take is dropped only
+    # then), so its hash includes the last version. A watches for a fixed time; it must have seen that same version,
+    # otherwise its hash would be compared one version early.
+    $versionA = Get-LastVersion $a
+    $versionB = Get-LastVersion $b2
+    Write-Host "  last version A $versionA, B $versionB"
+    Assert ($versionB -gt 0 -and $versionA -eq $versionB) "A left at version $versionA before B's last version $versionB (raise A's --duration)"
     $hashA = Get-LastValue $a 'project_hash'
     $hashB = Get-LastValue $b2 'project_hash'
     Write-Host "  project_hash A $hashA, B $hashB"

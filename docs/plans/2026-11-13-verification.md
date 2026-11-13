@@ -10,10 +10,11 @@ para las unitarias.
 `.\build\EnsayoTests_artefacts\Debug\EnsayoTests.exe` → **`TOTAL: 231 results, 0 failures`**, exit 0.
 
 230 venían de las tareas 1–10; la nueva es `HeadlessClient / runHeadless prints cached <take> <k>
-while the segments of a take still being recorded arrive` (8 checks, puerto 22260): un ProjectClient
-graba una toma de 4 segmentos (uno cada 400 ms) mientras `runHeadless` observa; antes de
-`take_complete` aparecen al menos 3 cantidades distintas de `cached <take> <k>`, y después la línea
-de la toma completa. Además el test de parseo cubre `--import-url` (URL válida, URL que no es de
+while the segments of a take still being recorded arrive` (el runner informa 8 checks: 7 `expect`
+del test más el de `parse`; puerto 22260): un ProjectClient graba una toma de 4 segmentos (uno cada
+400 ms) mientras `runHeadless` observa; antes de `take_complete` aparecen al menos 3 cantidades
+distintas de `cached <take> <k>`, y la línea `cached <take> 4` de la toma completa aparece
+*después* de `take_complete` (no alcanza con una parcial con el mismo número). Además el test de parseo cubre `--import-url` (URL válida, URL que no es de
 YouTube, falta de valor, sin sesión).
 
 ## Integración (Release, `tests\integration\run-all.ps1`)
@@ -60,11 +61,17 @@ A tenía k = 1, 2, 3, 4, 5, 6, 7 antes de que la toma se completara (se pide ≥
 
 ### Corrida con la MiniFuse ocupada
 
-El script se salta (SKIP) si el driver no está instalado o no se puede abrir. Para probar el caso
-"otro programa tiene el driver" se dejó un proceso headless con la MiniFuse abierta y se corrió el
-script: el driver de la MiniFuse admite varios clientes, así que no falló al abrir y el script dio
-PASS (calibración 37, error 0). La rama de SKIP por dispositivo tomado no se puede ejercitar con
-esta interfaz.
+El script se salta (SKIP) sólo si el driver no está instalado, o si el paso 1 (`--calibrate`) no
+puede abrir el dispositivo con uno de los errores de apertura de JUCE para un dispositivo ausente u
+ocupado, tal como los imprime el cliente headless: `error ASIO device: No Driver`, `Driver failed
+to initialise`, `No such device`, `Can't start device`, `Device didn't start correctly`, o `error
+ASIO device did not open`. Cualquier otro error, y cualquier fallo después de que el paso 1 abrió el
+dispositivo (la grabación, las exportaciones), es FAIL. Un driver que devuelve su propio texto de
+error al inicializar también da FAIL.
+
+**La rama de SKIP por dispositivo ocupado no está probada**: el driver de la MiniFuse admite varios
+programas a la vez. Con un proceso headless que tenía la MiniFuse abierta, el script abrió el
+dispositivo igual y dio PASS (calibración 37, error 0).
 
 ## Capturas revisadas
 
@@ -91,8 +98,10 @@ nombres).
    toma completa no cambia). Test unitario nuevo (arriba).
 2. **`--headless --import-url <url>`**: baja una URL de YouTube con `tools\yt-dlp.exe` (+ deno) por
    el mismo `YouTubeImporter` de "Importar de YouTube", imprime `downloaded <archivo>` y lo importa
-   como `--import`. Un fallo de la bajada imprime `error youtube: <motivo>` (el script lo toma como
-   SKIP de esa parte). Tests de parseo.
+   como `--import`. Un fallo de la bajada imprime `error youtube: <motivo>` (con las últimas líneas
+   de yt-dlp). El script lo toma como SKIP de esa parte sólo si el motivo es de red (resolver el
+   nombre, conexión, error HTTP, timeout); por ejemplo un video que no existe ("This video is
+   unavailable", probado a mano) es FAIL. Tests de parseo.
 3. `setHeadlessOutputCopyForTest` (sólo para tests): copia cada línea que imprime el modo headless.
 
 No apareció ningún bug de alineación, sincronización, permisos, reanudación ni reapertura.
@@ -101,7 +110,12 @@ No apareció ningún bug de alineación, sincronización, permisos, reanudación
 
 - `--wait-takes N` termina cuando N tomas están completas y en caché; la región de una toma grabada
   (`add_region`) llega una versión después. Un cliente que sale con `--wait-takes` puede imprimir un
-  hash una versión atrasado. record-sync usa `--duration 40` en A para comparar hashes.
+  hash una versión atrasado. Por eso los hashes se comparan así: el cliente que graba sale recién
+  cuando la región de su toma está en su réplica (`ProjectClient` suelta la toma pendiente sólo
+  entonces), así que su hash es el final; los que observan (A en record-sync, A y C en edit-sync)
+  se quedan un tiempo fijo y el script exige que su última versión `applied` sea igual a la del que
+  grabó/editó antes de comparar hashes (si no, FAIL con "raise --duration"). En reopen, el hash de
+  antes del reinicio viene del que grabó, y el script verifica que su dump ya tiene la región.
 - Un usuario nuevo que se une agrega `add_user` al proyecto y cambia el hash: en reopen, el cliente
   nuevo se compara por pistas y tomas, y el que ya era miembro por hash.
 - En reconnect se pierde el segundo que todavía no se había cortado en segmento cuando se mató el

@@ -48,8 +48,10 @@ namespace ensayo
 // Stdout lines: "link <ensayo://...>", "welcome <session> host|guest", "applied <version>" (every version after the
 // welcome's), "rejected <reason>", "downloaded <file>" (--import-url), "take_complete <take> <samples>" (a take that became complete during the run, and every
 // take finished by --resume), "cached <take> <segments>" (a complete take fully in the local cache, once each, also the
-// ones already complete at the welcome; and, for a take that is not complete yet, each time the number of its segments
-// in the local cache grows, so segments that arrive while it is being recorded show up), "calibration <samples>", "exported <wav>", "project_hash <sha1>" (at exit),
+// ones already complete at the welcome, printed right after that take's take_complete line; and, while a take is not
+// complete yet, "cached <take> <k>" each time k, the number of its segments in the local cache, grows, so segments
+// that arrive while it is being recorded show up; the complete-take line is printed once more even when the same
+// count already appeared as a partial one; use take_complete to know a take is complete), "calibration <samples>", "exported <wav>", "project_hash <sha1>" (at exit),
 // "error <text>". Returns 0 on success, 1 on a runtime failure, 2 on bad arguments.
 struct HeadlessOptions
 {
