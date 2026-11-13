@@ -35,7 +35,7 @@ pérdidas). Un retraso de red sólo hace que algo llegue más tarde, nunca que s
 | Edición v1 | Cortar, borrar, mover, recortar bordes, **micro-fundidas anti-clic automáticas**. | Deshacer/rehacer, fundidas editables, ajuste a grilla | Fuera de la v1 por decisión de alcance. |
 | Extras v1 | Importar audio/YouTube como pista, metrónomo + cuenta de 1 compás, exportar mezcla a WAV 24 bits. | Ajuste a grilla | Alcance. |
 | Transferencia de tomas | **Progresiva mientras se graba**: segmentos de 1 s, cada uno un FLAC 24 bits independiente, por TCP. | Subir al final; Opus con pérdida | Sin espera al parar; TCP no pierde datos (sin glitches); FLAC concatena exacto. Opus no se corta en segmentos sin costuras: queda para más adelante si alguien tiene subida lenta. |
-| Lectura de tomas al reproducir | Toma decodificada una vez a WAV float 32 en caché, leída con **memoria mapeada** y un hilo que precarga 2 s adelante del cursor. | Toda la sesión en RAM; `BufferingAudioReader` por región | Escala a proyectos largos sin RAM; el hilo de audio nunca abre archivos. |
+| Lectura de tomas al reproducir | Tomas decodificadas **en RAM en bloques de 1 s sólo-agregar** (el hilo de audio lee sin bloqueos aunque la toma siga creciendo); los segmentos FLAC quedan en disco para reabrir. ~46 MB por 4 min de pista mono. | Memoria mapeada + precarga (versión inicial de este diseño); `BufferingAudioReader` por región | Una toma que crece obliga a re-mapear y liberar el mapeo viejo desde el hilo de audio (llamada al sistema); los bloques en RAM no tienen ese problema y un proyecto típico entra holgado. |
 | Grabación de instrumento | **Después del VST** (estéreo, efecto aplicado). | Señal limpia + VST al reproducir | No hay efectos por pista en v1. |
 | Alineación | Latencia de entrada + salida reportada por el driver **más** desvío medido con "Calibrar latencia" (loopback). | Sólo lo reportado | Hay placas que reportan mal; es la técnica de los DAWs. |
 | Escucha en vivo | Paquetes UDP Opus del formato actual (bloques de 128 muestras), **reenviados** por el host a quien la activó; sin mezcla en el servidor. | TCP | Es sólo para oír; si se pierde un paquete, no afecta nada grabado. |
@@ -159,9 +159,10 @@ memoria y no toca disco ni red.
 
 **Reproducción** (`core/Render`): para cada pista y cada región que cruza el bloque, lee muestras de su toma
 (`SampleSource::read(take, offset, n, dest)`), aplica:
-- **Fundidas de borde**: 3 ms (144 muestras) de medio coseno al inicio y al final de cada región, salvo en los
-  extremos naturales de la toma (offset 0 / fin de la toma) donde no hay discontinuidad. Si la región dura
-  menos de 2 × 144 muestras, las fundidas se acortan a la mitad de la región.
+- **Fundidas de borde**: 3 ms (144 muestras) de medio coseno al inicio y al final de cada región, salvo en una
+  **unión continua** (otra región de la misma pista que termina/empieza exactamente ahí, sobre la misma toma y
+  con offset contiguo: un corte que dejó las dos mitades suena idéntico al original). Si la región dura menos
+  de 2 × 144 muestras, las fundidas se acortan a la mitad de la región.
 - **Superposiciones**: la región de arriba reemplaza a las de abajo; en sus bordes, las de abajo se
   atenúan con la curva complementaria (fundido cruzado de 3 ms).
 - **Ganancia y paneo** con rampas lineales de 20 ms (por pista, persisten entre bloques); paneo de potencia
@@ -172,11 +173,11 @@ memoria y no toca disco ni red.
   `bpm`/`beatsPerBar`, sólo a la salida local y nunca a la grabación ni a la exportación.
 - Las tomas mono se reproducen centradas antes del paneo; estéreo con balance.
 
-**Tomas en caché** (`client/TakeCache`): cada segmento recibido se decodifica y se **anexa** a
-`cache\<proyecto>\takes\<id>.wav` (float 32, se reescribe el header al final de cada anexado en un archivo
-aparte de largo para no reabrir el WAV); se calculan picos (min/max cada 256 muestras) en `<id>.peaks`. La
-lectura usa memoria mapeada; un hilo de precarga toca las páginas de 2 s por delante del cursor en todas las
-regiones activas. Si una muestra pedida todavía no llegó (toma en curso), se lee silencio.
+**Tomas en caché** (`client/TakeCache`): cada segmento recibido se decodifica y se **anexa** en RAM (bloques
+de 48000 muestras por canal, tabla de punteros preasignada para 4 h, publicada con atómicos: el hilo de audio
+lee sin bloqueos aunque la toma crezca) y se guarda en disco tal cual en `cache\<proyecto>\takes\<id>\<n>.flac`
+(para reabrir sin volver a bajar); se calculan picos (min/max cada 256 muestras). Si una muestra pedida todavía
+no llegó (toma en curso), se lee silencio.
 
 **Grabación** (`client/Recorder`): al apretar Grabar con una pista propia armada, el transporte arranca un
 compás antes del cursor (cuenta) y desde el cursor se capturan las entradas (pista de voz: canal de mic
