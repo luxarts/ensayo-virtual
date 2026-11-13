@@ -719,7 +719,6 @@ struct ProjectHost::Impl
         std::optional<Recording> recording;   // control only, under stateLock
 
         // UDP (read lock-free by the UDP thread through udpPeers).
-        std::atomic<bool> listening { false };
         std::atomic<uint64_t> udpAddress { 0 };     // ip << 16 | port, 0 = unknown
         std::atomic<int64_t> udpLastSeenMs { 0 };
     };
@@ -833,7 +832,7 @@ struct ProjectHost::Impl
 
         boundPort = listener->getBoundPort();
 
-        // UDP preview relay on the same port number.
+        // UDP live-audio relay (voice chat and live instrument) on the same port number.
         SOCKET udp = ::socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
         if (udp == INVALID_SOCKET)
@@ -1041,7 +1040,7 @@ struct ProjectHost::Impl
         else if (type == "rec_peaks") handleRecPeaks (c, message);
         else if (type == "rec_stop")  handleRecStop (c, message);
         else if (type == "take_complete") handleTakeComplete (c, message);
-        else if (type == "listen")    c.listening.store ((bool) message["enabled"], std::memory_order_release);
+        else if (type == "listen")    {}   // old clients: every peer with a UDP address now gets the live audio
         else if (type == "ping")      c.send (object ({ { "t", "pong" }, { "ms", message["ms"] } }));
         else if (type == "resync")
         {
@@ -1451,6 +1450,7 @@ struct ProjectHost::Impl
                     continue;
 
                 entry.getDynamicObject()->setProperty ("online", true);
+                entry.getDynamicObject()->setProperty ("clientId", (int) o->clientId);   // maps UDP senders to users
 
                 if (o->recording)
                     entry.getDynamicObject()->setProperty ("recording", object ({ { "take", o->recording->take },
@@ -1600,7 +1600,7 @@ struct ProjectHost::Impl
 
             for (auto& p : *peers)
             {
-                if (p.get() == sender || ! p->listening.load (std::memory_order_acquire))
+                if (p.get() == sender)
                     continue;
 
                 const auto address = p->udpAddress.load (std::memory_order_acquire);

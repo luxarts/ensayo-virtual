@@ -8,7 +8,7 @@ constexpr int protocolVersionV2 = 2;
 
 struct HostConfig
 {
-    int port = defaultPort;            // TCP (control + data) and UDP (preview relay)
+    int port = defaultPort;            // TCP (control + data) and UDP (live-audio relay)
     int maxClients = 8;
 };
 

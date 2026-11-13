@@ -618,7 +618,7 @@ public:
 
     void testUdpRelay()
     {
-        beginTest ("preview datagrams are relayed unchanged to listening clients only");
+        beginTest ("audio datagrams are relayed unchanged to every other peer with a UDP address, without listen");
 
         const auto hostUser = newId();
         ProjectHost host ({ 22210, 8 });
@@ -639,7 +639,6 @@ public:
             s.write ("127.0.0.1", 22210, bytes, 5);
         };
 
-        b.send (object ({ { "t", "listen" }, { "enabled", true } }));
         keepalive (ub, b.welcome);
         keepalive (uc, c.welcome);
 
@@ -661,24 +660,46 @@ public:
         const auto len = encodeAudioPacket (view, packet, sizeof (packet));
         expect (len > 0);
 
-        bool received = false;
+        bool receivedB = false, receivedC = false;
         uint8_t in[2048];
 
-        for (int attempt = 0; attempt < 20 && ! received; ++attempt)
+        auto readExact = [&] (juce::DatagramSocket& s)
+        {
+            if (s.waitUntilReady (true, 100) != 1)
+                return false;
+
+            const auto n = s.read (in, sizeof (in), false);
+            return n == (int) len && std::memcmp (in, packet, len) == 0;
+        };
+
+        for (int attempt = 0; attempt < 20 && ! (receivedB && receivedC); ++attempt)
         {
             keepalive (ub, b.welcome);
+            keepalive (uc, c.welcome);
             ua.write ("127.0.0.1", 22210, packet, (int) len);
-
-            if (ub.waitUntilReady (true, 100) == 1)
-            {
-                const auto n = ub.read (in, sizeof (in), false);
-                received = n == (int) len && std::memcmp (in, packet, len) == 0;
-            }
+            receivedB = receivedB || readExact (ub);
+            receivedC = receivedC || readExact (uc);
         }
 
-        expect (received);
-        expect (uc.waitUntilReady (true, 300) != 1);
-        expect (ua.waitUntilReady (true, 100) != 1);
+        expect (receivedB, "B gets A's datagram");
+        expect (receivedC, "C gets A's datagram");
+        expect (ua.waitUntilReady (true, 100) != 1, "never echoed to the sender");
+
+        // The old listen message is still accepted and changes nothing.
+        b.send (object ({ { "t", "listen" }, { "enabled", false } }));
+        juce::Thread::sleep (100);
+
+        while (ub.waitUntilReady (true, 0) == 1) ub.read (in, sizeof (in), false);
+
+        bool afterListenOff = false;
+
+        for (int attempt = 0; attempt < 20 && ! afterListenOff; ++attempt)
+        {
+            ua.write ("127.0.0.1", 22210, packet, (int) len);
+            afterListenOff = readExact (ub);
+        }
+
+        expect (afterListenOff, "listen:false does not stop the relay");
     }
 
     void testPresence()
@@ -704,6 +725,8 @@ public:
             });
             expect (both.isObject());
             expectEquals ((*findUser (both, userB))["name"].toString(), juce::String ("Ana"));
+            expectEquals ((int) (*findUser (both, userB))["clientId"], (int) b.welcome["clientId"]);
+            expectEquals ((int) (*findUser (both, hostUser))["clientId"], (int) a.welcome["clientId"]);
 
             // Recording state shows up in presence and rec_* messages are relayed with "user".
             const auto track = newId(), take = newId();
@@ -735,6 +758,7 @@ public:
         });
         expect (after.isObject());
         expect ((bool) (*findUser (after, hostUser))["online"]);
+        expect (! findUser (after, userB)->hasProperty ("clientId"), "offline users carry no clientId");
     }
 
     //==========================================================================
