@@ -54,6 +54,9 @@ bool isSeamless (const Region& prev, const Region& next) noexcept
 void panGains (float pan, float& left, float& right) noexcept
 {
     pan = std::isfinite (pan) ? std::clamp (pan, -1.0f, 1.0f) : 0.0f;
+
+    if (pan == 1.0f) { left = 0.0f; right = 1.0f; return; }   // cos (pi/2) is not exactly 0 in floating point
+
     const auto angle = ((double) pan + 1.0) * (pi / 4.0);
     left = (float) std::cos (angle);
     right = (float) std::sin (angle);
@@ -172,9 +175,15 @@ struct Renderer::Impl
 
     // Audio thread.
     std::shared_ptr<State> current;
+    // Layout crossfade: for transportFadeSamples after a new snapshot is picked up, the outgoing state is rendered
+    // too (with its own ramps, which keep running toward its own targets) and faded out against the incoming one,
+    // so deleting, moving or trimming a region under the playhead never cuts it. Each state's ramps advance once
+    // per sample. Snapshots arriving during a crossfade wait for it to finish (at most 5 ms).
+    std::shared_ptr<State> outgoing;
+    int fadePos = 0;
     uint64_t seenVersion = 0;
     int maxBlock = 0;
-    std::vector<float> readA, readB, coverage, mono, stereoL, stereoR;
+    std::vector<float> readA, readB, coverage, mono, stereoL, stereoR, oldL, oldR;
 
     void publish()   // message thread, messageLock held
     {
@@ -187,8 +196,17 @@ struct Renderer::Impl
         pendingVersion.fetch_add (1, std::memory_order_release);
     }
 
-    void pickUp() noexcept   // audio thread
+    // Audio thread. With `crossfade` false (snapRamps) any running crossfade ends and the new state is taken at once.
+    void pickUp (bool crossfade) noexcept
     {
+        if (outgoing != nullptr)
+        {
+            if (crossfade)
+                return;
+
+            outgoing.reset();   // keepAlive still references it: never freed here
+        }
+
         const auto version = pendingVersion.load (std::memory_order_acquire);
 
         if (version == seenVersion)
@@ -216,12 +234,45 @@ struct Renderer::Impl
             }
         }
 
+        if (crossfade && current != nullptr)
+        {
+            outgoing = current;
+            fadePos = 0;
+        }
+
         current = std::move (next);   // the previous state is still referenced by keepAlive
     }
 
     void renderChunk (const SampleSource& source, int64_t position, int n, float* outL, float* outR) noexcept
     {
-        for (auto& track : current->tracks)
+        renderState (*current, source, position, n, outL, outR);
+
+        if (outgoing == nullptr)
+            return;
+
+        const int m = std::min (n, transportFadeSamples - fadePos);
+        std::fill (oldL.begin(), oldL.begin() + m, 0.0f);
+        std::fill (oldR.begin(), oldR.begin() + m, 0.0f);
+        renderState (*outgoing, source, position, m, oldL.data(), oldR.data());
+
+        for (int i = 0; i < m; ++i)
+        {
+            // Outgoing weight: half-cosine from 1 to 0. Written as new + w * (old - new) so an unchanged layout
+            // renders bit-identical to no snapshot change.
+            const auto w = (float) (0.5 + 0.5 * std::cos (pi * ((double) (fadePos + i) + 0.5) / transportFadeSamples));
+            outL[i] += w * (oldL[(size_t) i] - outL[i]);
+            outR[i] += w * (oldR[(size_t) i] - outR[i]);
+        }
+
+        fadePos += m;
+
+        if (fadePos >= transportFadeSamples)
+            outgoing.reset();
+    }
+
+    void renderState (State& state, const SampleSource& source, int64_t position, int n, float* outL, float* outR) noexcept
+    {
+        for (auto& track : state.tracks)
         {
             if (track.gain.idleAt (0.0f))
                 continue;   // silent and not ramping: nothing to hear, nothing to advance
@@ -318,7 +369,7 @@ void Renderer::prepare (int maxBlockSize)
     auto& d = *impl;
     d.maxBlock = std::max (1, maxBlockSize);
 
-    for (auto* v : { &d.readA, &d.readB, &d.coverage, &d.mono, &d.stereoL, &d.stereoR })
+    for (auto* v : { &d.readA, &d.readB, &d.coverage, &d.mono, &d.stereoL, &d.stereoR, &d.oldL, &d.oldR })
         v->assign ((size_t) d.maxBlock, 0.0f);
 }
 
@@ -345,7 +396,7 @@ void Renderer::render (const SampleSource& source, int64_t position, int n, floa
     std::fill (outR, outR + n, 0.0f);
 
     auto& d = *impl;
-    d.pickUp();
+    d.pickUp (true);
 
     if (d.current == nullptr || d.maxBlock <= 0)
         return;
@@ -361,7 +412,7 @@ void Renderer::render (const SampleSource& source, int64_t position, int n, floa
 void Renderer::snapRamps() noexcept
 {
     auto& d = *impl;
-    d.pickUp();
+    d.pickUp (false);
 
     if (d.current == nullptr)
         return;

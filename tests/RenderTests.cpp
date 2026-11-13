@@ -13,7 +13,8 @@ namespace
 {
 constexpr int64_t takeSamples = 4 * 48000;
 
-// Serves a 440 Hz sine (amplitude 0.5) for every known take; sample k of a take is sine (k).
+// Serves a 440 Hz sine (amplitude 0.5) for every known take: sample k of channel 0 is sine (k), of channel 1
+// (stereo takes) sine2 (k), the same sine 60 degrees later, so the channels differ but share the no-click bound.
 class SineSource : public SampleSource
 {
 public:
@@ -24,20 +25,27 @@ public:
         return (float) (0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * 440.0 * (double) k / 48000.0));
     }
 
+    static float sine2 (int64_t k) noexcept
+    {
+        return (float) (0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * 440.0 * (double) k / 48000.0
+                                        + juce::MathConstants<double>::pi / 3.0));
+    }
+
     int channels (const Id& take) const noexcept override
     {
         const auto it = takes.find (take);
         return it == takes.end() ? 0 : it->second.first;
     }
 
-    void read (const Id& take, int, int64_t offset, int n, float* dest) const noexcept override
+    void read (const Id& take, int channel, int64_t offset, int n, float* dest) const noexcept override
     {
         const auto it = takes.find (take);
+        const bool second = it != takes.end() && std::min (channel, it->second.first - 1) >= 1;
 
         for (int i = 0; i < n; ++i)
         {
             const auto k = offset + i;
-            dest[i] = (it != takes.end() && k >= 0 && k < it->second.second) ? sine (k) : 0.0f;
+            dest[i] = (it != takes.end() && k >= 0 && k < it->second.second) ? (second ? sine2 (k) : sine (k)) : 0.0f;
         }
     }
 
@@ -95,13 +103,13 @@ struct Fixture
     SineSource source;
     bool ok = true;
 
-    Fixture()
+    explicit Fixture (int channels = 1)
     {
-        ok = apply (Ops::addTake (take, 1))
+        ok = apply (Ops::addTake (take, channels))
           && apply (Ops::updateTake (take, 4, takeSamples, true))
           && apply (Ops::addTrack (track, "Track", TrackKind::voice))
           && apply (Ops::addRegion (track, { region, take, 0, 0, takeSamples }));
-        source.add (take, 1);
+        source.add (take, channels);
     }
 
     bool apply (const juce::var& op) { return applyOp (project, op, host).ok; }
@@ -123,20 +131,28 @@ class RenderTests : public juce::UnitTest
 public:
     RenderTests() : juce::UnitTest ("Render", "EnsayoVirtual") {}
 
+    juce::String clickSummary;   // measured steps of the current test, logged once by logClicks
+
     void expectNoClick (const std::vector<float>& x, const juce::String& what)
     {
         const auto step = maxStep (x), bound = noClickBound();
-        logMessage (what + ": maxStep " + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
+        clickSummary << " " << what << " " << juce::String (step, 6);
         expect (step <= bound, what + ": step " + juce::String (step, 6) + " > bound " + juce::String (bound, 6));
     }
 
-    // Same check restricted to [edge - 200, edge + 200), so the report shows the step at the edge itself.
+    // Same check restricted to [edge - 200, edge + 200), so the summary shows the step at the edge itself.
     void expectNoClickAt (const std::vector<float>& x, int64_t edge, const juce::String& what)
     {
         const auto from = (size_t) std::max<int64_t> (1, edge - 200), to = (size_t) (edge + 200);
         const auto step = maxStep (x, from, to), bound = noClickBound();
-        logMessage (what + " @" + juce::String (edge) + ": local maxStep " + juce::String (step, 6));
+        clickSummary << " " << what << "@" << juce::String (edge) << " " << juce::String (step, 6);
         expect (step <= bound, what + " @" + juce::String (edge));
+    }
+
+    void logClicks()
+    {
+        logMessage ("maxStep (bound " + juce::String (noClickBound(), 6) + "):" + clickSummary);
+        clickSummary.clear();
     }
 
     Stereo renderProject (const Fixture& f, int64_t start, int total, int block = 512)
@@ -190,6 +206,7 @@ public:
             expectNoClick (out.L, "delete middle third");
             expectNoClickAt (out.L, 64000, "delete middle third");
             expectNoClickAt (out.L, 128000, "delete middle third");
+            logClicks();
             expectEquals (out.L[63999], 0.0f);
             expectEquals (out.L[128000], 0.0f);
 
@@ -212,6 +229,7 @@ public:
             expectNoClick (out.L, "move start+end");
             expectNoClickAt (out.L, 6000, "move");
             expectNoClickAt (out.L, 102000, "move");
+            logClicks();
             expectEquals (out.L[5999], 0.0f);
             expect (out.L[6200] != 0.0f);
             expectEquals (out.L[102000], 0.0f);
@@ -225,6 +243,7 @@ public:
             const auto out = renderProject (f, 0, whole);
             expectNoClick (out.L, "trim start");
             expectNoClickAt (out.L, 777, "trim start");
+            logClicks();
             expectEquals (out.L[776], 0.0f);
         }
 
@@ -241,6 +260,7 @@ public:
             expectNoClick (clicks.L, "overlap");
             expectNoClickAt (clicks.L, 48000, "overlap");
             expectNoClickAt (clicks.L, 96000, "overlap");
+            logClicks();
 
             expect (f.apply (Ops::setMix (f.track, -6.0f, 0.0f, std::nullopt)));
             const auto out = renderProject (f, 0, whole);
@@ -276,6 +296,7 @@ public:
             append (out, after);
             expectNoClick (out.L, "gain -60 -> 0 dB");
             expectNoClickAt (out.L, 4800, "gain -60 -> 0 dB");
+            logClicks();
 
             const auto full = renderProject (f, 0, 9600);
             bool rampedDown = true;
@@ -329,6 +350,7 @@ public:
             append (both, renderRange (s, g.source, 4800, 4800, 64));
             expectNoClick (both.L, "solo");
             expectNoClickAt (both.L, 4800, "solo");
+            logClicks();
 
             const auto single = renderProject (g, 0, 9600);   // both tracks: twice one track
             bool half = true;
@@ -345,6 +367,110 @@ public:
             const auto snapped = renderRange (r, f.source, 9600, 64, 64);
             const auto ref = renderProject (f, 9600, 64);
             expect (snapped.L == ref.L, "snapRamps did not jump to the target");
+        }
+
+        beginTest ("Stereo takes: balance law");
+        {
+            Fixture f (2);
+            const auto gain = dbToGain (-6.0f);
+            const int from = 1000, to = 48000;   // past the fade-in
+
+            const auto check = [&] (float pan, float leftScale, float rightScale)
+            {
+                expect (f.apply (Ops::setMix (f.track, -6.0f, pan, std::nullopt)));
+                const auto out = renderProject (f, 0, to);
+                bool same = true;
+
+                for (int i = from; i < to; ++i)
+                    same = same && std::abs (out.L[(size_t) i] - SineSource::sine (i) * gain * leftScale) <= 1.0e-6f
+                                && std::abs (out.R[(size_t) i] - SineSource::sine2 (i) * gain * rightScale) <= 1.0e-6f;
+
+                expect (same, "pan " + juce::String (pan));
+            };
+
+            check (0.0f, 1.0f, 1.0f);
+            check (-1.0f, 1.0f, 0.0f);
+            check (1.0f, 0.0f, 1.0f);
+        }
+
+        beginTest ("Stereo takes: delete middle third and overlap have no clicks on either channel");
+        {
+            Fixture f (2);
+            const auto middle = newId(), last = newId();
+            expect (f.apply (Ops::splitRegion (f.track, f.region, 64000, middle)));
+            expect (f.apply (Ops::splitRegion (f.track, middle, 128000, last)));
+            expect (f.apply (Ops::deleteRegion (f.track, middle)));
+            const auto cut = renderProject (f, 0, whole);
+
+            for (const auto* ch : { &cut.L, &cut.R })
+            {
+                const juce::String name = ch == &cut.L ? "L" : "R";
+                expectNoClick (*ch, "delete " + name);
+                expectNoClickAt (*ch, 64000, "delete " + name);
+                expectNoClickAt (*ch, 128000, "delete " + name);
+            }
+
+            Fixture g (2);
+            const auto take2 = newId();
+            expect (g.apply (Ops::addTake (take2, 2)));
+            expect (g.apply (Ops::updateTake (take2, 4, takeSamples, true)));
+            g.source.add (take2, 2);
+            expect (g.apply (Ops::addRegion (g.track, { newId(), take2, 48000, 10000, 48000 })));
+            const auto overlap = renderProject (g, 0, whole);
+
+            for (const auto* ch : { &overlap.L, &overlap.R })
+            {
+                const juce::String name = ch == &overlap.L ? "L" : "R";
+                expectNoClick (*ch, "overlap " + name);
+                expectNoClickAt (*ch, 48000, "overlap " + name);
+                expectNoClickAt (*ch, 96000, "overlap " + name);
+            }
+
+            logClicks();
+        }
+
+        beginTest ("Deleting a region under the playhead crossfades to the new layout");
+        {
+            Fixture f;
+            expect (f.hardLeft());
+            Renderer r;
+            r.prepare (512);
+            r.setProject (f.snapshot());
+            auto out = renderRange (r, f.source, 0, 4900, 4900);
+            expect (f.apply (Ops::deleteRegion (f.track, f.region)));
+            r.setProject (f.snapshot());                       // between two render calls, mid-way through playback
+            append (out, renderRange (r, f.source, 4900, 4700, 300));
+            expectNoClick (out.L, "delete under playhead");
+            expectNoClickAt (out.L, 4900, "delete under playhead");
+            logClicks();
+            expect (out.L[4901] != 0.0f, "the deleted region was cut, not faded");
+
+            bool silent = true;
+
+            for (int i = 4900 + transportFadeSamples; i < 9600; ++i)
+                silent = silent && out.L[(size_t) i] == 0.0f && out.R[(size_t) i] == 0.0f;
+
+            expect (silent, "not silent after the crossfade");
+        }
+
+        beginTest ("Replacing the snapshot with an identical project changes nothing");
+        {
+            Fixture f;
+            Renderer a, b;
+
+            for (auto* r : { &a, &b })
+            {
+                r->prepare (512);
+                r->setProject (f.snapshot());
+            }
+
+            auto outA = renderRange (a, f.source, 0, 1000, 100);
+            auto outB = renderRange (b, f.source, 0, 1000, 100);
+            b.setProject (f.snapshot());
+            append (outA, renderRange (a, f.source, 1000, 2000, 100));
+            append (outB, renderRange (b, f.source, 1000, 2000, 100));
+            expect (outA.L == outB.L && outA.R == outB.R);
+            expect (maxStep (outA.L) > 0.0f);
         }
 
         beginTest ("panGains is constant power");
