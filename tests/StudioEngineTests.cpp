@@ -638,6 +638,23 @@ public:
     {
         studioTestDir().deleteRecursively();
 
+        beginTest ("destroying an engine right after creating it never leaves the chat thread waiting");
+        {
+            // The quit must not slip in between the chat thread's check and its wait: ~StudioEngine would hang in join.
+            const auto start = juce::Time::getMillisecondCounter();
+
+            for (int i = 0; i < 200; ++i)
+            {
+                StudioEngine engine;
+
+                if (i % 2 == 0)
+                    std::this_thread::yield();
+            }
+
+            logMessage ("200 engines in " + juce::String ((int) (juce::Time::getMillisecondCounter() - start)) + " ms");
+            expect (true);
+        }
+
         beginTest ("loopback alignment, block 256");
         alignment ({ "b256", 256, { 200, 264 }, 0, 96000 + 200 + 264 });
 

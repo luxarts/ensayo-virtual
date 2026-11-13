@@ -528,9 +528,14 @@ void StudioEngine::sendChat (const float* voice, const float* instrumentL, const
 
 void StudioEngine::chatLoop()
 {
-    while (! chatQuit.load())
+    for (;;)
     {
+        // The signal is read before the quit flag: a quit stored (and signalled) after this load changes the value, so
+        // the wait below returns at once instead of missing it.
         const auto seen = chatSignal.load (std::memory_order_acquire);
+
+        if (chatQuit.load())
+            break;
 
         for (auto* sender : { chatVoice.get(), chatInstrument.get() })
         {
