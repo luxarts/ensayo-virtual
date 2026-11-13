@@ -67,7 +67,6 @@ set(ENSAYO_CORE_SOURCES
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
-    src/server/HighResClock.cpp
     src/server/MediaFoundationAudioFormat.cpp
     # T4
     src/server/ProjectHost.cpp

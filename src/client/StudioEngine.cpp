@@ -265,6 +265,11 @@ juce::Result StudioEngine::startRecording (const Track& track, const Id& take, c
                               ? (int64_t) std::llround (beatsPerBar.load() * 60.0 * sampleRate / tempo) : 0;
     const int64_t point = getPosition();
 
+    // The record point and the offset are fixed before the writer starts, so its callbacks (and the caller, through
+    // getRecordPoint / getRecordOffset) can rely on them for the whole take.
+    recordPoint = point;
+    recordOffset = recordingOffset (countIn, device->getInputLatencyInSamples(), device->getOutputLatencyInSamples(),
+                                    calibrationSamples.load());
     finishedSegments = 0;
     finishedSamples = 0;
     previewEncoder = std::make_unique<PreviewEncoder> (mode128, channels);
@@ -297,9 +302,6 @@ juce::Result StudioEngine::startRecording (const Track& track, const Id& take, c
     }
 
     recordTake = take;
-    recordPoint = point;
-    recordOffset = recordingOffset (countIn, device->getInputLatencyInSamples(), device->getOutputLatencyInSamples(),
-                                    calibrationSamples.load());
     recordChannels.store (channels);
     captureEnabled.store (true);
     recording.store (true);
@@ -330,8 +332,7 @@ std::optional<RecordingResult> StudioEngine::stopRecording()
     if (total - recordOffset < 1)
     {
         if (recorder.onError)
-            recorder.onError ("The take (" + juce::String (total) + " samples) is shorter than the recording offset ("
-                              + juce::String (recordOffset) + "); nothing was recorded");
+            recorder.onError (juce::String (juce::CharPointer_UTF8 ("La toma es m\xc3\xa1s corta que la cuenta y la latencia; no se guard\xc3\xb3")));
 
         return std::nullopt;
     }
@@ -346,6 +347,8 @@ std::optional<RecordingResult> StudioEngine::stopRecording()
 }
 
 bool StudioEngine::isRecording() const noexcept    { return recording.load(); }
+int64_t StudioEngine::getRecordPoint() const noexcept    { return recordPoint; }
+int64_t StudioEngine::getRecordOffset() const noexcept   { return recordOffset; }
 
 void StudioEngine::disableCapture() noexcept
 {

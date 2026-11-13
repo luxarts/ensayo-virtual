@@ -1,4 +1,5 @@
 #include "client/HeadlessClient.h"
+#include "client/SessionController.h"
 #include "client/ProjectClient.h"
 #include "client/Offline.h"
 #include "server/ProjectHost.h"
@@ -360,6 +361,37 @@ public:
                     expectEquals ((juce::int64) reader->lengthInSamples, (juce::int64) 144000);
                 }
             }
+        }
+
+        beginTest ("leaving during an import cancels it: no track is created and leave() returns promptly");
+        {
+            const auto dir = tempDir ("import-cancel");
+            const auto wav = writeWav (dir.getChildFile ("Larga.wav"), 44100.0, 120);
+            const auto projectDir = dir.getChildFile ("project");
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+
+            {
+                SessionController session (engine);
+                bool connected = false;
+                session.onConnected = [&] { connected = true; };
+                expect (session.host (projectDir, recordPort, { newId(), "Dani", dir.getChildFile ("cache") }, "Cancelar").wasOk());
+                expect (waitFor ([&] { return connected; }, 8000));
+                expect (session.importFile (wav).wasOk());
+                expect (session.isImporting());
+
+                const auto t0 = juce::Time::getMillisecondCounter();
+                session.leave();
+                const auto elapsed = juce::Time::getMillisecondCounter() - t0;
+                expect (elapsed < 15000, "leave took " + juce::String ((int) elapsed) + " ms");
+                expect (! session.isImporting() && ! session.isActive());
+                pumpMessages (200);   // stale import posts must be dropped
+            }
+
+            juce::String error;
+            const auto p = projectFromJson (projectDir.getChildFile ("project.json").loadFileAsString(), error);
+            expect (p.has_value() && p->tracks.empty(), "a cancelled import left a track");
+            engine.getDeviceManager().closeAudioDevice();
         }
 
         beginTest ("runHeadless --calibrate on a fake loopback finds the hidden latency and exits");

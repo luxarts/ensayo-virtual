@@ -79,6 +79,27 @@ public:
             file.deleteFile();
         }
 
+        beginTest ("a settings file that does not parse is kept as .bad, never overwritten silently");
+        {
+            const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ensayo-settings-bad");
+            dir.deleteRecursively();
+            dir.createDirectory();
+            const auto file = dir.getChildFile ("settings.json");
+            file.replaceWithText ("{ \"name\": \"Ana\", truncated");
+            juce::String warning;
+            const auto loaded = loadSettings (file, &warning);
+            expect (isValidId (loaded.userId));
+            expectEquals (loaded.name, juce::String());
+            expectEquals (dir.getChildFile ("settings.json.bad").loadFileAsString(), juce::String ("{ \"name\": \"Ana\", truncated"));
+            expect (warning.contains ("settings.json.bad"), warning);
+            expect (fromJson (file.loadFileAsString()).userId == loaded.userId, "new defaults written with the id");
+
+            juce::String none;
+            loadSettings (file, &none);
+            expect (none.isEmpty(), "a valid file gives no warning");
+            dir.deleteRecursively();
+        }
+
         beginTest ("calibration map round trip and key format");
         {
             expectEquals (calibrationKey ("MiniFuse ASIO Driver", 256), juce::String ("MiniFuse ASIO Driver@256"));

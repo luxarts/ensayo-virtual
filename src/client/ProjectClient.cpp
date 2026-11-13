@@ -318,6 +318,14 @@ struct ProjectClient::Impl
 
     std::shared_ptr<std::atomic<int>> generation;
 
+    // The take being recorded here (beginTake .. finishTake/discardTake) and the peaks sent for it, so a reconnect in
+    // the middle of the take can announce it again. Lines for it are enqueued under this lock so rec_start always
+    // precedes its peaks on a connection.
+    std::mutex activeLock;
+    Id activeTake, activeTrack;
+    int64_t activeStart = 0;
+    std::vector<Peak> activePeaks;
+
     //==========================================================================
     void post (int gen, std::function<void()> fn)
     {
@@ -343,6 +351,49 @@ struct ProjectClient::Impl
     // From API calls (message thread or the caller's own thread), not from connection threads.
     void postError (const juce::String& message)   { postError (generation->load(), message); }
     void postTransfers()                            { postTransfers (generation->load()); }
+
+    // Any thread.
+    void sendPeakLines (const Id& take, int64_t fromPeak, const Peak* peaks, size_t count)
+    {
+        auto round = [] (float v) { return std::round ((double) v * 10000.0) / 10000.0; };
+
+        for (size_t first = 0; first < count; first += peaksPerMessage)
+        {
+            juce::Array<juce::var> list;
+            const auto last = std::min (count, first + peaksPerMessage);
+
+            for (size_t i = first; i < last; ++i)
+                list.add (juce::Array<juce::var> { round (peaks[i].min), round (peaks[i].max) });
+
+            sendLine (object ({ { "t", "rec_peaks" }, { "take", take }, { "from", (juce::int64) (fromPeak + (int64_t) first) },
+                                { "peaks", list } }));
+        }
+    }
+
+    // Message thread, at a welcome: a take still being recorded here is announced again with every peak so far.
+    void resendActiveTake()
+    {
+        const std::lock_guard<std::mutex> scoped (activeLock);
+
+        if (activeTake.isEmpty())
+            return;
+
+        sendLine (object ({ { "t", "rec_start" }, { "take", activeTake }, { "track", activeTrack },
+                            { "start", (juce::int64) activeStart } }));
+        sendPeakLines (activeTake, 0, activePeaks.data(), activePeaks.size());
+    }
+
+    void clearActive (const Id& take)
+    {
+        const std::lock_guard<std::mutex> scoped (activeLock);
+
+        if (activeTake == take)
+        {
+            activeTake.clear();
+            activeTrack.clear();
+            activePeaks.clear();
+        }
+    }
 
     // Any thread.
     void sendLine (const juce::var& message)
@@ -980,6 +1031,7 @@ struct ProjectClient::Impl
             owner.onWelcomeForTest();
 
         reconcile();
+        resendActiveTake();
 
         if (owner.onProjectChanged != nullptr)
             owner.onProjectChanged();
@@ -1655,6 +1707,12 @@ void ProjectClient::beginTake (const Id& take, int channels, const Id& track, in
     if (sendAddTake)
         impl->sendOpInternal (Ops::addTake (take, channels));
 
+    const std::lock_guard<std::mutex> scoped (impl->activeLock);
+    impl->activeTake = take;
+    impl->activeTrack = track;
+    impl->activeStart = timelineStart;
+    impl->activePeaks.clear();
+
     if (impl->welcomed)
         impl->sendLine (object ({ { "t", "rec_start" }, { "take", take }, { "track", track },
                                         { "start", (juce::int64) timelineStart } }));
@@ -1662,22 +1720,23 @@ void ProjectClient::beginTake (const Id& take, int channels, const Id& track, in
 
 void ProjectClient::sendPeaks (const Id& take, int64_t fromPeak, const std::vector<Peak>& peaks)
 {
-    if (! impl->canSend.load())
+    if (fromPeak < 0)
         return;
 
-    auto round = [] (float v) { return std::round ((double) v * 10000.0) / 10000.0; };
+    const std::lock_guard<std::mutex> scoped (impl->activeLock);
 
-    for (size_t first = 0; first < peaks.size(); first += peaksPerMessage)
+    if (take == impl->activeTake)
     {
-        juce::Array<juce::var> list;
-        const auto last = std::min (peaks.size(), first + peaksPerMessage);
+        const auto end = (size_t) fromPeak + peaks.size();
 
-        for (size_t i = first; i < last; ++i)
-            list.add (juce::Array<juce::var> { round (peaks[i].min), round (peaks[i].max) });
+        if (impl->activePeaks.size() < end)
+            impl->activePeaks.resize (end);
 
-        impl->sendLine (object ({ { "t", "rec_peaks" }, { "take", take }, { "from", (juce::int64) (fromPeak + (int64_t) first) },
-                                  { "peaks", list } }));
+        std::copy (peaks.begin(), peaks.end(), impl->activePeaks.begin() + (std::ptrdiff_t) fromPeak);
     }
+
+    if (impl->canSend.load())
+        impl->sendPeakLines (take, fromPeak, peaks.data(), peaks.size());
 }
 
 void ProjectClient::queueSegment (const Id& take, int index, const juce::MemoryBlock& flac)
@@ -1743,6 +1802,8 @@ void ProjectClient::queueSegment (const Id& take, int index, const juce::MemoryB
 
 void ProjectClient::finishTake (const Id& take, const Id& track, const Region& region)
 {
+    impl->clearActive (take);
+
     {
         const std::lock_guard<std::mutex> scoped (impl->lock);
 
@@ -1810,14 +1871,19 @@ std::vector<UnfinishedTake> ProjectClient::unfinishedTakes() const
 
 void ProjectClient::discardTake (const Id& take)
 {
+    impl->clearActive (take);
+
     {
         const std::lock_guard<std::mutex> scoped (impl->lock);
 
-        if (impl->projectId.isEmpty() || impl->findPending (take) == nullptr)
-            return;
-
-        impl->dropPendingLocked (take);
+        if (impl->projectId.isNotEmpty() && impl->findPending (take) != nullptr)
+            impl->dropPendingLocked (take);
     }
+
+    // Nobody may keep showing it as recording. The take itself (if add_take was applied) stays empty and incomplete,
+    // with no region.
+    if (impl->welcomed)
+        impl->sendLine (object ({ { "t", "rec_stop" }, { "take", take } }));
 
     impl->postTransfers();
 }

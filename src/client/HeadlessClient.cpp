@@ -716,7 +716,7 @@ int runHeadless (const HeadlessOptions& o)
                 waitUntil ([&] { return engine.getPosition() >= endPosition; }, o.recordFor * 1000.0 + 30000.0, isFailed);
 
                 if (! session.stopTake())
-                    markFailed ("the take was shorter than the recording offset");
+                    markFailed ("record: " + session.getTakeError());
             }
         }
     }

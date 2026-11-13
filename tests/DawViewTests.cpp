@@ -159,11 +159,17 @@ public:
             expect (find (view, "track.1.mute")->isEnabled());
             expect (find (view, "track.1.volume")->isEnabled());
 
+            // As host I can edit every track but arm only my own (spec 7): the guest's tracks show the lock.
             view.setState (f.state (f.host));
             expect (find (view, "track.3.mute")->isEnabled());
             expect (find (view, "track.3.volume")->isEnabled());
             expect (find (view, "track.1.volume")->isEnabled());
-            expect (shownWithin (view, find (view, "track.1.arm")));
+            expect (find (view, "track.1.mute")->isEnabled());
+            expect (! shownWithin (view, find (view, "track.1.arm")), "host must not arm the guest's track");
+            expect (! shownWithin (view, find (view, "track.2.arm")), "host must not arm the guest's track");
+            expect (shownWithin (view, find (view, "track.1.lock")));
+            expect (shownWithin (view, find (view, "track.3.arm")), "host arms its own track");
+            expect (! shownWithin (view, find (view, "track.3.lock")));
         }
 
         beginTest ("split emits split_region at the playhead");
@@ -480,7 +486,7 @@ public:
             expect (! find (view, "track.1.pan")->isEnabled());
             expect (! find (view, "transport.bpm")->isEnabled());
             expect (! find (view, "edit.split")->isEnabled());
-            expect (shownWithin (view, find (view, "track.1.arm")));   // arming stays available
+            expect (shownWithin (view, find (view, "track.3.arm")));   // arming my own track stays available
 
             dynamic_cast<juce::Label*> (find (view, "track.1.name"))->setText ("X", juce::sendNotificationSync);
             dynamic_cast<juce::Label*> (find (view, "transport.bpm"))->setText ("90", juce::sendNotificationSync);

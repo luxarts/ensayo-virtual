@@ -1,4 +1,6 @@
 #include "server/ProjectHost.h"
+#include "client/ProjectClient.h"
+#include "MessagePump.h"
 #include "core/Segments.h"
 #include "server/ProjectHostDetail.h"
 #include "core/Sha1.h"
@@ -218,6 +220,7 @@ public:
     void runTest() override
     {
         testStartAndReopen();
+        testStableSessionId();
         testHelloErrors();
         testOpsOrderedAndRejected();
         testSegments();
@@ -271,6 +274,51 @@ public:
             expectEquals (host.snapshot()->id, projectId);
             expectEquals (host.snapshot()->name, juce::String ("Mi tema"));
         }
+    }
+
+    void testStableSessionId()
+    {
+        beginTest ("the session id is kept per project: a restart keeps it and the old link joins");
+
+        const auto root = testDir ("session");
+        const auto dir = root.getChildFile ("proj");
+        const auto hostUser = newId();
+        juce::String first;
+
+        {
+            ProjectHost host ({ 22259, 8 });
+            expect (host.start (dir, hostUser, "Lucas", "Tema").wasOk());
+            first = host.getSessionId();
+            expectEquals (dir.getChildFile ("session.txt").loadFileAsString().trim(), first);
+            host.stop();
+        }
+
+        ProjectHost host ({ 22259, 8 });
+        expect (host.start (dir, hostUser, "Lucas", "ignored").wasOk());
+        expectEquals (host.getSessionId(), first);
+
+        ProjectClient guest ({ root.getChildFile ("cache"), newId(), "Ana" });
+        bool connected = false;
+        juce::String error;
+        guest.onConnected = [&] { connected = true; };
+        guest.onError = [&] (const juce::String& e) { error = e; };
+        guest.connect ({ "127.0.0.1", 22259, first });
+        const auto deadline = juce::Time::getMillisecondCounter() + 8000;
+
+        while (! connected && error.isEmpty() && juce::Time::getMillisecondCounter() < deadline)
+            pumpMessages (10);
+
+        expect (connected, "the old link did not join: " + error);
+        guest.disconnect();
+
+        // A corrupt session.txt is replaced by a new valid id.
+        host.stop();
+        dir.getChildFile ("session.txt").replaceWithText ("??");
+        ProjectHost third ({ 22259, 8 });
+        expect (third.start (dir, hostUser, "Lucas", "ignored").wasOk());
+        expect (isValidSessionId (third.getSessionId()));
+        expectEquals (dir.getChildFile ("session.txt").loadFileAsString().trim(), third.getSessionId());
+        third.stop();
     }
 
     void testHelloErrors()

@@ -40,7 +40,7 @@ void printUsage()
               << "                  Un cliente con ese id solo puede conectarse desde 127.0.0.1.\n"
               << "  --user-name N   nombre del anfitrion (por defecto el guardado en el proyecto, o \"Anfitrion\")\n"
               << "  --log           imprime eventos del servidor\n"
-              << "Imprime \"listening port=N session=ID\" y termina al cerrarse la entrada estandar (o con Ctrl+C).\n";
+              << "Imprime \"host_user ID\" y \"listening port=N session=ID\"; termina al cerrarse la entrada estandar (o con Ctrl+C).\n";
 }
 
 juce::String fromArg (const char* text)   { return juce::String (juce::CharPointer_UTF8 (text)); }
@@ -157,6 +157,8 @@ int main (int argc, char* argv[])
         return 1;
     }
 
+    // The host user's id comes first so a script can connect as host (from 127.0.0.1) even when it was generated here.
+    std::cout << "host_user " << user.toStdString() << std::endl;
     std::cout << "listening port=" << host.getPort() << " session=" << host.getSessionId().toStdString() << std::endl;
     std::cout.flush();
 

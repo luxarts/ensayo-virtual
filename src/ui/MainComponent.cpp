@@ -169,7 +169,8 @@ MainComponent::MainComponent()
 
     settingsFile = testMode ? juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("EnsayoVirtual-test-settings.json")
                             : defaultSettingsFile();
-    settings = loadSettings (settingsFile);
+    juce::String settingsWarning;
+    settings = loadSettings (settingsFile, &settingsWarning);
 
     addAndMakeVisible (lobby);
     addChildComponent (daw);
@@ -201,6 +202,9 @@ MainComponent::MainComponent()
         applyCalibrationFromSettings();
         setStatus ("Modo de prueba: sin dispositivo de audio");
     }
+
+    if (settingsWarning.isNotEmpty())
+        setStatus (settingsWarning, true, false);
 
     showLobby();
     startTimer (50);
@@ -1024,7 +1028,8 @@ void MainComponent::stopTake()
     if (result)
         setStatus ("Toma terminada: " + formatTime (result->region.length) + ES (" (se sube en segundo plano)"));
     else
-        setStatus ("La toma fue demasiado corta: no se guarda nada", true, false);
+        setStatus (session.getTakeError().isNotEmpty() ? session.getTakeError() : juce::String ("La toma fue demasiado corta: no se guarda nada"),
+                   true, false);
 
     refreshSessionView();
 }

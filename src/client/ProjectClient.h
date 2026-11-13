@@ -34,7 +34,8 @@ public:
     // add_take op + rec_start. takeOffset (persisted, not sent) = take samples before the record point (count-in and
     // latency); used only to finish the take if the app stops before finishTake (see unfinishedTakes).
     void beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset = 0);
-    void sendPeaks (const Id& take, int64_t fromPeak, const std::vector<Peak>&);           // any thread
+    // Any thread. Peaks of the take begun here are also kept: a reconnect during the take re-sends rec_start and them.
+    void sendPeaks (const Id& take, int64_t fromPeak, const std::vector<Peak>&);
     // Any thread: appends to the local cache right away, persists to <cacheRoot>/pending/<take>/<index>.flac,
     // uploads in order; survives disconnects (resent on the next connect, starting at the host's take.segments).
     void queueSegment (const Id& take, int index, const juce::MemoryBlock& flac);
@@ -42,7 +43,8 @@ public:
     void finishTake (const Id& take, const Id& track, const Region& region);
     // Message thread, after onConnected: pending takes without a finish intent. samples = what the local cache holds.
     std::vector<UnfinishedTake> unfinishedTakes() const;
-    void discardTake (const Id& take);                         // message thread: forgets a pending take and its files
+    // Message thread: forgets a pending take and its files and sends rec_stop, so no one keeps showing it as recording.
+    void discardTake (const Id& take);
     void setListening (bool);
     void sendPreview (const uint8_t* packet, size_t len) noexcept;   // any thread (UDP)
     JitterBuffer* previewBuffer() noexcept;                           // mix-free: datagrams from whoever records

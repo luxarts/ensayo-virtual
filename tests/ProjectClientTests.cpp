@@ -118,6 +118,8 @@ public:
         testConnectAndOps();
         testRecording();
         testLive();
+        testDiscardEndsLive();
+        testReconnectMidTake();
         testResumeAfterDisconnect();
         testQueueWhileReconnecting();
         testDestroyWhileBusy();
@@ -298,6 +300,93 @@ public:
 
         expect (waitUntil ([&] { return a->liveRecordings().empty() && hasRegion (*a->project(), track, region.id); }, 8000),
                 "the live recording ends after rec_stop");
+
+        a->disconnect();
+        b->disconnect();
+        host.stop();
+    }
+
+    //==========================================================================
+    void testDiscardEndsLive()
+    {
+        beginTest ("a discarded take stops showing as recording: rec_stop reaches the others and the host's presence");
+
+        const auto root = testDir ("discard");
+        const auto hostUser = newId(), userB = newId(), userC = newId();
+        ProjectHost host ({ 22257, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+
+        Peer a (root.getChildFile ("cacheA"), hostUser, "Lucas");
+        Peer b (root.getChildFile ("cacheB"), userB, "Ana");
+        expect (a.connectTo (22257, host.getSessionId()));
+        expect (b.connectTo (22257, host.getSessionId()));
+
+        const auto track = newId(), take = newId();
+        expect (addOwnTrack (a, track, "Voz"));
+        a->beginTake (take, 1, track, 0, 96000);
+        expect (waitUntil ([&] { return b->liveRecordings().size() == 1; }, 5000), "B sees A recording");
+        expectEquals (a->transfers().pendingTakes, 1);
+
+        a->discardTake (take);   // stopped during the count-in: nothing to keep
+        expectEquals (a->transfers().pendingTakes, 0);
+        expect (waitUntil ([&] { return b->liveRecordings().empty(); }, 5000), "B still shows A recording");
+
+        // A client joining now learns recordings only from the host's presence.
+        Peer c (root.getChildFile ("cacheC"), userC, "Caro");
+        expect (c.connectTo (22257, host.getSessionId()));
+        pumpMessages (300);
+        expect (c->liveRecordings().empty(), "the host's presence still says A is recording");
+        expect (b->liveRecordings().empty());
+
+        const auto* t = host.snapshot()->findTake (take);
+        expect (t == nullptr || (! t->complete && t->segments == 0), "the discarded take is at most an empty incomplete take");
+        expect (a.errors.isEmpty() && b.errors.isEmpty(), a.errors.joinIntoString ("; ") + b.errors.joinIntoString ("; "));
+
+        a->disconnect();
+        b->disconnect();
+        c->disconnect();
+        host.stop();
+    }
+
+    void testReconnectMidTake()
+    {
+        beginTest ("a reconnect in the middle of a take announces it again with the peaks so far");
+
+        const auto root = testDir ("reconnect-live");
+        const auto hostUser = newId(), userB = newId();
+        ProjectHost host ({ 22258, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+
+        Peer a (root.getChildFile ("cacheA"), hostUser, "Lucas");
+        Peer b (root.getChildFile ("cacheB"), userB, "Ana");
+        expect (a.connectTo (22258, host.getSessionId()));
+        expect (b.connectTo (22258, host.getSessionId()));
+
+        const auto track = newId(), take = newId();
+        expect (addOwnTrack (b, track, "Voz"));
+        b->beginTake (take, 1, track, 48000);
+        b->sendPeaks (take, 0, std::vector<Peak> (10, Peak { -0.2f, 0.3f }));
+        expect (waitUntil ([&] { return a->liveRecordings().size() == 1 && a->liveRecordings()[0].peaks.size() == 10; }, 5000));
+
+        b->dropConnectionForTest();
+        expect (waitUntil ([&] { return ! b.disconnected.isEmpty(); }, 8000), "B never noticed the drop");
+        expect (waitUntil ([&] { return a->liveRecordings().empty(); }, 8000), "the host keeps B recording after the drop");
+
+        b->sendPeaks (take, 10, std::vector<Peak> (5, Peak { -0.4f, 0.5f }));   // while offline
+        b->disconnect();
+        expect (b.connectTo (22258, host.getSessionId()));
+
+        expect (waitUntil ([&]
+        {
+            const auto live = a->liveRecordings();
+            return live.size() == 1 && live[0].take == take && live[0].start == 48000 && live[0].peaks.size() == 15;
+        }, 5000), "A sees B's take again with every peak");
+
+        if (a->liveRecordings().size() == 1)
+            expectWithinAbsoluteError (a->liveRecordings()[0].peaks[12].max, 0.5f, 0.001f);
+
+        b->discardTake (take);
+        expect (waitUntil ([&] { return a->liveRecordings().empty(); }, 5000));
 
         a->disconnect();
         b->disconnect();

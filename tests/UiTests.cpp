@@ -297,7 +297,8 @@ public:
             main.setVisible (true);
             main.setSize (1100, 760);
             main.joinFromLink ({ "127.0.0.1", 22251, "ABCDEF" });
-            expect (waitFor ([&] { return ! main.getLobby().joinButton.isEnabled() == false && statusText (main).isNotEmpty()
+            // Connecting disables Unirse; the failure re-enables it and replaces the "Conectando" message.
+            expect (waitFor ([&] { return main.getLobby().joinButton.isEnabled() && statusText (main).isNotEmpty()
                                           && ! statusText (main).startsWith ("Conectando"); }, 15000),
                     "still connecting: " + statusText (main));
             expect (! main.isInSession());

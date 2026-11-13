@@ -59,7 +59,7 @@ private:
     LockedCallback& operator= (const LockedCallback&) = delete;
 };
 
-// Two inputs, two outputs, thread-driven at exact block cadence (HighResClock-style waitable timer).
+// Two inputs, two outputs, thread-driven at exact block cadence (waitable-timer driven).
 class FakeAudioDevice : public juce::AudioIODevice
 {
 public:

@@ -65,6 +65,10 @@ public:
     // Stops the take and playback; the result's region is aligned with recordingOffset and starts at the record point.
     std::optional<RecordingResult> stopRecording();
     bool isRecording() const noexcept;
+    // The take's record point (timeline) and recording offset (count-in + latencies + calibration), set by
+    // startRecording before the recorder starts; valid until the next startRecording.
+    int64_t getRecordPoint() const noexcept;
+    int64_t getRecordOffset() const noexcept;
     Recorder& getRecorder() noexcept;
 
     void setPreviewBuffer (JitterBuffer*) noexcept;    // live listening; nullptr = off

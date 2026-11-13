@@ -287,7 +287,9 @@ struct DawView::Impl
         {
             trackId = t.id;
             const bool editable = impl.canEdit (t);              // false while I am recording
-            const bool mine = impl.canEditBase (t);              // arm/lock follow ownership only
+            // Spec 7: only the author records on a track (the host may edit any track but not arm it); read-only
+            // locks everything.
+            const bool mine = ! impl.state.readOnly && t.author == impl.state.me;
             const auto colour = authorColour (p, t.author);
 
             swatch.colour = colour;
@@ -850,7 +852,7 @@ struct DawView::Impl
     //==========================================================================
     const Project* currentProject() const noexcept { return state.project.get(); }
 
-    // Ownership and read-only only (what arm/lock and selection clean-up follow).
+    // Ownership (author or host) and read-only only: what selection clean-up follows.
     bool canEditBase (const Track& t) const
     {
         return ! state.readOnly && currentProject() != nullptr && canEditTrack (*currentProject(), t, state.me);

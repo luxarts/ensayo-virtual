@@ -48,7 +48,10 @@ public:
 
     // Recording. startTake needs a connected session, a running device and a track of mine that is not imported.
     juce::Result startTake (const Id& track);
-    std::optional<RecordingResult> stopTake();                       // stopRecording + finishTake
+    // stopRecording + finishTake. nullopt when nothing was recording or the take was shorter than its offset (then
+    // getTakeError() says why and the take is discarded).
+    std::optional<RecordingResult> stopTake();
+    juce::String getTakeError() const       { return takeError; }
     bool isRecording() const noexcept;
     Id recordingTrack() const               { return takeTrack; }
     std::optional<LiveRecording> ownLiveRecording() const;          // peaks aligned to the record point
@@ -85,7 +88,6 @@ private:
     void post (std::function<void()>);
     void joinImportThread();
     void completeImport();
-    int64_t countInSamples() const;
 
     StudioEngine& engine;
     std::unique_ptr<ProjectHost> projectHost;
@@ -93,20 +95,20 @@ private:
     SessionLink link;
     juce::File cacheRoot;
     const SampleSource* engineSource = nullptr;
-    bool everConnected = false, listening = false, click = true, countIn = true;
-    int calibration = 0;
+    bool everConnected = false, listening = false;
     std::vector<Id> resumedTakes;
 
     // Take being recorded here.
     Id takeId, takeTrack;
-    int64_t takePoint = 0, takeOffset = 0;
+    int64_t takePoint = 0;
+    juce::String takeError;
     std::atomic<bool> stopping { false };
     mutable std::mutex liveLock;
     std::vector<Peak> livePeaks;
 
     // Import / export.
     std::thread importThread, exportThread;
-    std::atomic<bool> importBusy { false }, exportBusy { false }, exportCancel { false };
+    std::atomic<bool> importBusy { false }, importCancel { false }, exportBusy { false }, exportCancel { false };
     std::optional<ImportFinish> importFinish;   // message thread: set before the queueing thread starts
     std::atomic<bool> importQueued { false };   // the queueing thread queued every segment
 

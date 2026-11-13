@@ -733,7 +733,24 @@ struct ProjectHost::Impl
         }
 
         project.store (std::make_shared<const Project> (std::move (p)));
-        sessionId = generateSessionId (juce::Random::getSystemRandom());
+        // The session id belongs to the project: kept in session.txt so links (and a guest's Reintentar) survive a
+        // host restart.
+        {
+            const auto sessionFile = dir.getChildFile ("session.txt");
+            const auto stored = sessionFile.existsAsFile() ? sessionFile.loadFileAsString().trim() : juce::String();
+
+            if (isValidSessionId (stored))
+            {
+                sessionId = stored;
+            }
+            else
+            {
+                sessionId = generateSessionId (juce::Random::getSystemRandom());
+
+                if (! sessionFile.replaceWithText (sessionId))
+                    log ("no se pudo guardar session.txt: el link cambiara al reabrir el proyecto");
+            }
+        }
 
         WSADATA wsaData;
 

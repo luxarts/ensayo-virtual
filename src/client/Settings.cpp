@@ -120,8 +120,32 @@ juce::File defaultSettingsFile()
                .getChildFile ("settings.json");
 }
 
-AppSettings loadSettings (const juce::File& file)
+AppSettings loadSettings (const juce::File& file, juce::String* warning)
 {
+    if (warning != nullptr)
+        warning->clear();
+
+    if (file.existsAsFile())
+    {
+        juce::var parsed;
+
+        // A file that does not parse is kept as <name>.bad before any defaults are written over it.
+        if (juce::JSON::parse (file.loadFileAsString(), parsed).failed() || ! parsed.isObject())
+        {
+            const auto bad = file.getSiblingFile (file.getFileName() + ".bad");
+            bad.deleteFile();
+            const bool kept = file.moveFileTo (bad);
+            const auto message = "Settings file " + file.getFullPathName() + " is not valid JSON"
+                                 + (kept ? "; kept as " + bad.getFullPathName() : juce::String ("; it could not be renamed"))
+                                 + " and replaced with defaults";
+            juce::Logger::writeToLog (message);
+
+            if (warning != nullptr)
+                *warning = juce::String (juce::CharPointer_UTF8 ("La configuraci\xc3\xb3n estaba da\xc3\xb1" "ada: se guard\xc3\xb3 como "))
+                           + bad.getFileName() + " y se usan valores por defecto";
+        }
+    }
+
     auto s = file.existsAsFile() ? fromJson (file.loadFileAsString()) : AppSettings();
 
     if (s.userId.isEmpty())

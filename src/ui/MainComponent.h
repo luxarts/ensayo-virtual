@@ -125,7 +125,8 @@ private:
 
     AppSettings settings;
     juce::File settingsFile;
-    // Declaration order matters: the session (client, host, recorder callbacks) must go before the engine.
+    // Declaration order matters: the engine is declared first so it is destroyed last, after the session (client,
+    // host, recorder callbacks) that uses it.
     StudioEngine engine;
     SessionController session { engine };
     YouTubeImporter importer;

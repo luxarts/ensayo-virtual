@@ -76,16 +76,19 @@ function Start-Proc
 
 # EnsayoServer.exe stops on stdin EOF, so it gets a stdin pipe that stays open until Stop-Procs kills it
 # (Start-Process would hand it the parent's stdin, which is already at EOF when the script runs unattended).
-# Blocks until the server prints its "listening ..." line, which is returned in .ListenLine.
+# Hosts -Project (a project directory) and blocks until the server prints "listening port=N session=ID".
+# Returns .ListenLine, .Session and .HostUser (from the "host_user <id>" line printed before it).
 function Start-ServerProc
 {
-    param ([string] $FilePath, [int] $Port, [string] $RunDir, [double] $TimeoutSec = 10)
+    param ([string] $FilePath, [int] $Port, [string] $RunDir, [string] $Project, [string[]] $ExtraArgs = @(), [double] $TimeoutSec = 10)
 
-    Write-Host ("  [server] {0} --port {1}" -f [System.IO.Path]::GetFileName($FilePath), $Port)
+    if ([string]::IsNullOrEmpty($Project)) { $Project = Join-Path $RunDir 'server-project' }
+    $arguments = @('--project', ('"{0}"' -f $Project), '--port', $Port) + $ExtraArgs
+    Write-Host ("  [server] {0} {1}" -f [System.IO.Path]::GetFileName($FilePath), ($arguments -join ' '))
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
-    $psi.Arguments = "--port $Port"
+    $psi.Arguments = $arguments -join ' '
     $psi.WorkingDirectory = $RunDir
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
@@ -94,15 +97,26 @@ function Start-ServerProc
     $psi.RedirectStandardError = $true
 
     $p = [System.Diagnostics.Process]::Start($psi)
-    $read = $p.StandardOutput.ReadLineAsync()
-    if (-not $read.Wait([int]($TimeoutSec * 1000)))
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $hostUser = $null
+    $line = $null
+
+    while ($true)
     {
-        try { $p.Kill() } catch {}
-        throw "server did not print its listening line within $TimeoutSec s"
+        $remaining = [int][math]::Max(1, ($deadline - (Get-Date)).TotalMilliseconds)
+        $read = $p.StandardOutput.ReadLineAsync()
+        if (-not $read.Wait($remaining))
+        {
+            try { $p.Kill() } catch {}
+            throw "server did not print its listening line within $TimeoutSec s"
+        }
+
+        $line = $read.Result
+        if ($null -ne $line -and $line -match '^host_user (\S+)') { $hostUser = $Matches[1]; continue }
+        break
     }
 
-    $line = $read.Result
-    if ($null -eq $line -or $line -notmatch '^listening ')
+    if ($null -eq $line -or $line -notmatch '^listening port=\d+ session=(\S+)')
     {
         $err = ''
         try { $err = $p.StandardError.ReadToEnd().Trim() } catch {}
@@ -110,8 +124,9 @@ function Start-ServerProc
         throw "server failed to start on port ${Port}: '$line' $err"
     }
 
-    Write-Host "  [server] $line"
-    return [PSCustomObject] @{ Name = 'server'; Process = $p; StdOut = $null; StdErr = $null; ListenLine = $line }
+    $session = $Matches[1]
+    Write-Host "  [server] host_user $hostUser; $line"
+    return [PSCustomObject] @{ Name = 'server'; Process = $p; StdOut = $null; StdErr = $null; ListenLine = $line; Session = $session; HostUser = $hostUser }
 }
 
 # Reads a file that another process is still writing to.
@@ -211,28 +226,6 @@ function Assert
 function Write-Pass { param ([string] $Name) Write-Host ("PASS {0}" -f $Name) -ForegroundColor Green }
 function Write-Fail { param ([string] $Name, [string] $Reason) Write-Host ("FAIL {0}: {1}" -f $Name, $Reason) -ForegroundColor Red }
 function Write-Skip { param ([string] $Name, [string] $Reason) Write-Host ("SKIP {0}: {1}" -f $Name, $Reason) -ForegroundColor Yellow }
-
-# Parses "latency median <ms> p95 <ms> n <count>" or "latency n 0".
-function ConvertFrom-LatencyLine
-{
-    param ([string] $Line)
-
-    if ($Line -match '^latency median ([0-9.]+) p95 ([0-9.]+) n (\d+)')
-    {
-        return @{ Median = [double] $Matches[1]; P95 = [double] $Matches[2]; N = [int] $Matches[3] }
-    }
-    if ($Line -match '^latency n (\d+)') { return @{ Median = [double]::NaN; P95 = [double]::NaN; N = [int] $Matches[1] } }
-    throw "cannot parse latency line: '$Line'"
-}
-
-# Counts the "qpcMs,sampleIndex" lines in a click CSV.
-function Get-ClickCount
-{
-    param ([string] $Path)
-
-    if (-not (Test-Path $Path)) { return 0 }
-    return @((Read-SharedFile $Path) -split "`r?`n" | Where-Object { $_ -match '^\s*[0-9.]+\s*,\s*\d+' }).Count
-}
 
 # ---------------------------------------------------------------- fixtures
 

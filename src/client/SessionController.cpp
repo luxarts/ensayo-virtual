@@ -91,14 +91,11 @@ SessionLink SessionController::getShareLink() const
 
 void SessionController::setCalibration (int samples)
 {
-    calibration = samples;
     engine.setCalibration (samples);
 }
 
 void SessionController::setMetronome (bool clickOn, bool countInOn)
 {
-    click = clickOn;
-    countIn = countInOn;
     engine.setMetronome (clickOn, countInOn);
 }
 
@@ -191,13 +188,27 @@ void SessionController::leave()
     if (isRecording())
         stopTake();
 
+    // An import stops at its next checkpoint (after decoding, after cutting, between segments). One whose segments
+    // were all queued is finished (the intent persists); a partial one is discarded with its track.
+    importCancel = true;
     joinImportThread();
 
     if (importFinish && importQueued)
-        completeImport();   // every segment is queued: the finish intent is persisted even if we disconnect now
+    {
+        completeImport();
+    }
+    else if (importFinish && client != nullptr)
+    {
+        client->discardTake (importFinish->take);
+
+        if (client->isConnected())
+            client->sendOp (Ops::deleteTrack (importFinish->track));
+    }
 
     importFinish.reset();
     importBusy = false;
+    importQueued = false;
+    importCancel = false;
 
     exportCancel = true;
 
@@ -255,17 +266,6 @@ void SessionController::leave()
 }
 
 //==============================================================================
-int64_t SessionController::countInSamples() const
-{
-    const auto p = project();
-
-    if (! countIn || p == nullptr || p->bpm <= 0.0)
-        return 0;
-
-    // Same formula as StudioEngine::startRecording: one bar of beatsPerBar beats.
-    return (int64_t) std::llround (p->beatsPerBar * 60.0 * sampleRate / p->bpm);
-}
-
 juce::Result SessionController::startTake (const Id& trackId)
 {
     if (client == nullptr || ! client->isConnected())
@@ -293,10 +293,6 @@ juce::Result SessionController::startTake (const Id& trackId)
 
     const Id take = newId();
     const int channels = track->kind == TrackKind::voice ? 1 : 2;
-    const int64_t point = engine.getPosition();
-    const int64_t offset = recordingOffset (countInSamples(), device->getInputLatencyInSamples(),
-                                            device->getOutputLatencyInSamples(), calibration);
-    const int64_t skipPeaks = offset / peakBlock;
 
     const auto wav = cacheRoot.getChildFile (p->id).getChildFile ("recordings").getChildFile (take + ".wav");
     wav.getParentDirectory().createDirectory();
@@ -308,8 +304,8 @@ juce::Result SessionController::startTake (const Id& trackId)
 
     takeId = take;
     takeTrack = trackId;
-    takePoint = point;
-    takeOffset = offset;
+    takePoint = engine.getPosition();   // replaced by the engine's own record point once the take starts
+    takeError.clear();
     stopping = false;
 
     auto* c = client.get();
@@ -318,8 +314,10 @@ juce::Result SessionController::startTake (const Id& trackId)
 
     // Peaks are re-based on the record point (the first `offset` samples are count-in and latency), so the growing
     // region lines up with the timeline here and on the other machines.
-    recorder.onPeaks = [this, c, take, skipPeaks] (int64_t fromPeak, const std::vector<Peak>& peaks)
+    recorder.onPeaks = [this, c, take] (int64_t fromPeak, const std::vector<Peak>& peaks)
     {
+        // Set by startRecording before the writer starts.
+        const int64_t skipPeaks = engine.getRecordOffset() / peakBlock;
         const int64_t skip = std::max<int64_t> (0, skipPeaks - fromPeak);
 
         if (skip >= (int64_t) peaks.size())
@@ -338,9 +336,14 @@ juce::Result SessionController::startTake (const Id& trackId)
     };
 
     recorder.onLiveAudio = nullptr;
+    // On the message thread (a take too short, inside stopRecording) the message is kept for stopTake's caller, so
+    // only one message is shown; writer-thread failures are posted.
     recorder.onError = [this] (const juce::String& message)
     {
-        post ([this, message] { if (onError) onError ("Error grabando: " + message); });
+        if (juce::MessageManager::existsAndIsCurrentThread())
+            takeError = message;
+        else
+            post ([this, message] { if (onError) onError ("Error grabando: " + message); });
     };
 
     // Fires on the writer thread when the take ends, normally inside stopRecording; by itself only when a segment
@@ -371,7 +374,8 @@ juce::Result SessionController::startTake (const Id& trackId)
     }
 
     // Right after the start: the first segment comes a second later, and one queued earlier would be kept anyway.
-    client->beginTake (take, channels, trackId, point, offset);
+    takePoint = engine.getRecordPoint();
+    client->beginTake (take, channels, trackId, takePoint, engine.getRecordOffset());
     return juce::Result::ok();
 }
 
@@ -502,8 +506,14 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
         const auto loaded = loadAndResample (file, *audio);
         auto segments = std::make_shared<std::vector<juce::MemoryBlock>>();
 
+        if (importCancel)
+            return;
+
         if (loaded.wasOk())
             *segments = makeSegments (*audio);
+
+        if (importCancel)
+            return;
 
         const int channels = audio->getNumChannels();
         const int64_t samples = audio->getNumSamples();
@@ -512,6 +522,9 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
         post ([this, loaded, segments, channels, samples, name]
         {
             joinImportThread();
+
+            if (importCancel)
+                return;
 
             if (loaded.failed() || segments->empty() || samples < 1 || client == nullptr)
             {
@@ -535,6 +548,9 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
 
                 for (int i = 0; i < total; ++i)
                 {
+                    if (importCancel)
+                        return;   // leave() discards the partial take and its track
+
                     c->queueSegment (take, i, (*segments)[(size_t) i]);
                     const float fraction = (float) (i + 1) / (float) total;
                     post ([this, name, fraction] { if (onImportProgress) onImportProgress (name, fraction); });
