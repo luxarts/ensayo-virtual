@@ -1,5 +1,6 @@
 #include "server/ProjectHost.h"
 #include "core/Segments.h"
+#include "server/ProjectHostDetail.h"
 #include "core/Sha1.h"
 
 #include <cmath>
@@ -18,9 +19,9 @@ public:
     // are attached to the message as "payload" (a MemoryBlock). Unmatched messages stay queued.
     struct Client
     {
-        explicit Client (int p) : port (p) {}
+        explicit Client (int p, juce::String a = "127.0.0.1") : port (p), address (std::move (a)) {}
 
-        bool connect()   { return socket.connect ("127.0.0.1", port, 3000); }
+        bool connect()   { return socket.connect (address, port, 3000); }
 
         void send (const juce::var& message)
         {
@@ -161,6 +162,7 @@ public:
         }
 
         int port;
+        juce::String address;
         juce::StreamingSocket socket;
         std::string pending;
         juce::var payloadOwner;
@@ -222,6 +224,9 @@ public:
         testCrashSafety();
         testUdpRelay();
         testPresence();
+        testDetail();
+        testSilentSockets();
+        testHostUserFromRemote();
     }
 
     //==========================================================================
@@ -620,6 +625,179 @@ public:
         });
         expect (after.isObject());
         expect ((bool) (*findUser (after, hostUser))["online"]);
+    }
+
+    //==========================================================================
+    void testDetail()
+    {
+        beginTest ("only a loopback peer may claim the host user");
+
+        const auto hostUser = newId(), other = newId();
+        expect (hostdetail::mayClaimUser (hostUser, hostUser, true));
+        expect (! hostdetail::mayClaimUser (hostUser, hostUser, false));
+        expect (hostdetail::mayClaimUser (other, hostUser, false));
+        expect (hostdetail::mayClaimUser (other, hostUser, true));
+
+        beginTest ("readInteger accepts integral values in range only");
+
+        expect (hostdetail::readInteger (juce::var (5), 0, 10) == std::optional<int64_t> (5));
+        expect (hostdetail::readInteger (juce::var ((juce::int64) 1 << 40), 0, (int64_t) 1 << 41) == std::optional<int64_t> ((int64_t) 1 << 40));
+        expect (hostdetail::readInteger (juce::var (7.0), 0, 10) == std::optional<int64_t> (7));
+        expect (! hostdetail::readInteger (juce::var (7.5), 0, 10));
+        expect (! hostdetail::readInteger (juce::var (1.0e300), 0, INT_MAX));
+        expect (! hostdetail::readInteger (juce::var (4294967296.0), 0, INT_MAX));
+        expect (! hostdetail::readInteger (juce::var (-1), 0, 10));
+        expect (! hostdetail::readInteger (juce::var (11), 0, 10));
+        expect (! hostdetail::readInteger (juce::var ("5"), 0, 10));
+        expect (! hostdetail::readInteger (juce::var(), 0, 10));
+
+        beginTest ("the write stall timeout restarts on progress; a real stall still fails");
+
+        // A slow but steady peer: 64 KB every 50 ms, 2 MB in total (~1.6 s), with a 200 ms stall timeout.
+        juce::MemoryBlock source (2 * 1024 * 1024);
+
+        for (size_t i = 0; i < source.getSize(); ++i)
+            source[i] = (char) (i * 31 + 7);
+
+        juce::MemoryOutputStream received;
+        auto lastAccept = juce::Time::getMillisecondCounterHiRes();
+
+        auto slowPeer = [&] (const char* data, size_t len) -> int
+        {
+            const auto now = juce::Time::getMillisecondCounterHiRes();
+
+            if (now - lastAccept < 50.0)
+                return 0;
+
+            lastAccept = now;
+            const auto n = std::min<size_t> (len, 64 * 1024);
+            received.write (data, n);
+            return (int) n;
+        };
+
+        const auto start = juce::Time::getMillisecondCounterHiRes();
+        expect (hostdetail::writeWithStallTimeout (slowPeer, static_cast<const char*> (source.getData()), source.getSize(), 200));
+        expect (juce::Time::getMillisecondCounterHiRes() - start > 1000.0);   // far longer than the stall timeout
+        expect (received.getMemoryBlock() == source);
+
+        int accepted = 0;
+        auto stalledPeer = [&] (const char*, size_t len) -> int
+        {
+            if (accepted > 0)
+                return 0;
+
+            accepted = (int) std::min<size_t> (len, 1000);
+            return accepted;
+        };
+
+        const auto stallStart = juce::Time::getMillisecondCounterHiRes();
+        expect (! hostdetail::writeWithStallTimeout (stalledPeer, static_cast<const char*> (source.getData()), 5000, 200));
+        const auto stalledFor = juce::Time::getMillisecondCounterHiRes() - stallStart;
+        expect (stalledFor >= 190.0 && stalledFor < 1500.0, juce::String (stalledFor));
+
+        auto failingPeer = [] (const char*, size_t) -> int { return -1; };
+        expect (! hostdetail::writeWithStallTimeout (failingPeer, static_cast<const char*> (source.getData()), 10, 200));
+    }
+
+    static bool closedWithin (juce::StreamingSocket& s, int timeoutMs)
+    {
+        const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+
+        while (juce::Time::getMillisecondCounter() < deadline)
+        {
+            const auto ready = s.waitUntilReady (true, 100);
+
+            if (ready < 0)
+                return true;
+
+            if (ready == 1)
+            {
+                char byte;
+
+                if (s.read (&byte, 1, false) <= 0)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    void testSilentSockets()
+    {
+        beginTest ("silent sockets cannot lock real joiners out and are closed after the first-line deadline");
+
+        const auto hostUser = newId();
+        ProjectHost host ({ 22214, 8 });
+        expect (host.start (testDir ("silent"), hostUser, "Lucas", "P").wasOk());
+
+        std::vector<std::unique_ptr<juce::StreamingSocket>> silent;
+
+        for (int i = 0; i < 20; ++i)
+        {
+            silent.push_back (std::make_unique<juce::StreamingSocket>());
+            expect (silent.back()->connect ("127.0.0.1", 22214, 3000));
+        }
+
+        const auto lastConnected = juce::Time::getMillisecondCounterHiRes();
+        juce::Thread::sleep (300);
+
+        Client a (22214);
+        const auto welcome = a.join (host.getSessionId(), hostUser, "Lucas");
+        expect (welcome.isObject());
+        expect (closedWithin (*silent.front(), 1000));   // the oldest silent sockets made room
+
+        expect (closedWithin (*silent.back(), 8000));
+        const auto lifetime = juce::Time::getMillisecondCounterHiRes() - lastConnected;
+        expect (lifetime > 4000.0 && lifetime < 7500.0, juce::String (lifetime));
+
+        // The identified client is not subject to the deadline.
+        a.send (object ({ { "t", "ping" }, { "ms", 99 } }));
+        expectEquals ((int) a.waitFor ("pong")["ms"], 99);
+    }
+
+    void testHostUserFromRemote()
+    {
+        beginTest ("the host user id is refused from a non-loopback address");
+
+        juce::String remote;
+
+        for (const auto& ip : juce::IPAddress::getAllAddresses (false))
+        {
+            const auto text = ip.toString();
+
+            if (! ip.isNull() && ! text.startsWith ("127.") && ! text.startsWith ("169.254.") && text != "0.0.0.0")
+            {
+                remote = text;
+                break;
+            }
+        }
+
+        const auto hostUser = newId();
+        ProjectHost host ({ 22216, 8 });
+        expect (host.start (testDir ("remotehost"), hostUser, "Lucas", "P").wasOk());
+
+        Client local (22216);
+        expect ((bool) local.join (host.getSessionId(), hostUser, "Lucas")["isHost"]);   // loopback host path
+
+        Client claim (22216, remote);
+
+        if (remote.isEmpty() || ! claim.connect())
+        {
+            logMessage ("no non-loopback IPv4 address reachable here: only mayClaimUser covers the remote case");
+            return;
+        }
+
+        claim.send (object ({ { "t", "hello" }, { "protocol", 2 }, { "session", host.getSessionId() },
+                              { "user", hostUser }, { "name", "Impostor" } }));
+        expectEquals (claim.waitFor ("error")["message"].toString(), juce::String ("usuario reservado"));
+        expect (claim.waitForClose (3000));
+
+        // The real host was not kicked, and an ordinary user may join from that address.
+        local.send (object ({ { "t", "ping" }, { "ms", 5 } }));
+        expectEquals ((int) local.waitFor ("pong")["ms"], 5);
+
+        Client guest (22216, remote);
+        expect (guest.join (host.getSessionId(), newId(), "Ana").isObject());
     }
 };
 

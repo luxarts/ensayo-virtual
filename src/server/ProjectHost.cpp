@@ -8,13 +8,17 @@
 #include <ws2tcpip.h>
 #include <mswsock.h>
 #include <avrt.h>
+#include <bcrypt.h>
 
 #include "ProjectHost.h"
+#include "ProjectHostDetail.h"
 #include "core/Segments.h"
 #include "core/Sha1.h"
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -34,7 +38,9 @@ namespace
     constexpr size_t maxQueuedBytes = 64 * 1024 * 1024;      // a peer that falls this far behind is dropped
     constexpr int64_t maxWriteStallMs = 2000;                // a peer that does not drain its socket for this long is dropped
     constexpr int maxNestingDepth = 32;                      // juce::JSON::parse recurses per level
-    constexpr size_t maxConnections = 64;                    // live TCP connections (control + data + not yet identified)
+    constexpr size_t maxConnections = 64;                    // live identified TCP connections (control + data)
+    constexpr size_t maxUnidentified = 16;                   // connections still waiting for hello / data_hello
+    constexpr int64_t firstLineDeadlineMs = 5000;            // no complete hello / data_hello by then: closed
     constexpr int64_t endpointSilenceMs = 2000;
     constexpr uint8_t keepaliveByte = 0x00;
     constexpr int keepaliveBytes = 5;                        // 0x00 + clientId u32 little-endian
@@ -103,20 +109,51 @@ namespace
         return (int64_t) juce::Time::getMillisecondCounterHiRes();
     }
 
-    bool isNumber (const juce::var& v) noexcept
+    // Cryptographically secure bytes (tokens and clientIds identify a peer on the data connection and over UDP).
+    void secureRandom (void* data, size_t size)
     {
-        return v.isInt() || v.isInt64() || v.isDouble();
+        if (! BCRYPT_SUCCESS (BCryptGenRandom (nullptr, static_cast<PUCHAR> (data), (ULONG) size, BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+            juce::Random::getSystemRandom().fillBitsRandomly (data, size);   // never expected; better than zeros
     }
 
     juce::String randomToken()
     {
-        auto& random = juce::Random::getSystemRandom();
-        juce::String token;
+        uint8_t bytes[8];
+        secureRandom (bytes, sizeof (bytes));
+        return juce::String::toHexString (bytes, (int) sizeof (bytes), 0).toLowerCase();   // 16 hex chars
+    }
 
-        for (int i = 0; i < 16; ++i)
-            token << juce::String::charToString ("0123456789abcdef"[random.nextInt (16)]);
+    uint32_t randomClientId()
+    {
+        uint32_t id = 0;
 
-        return token;
+        while (id == 0)
+        {
+            secureRandom (&id, sizeof (id));
+            id &= 0x7fffffffu;
+        }
+
+        return id;
+    }
+
+    bool peerIsLoopback (SOCKET handle) noexcept
+    {
+        sockaddr_storage address {};
+        int len = sizeof (address);
+
+        if (getpeername (handle, (sockaddr*) &address, &len) != 0)
+            return false;
+
+        if (address.ss_family == AF_INET)
+            return (ntohl (((const sockaddr_in*) &address)->sin_addr.s_addr) >> 24) == 127;
+
+        if (address.ss_family == AF_INET6)
+        {
+            const auto& in6 = ((const sockaddr_in6*) &address)->sin6_addr;
+            return IN6_IS_ADDR_LOOPBACK (&in6) || (IN6_IS_ADDR_V4MAPPED (&in6) && in6.s6_addr[12] == 127);
+        }
+
+        return false;
     }
 
     juce::Result writeFileAtomically (const juce::File& target, const void* data, size_t size)
@@ -146,6 +183,72 @@ namespace
 
         return juce::Result::ok();
     }
+}
+
+//==============================================================================
+namespace hostdetail
+{
+bool mayClaimUser (const Id& user, const Id& hostUser, bool fromLoopback) noexcept
+{
+    return user != hostUser || fromLoopback;
+}
+
+bool writeWithStallTimeout (const std::function<int (const char*, size_t)>& sendSome, const char* data, size_t len,
+                            int64_t stallMs, const std::function<bool()>& shouldAbort)
+{
+    auto deadline = nowMs() + stallMs;
+
+    while (len > 0)
+    {
+        const int n = sendSome (data, std::min<size_t> (len, 1u << 20));
+
+        if (n > 0)
+        {
+            data += n;
+            len -= (size_t) n;
+            deadline = nowMs() + stallMs;   // progress: the stall timer starts over
+            continue;
+        }
+
+        if (n == 0 && nowMs() < deadline && ! (shouldAbort && shouldAbort()))
+        {
+            std::this_thread::sleep_for (std::chrono::milliseconds (2));
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+std::optional<int64_t> readInteger (const juce::var& v, int64_t min, int64_t max)
+{
+    int64_t value = 0;
+
+    if (v.isInt() || v.isInt64())
+    {
+        value = (juce::int64) v;
+    }
+    else if (v.isDouble())
+    {
+        const double d = v;
+
+        if (! std::isfinite (d) || d != std::floor (d) || std::abs (d) > 9007199254740992.0)
+            return std::nullopt;
+
+        value = (int64_t) d;
+    }
+    else
+    {
+        return std::nullopt;
+    }
+
+    if (value < min || value > max)
+        return std::nullopt;
+
+    return value;
+}
 }
 
 //==============================================================================
@@ -204,6 +307,7 @@ struct ProjectHost::Impl
             // Non-blocking from the start so writeAll() never parks inside ::send.
             u_long nonBlocking = 1;
             ioctlsocket ((SOCKET) socket->getRawSocketHandle(), (long) FIONBIO, &nonBlocking);
+            fromLoopback = peerIsLoopback ((SOCKET) socket->getRawSocketHandle());
         }
 
         ~Connection()
@@ -382,39 +486,32 @@ struct ProjectHost::Impl
                 && writeAll (static_cast<const char*> (bytes.getData()), bytes.getSize());
         }
 
-        // Writes the whole buffer, retrying partial writes and WSAEWOULDBLOCK with short sleeps for at most
-        // maxWriteStallMs in total. On failure or timeout the connection is marked dead. Writer thread only.
+        // Writes the whole buffer; a peer that accepts no byte for maxWriteStallMs in a row is marked dead.
+        // Writer thread only.
         bool writeAll (const char* data, size_t len)
         {
             if (dead.load (std::memory_order_acquire))
                 return false;
 
             const auto handle = (SOCKET) socket->getRawSocketHandle();
-            const auto deadline = nowMs() + maxWriteStallMs;
 
-            while (len > 0)
+            auto sendSome = [handle] (const char* bytes, size_t count)
             {
-                const int n = ::send (handle, data, (int) std::min<size_t> (len, 1u << 20), 0);
+                const int n = ::send (handle, bytes, (int) count, 0);
 
                 if (n > 0)
-                {
-                    data += n;
-                    len -= (size_t) n;
-                    continue;
-                }
+                    return n;
 
-                if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK && nowMs() < deadline
-                     && ! exiting.load (std::memory_order_acquire))
-                {
-                    std::this_thread::sleep_for (std::chrono::milliseconds (2));
-                    continue;
-                }
+                return (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) ? 0 : -1;
+            };
 
-                markDead();
-                return false;
-            }
+            auto shouldAbort = [this] { return exiting.load (std::memory_order_acquire); };
 
-            return true;
+            if (hostdetail::writeWithStallTimeout (sendSome, data, len, maxWriteStallMs, shouldAbort))
+                return true;
+
+            markDead();
+            return false;
         }
 
         //======================================================================
@@ -422,6 +519,12 @@ struct ProjectHost::Impl
         {
             while (! exiting.load (std::memory_order_acquire))
             {
+                if (kindForReader == Kind::unidentified && nowMs() - acceptedMs > firstLineDeadlineMs)
+                {
+                    host.log ("conexion cerrada: no envio hello a tiempo");
+                    break;
+                }
+
                 const int ready = socket->waitUntilReady (true, 100);
 
                 if (ready < 0)
@@ -534,6 +637,9 @@ struct ProjectHost::Impl
         bool aborted = false, draining = false;
 
         std::atomic<bool> exiting { false }, dead { false }, readerDone { false }, writerDone { false };
+        std::atomic<bool> identified { false };   // hello / data_hello accepted (counted against maxConnections)
+        const int64_t acceptedMs = nowMs();
+        bool fromLoopback = false;                // peer address is 127.0.0.0/8 or ::1; fixed after construction
         std::vector<char> pending;             // reader thread only
         Kind kindForReader = Kind::unidentified;   // reader thread's own copy of `kind`
 
@@ -777,7 +883,32 @@ struct ProjectHost::Impl
                     }
                 }
 
-                if (connections.size() < maxConnections)
+                size_t identifiedCount = 0, unidentifiedCount = 0;
+                Connection* oldestUnidentified = nullptr;
+
+                for (auto& c : connections)
+                {
+                    if (c->dead.load (std::memory_order_acquire))
+                        continue;
+
+                    if (c->identified.load (std::memory_order_acquire))
+                    {
+                        ++identifiedCount;
+                    }
+                    else
+                    {
+                        ++unidentifiedCount;
+
+                        if (oldestUnidentified == nullptr)
+                            oldestUnidentified = c.get();   // the list is in accept order
+                    }
+                }
+
+                // Silent sockets cannot lock real joiners out: past the cap the oldest silent one makes room.
+                if (unidentifiedCount >= maxUnidentified && oldestUnidentified != nullptr)
+                    oldestUnidentified->markDead();
+
+                if (identifiedCount < maxConnections)
                 {
                     connection = std::make_shared<Connection> (*this, socket);
                     connections.push_back (connection);
@@ -844,9 +975,7 @@ struct ProjectHost::Impl
 
     bool handleHello (Connection& c, const juce::var& message)
     {
-        const auto& protocol = message["protocol"];
-
-        if (! isNumber (protocol) || (double) protocol != (double) protocolVersionV2)
+        if (hostdetail::readInteger (message["protocol"], INT_MIN, INT_MAX) != (int64_t) protocolVersionV2)
             return refuse (c, juce::String (juce::CharPointer_UTF8 ("versi\xc3\xb3n incompatible")));
 
         if (message["session"].toString() != sessionId)
@@ -857,6 +986,12 @@ struct ProjectHost::Impl
 
         if (! isValidId (user) || name.isEmpty())
             return refuse (c, juce::String (juce::CharPointer_UTF8 ("datos de usuario inv\xc3\xa1lidos")));
+
+        if (! hostdetail::mayClaimUser (user, hostUser, c.fromLoopback))
+        {
+            log ("hello rechazado: el usuario anfitrion solo puede conectarse desde esta maquina");
+            return refuse (c, "usuario reservado");
+        }
 
         const std::lock_guard<std::mutex> scoped (stateLock);
 
@@ -869,6 +1004,7 @@ struct ProjectHost::Impl
                 (*it)->markDead();
                 closeDataConnectionsOf ((*it)->clientId);
                 controls.erase (it);
+                publishUdpPeers();   // even if this join fails below, the old endpoint must stop receiving
                 break;
             }
         }
@@ -889,11 +1025,10 @@ struct ProjectHost::Impl
                 return refuse (c, juce::String (juce::CharPointer_UTF8 ("nombre inv\xc3\xa1lido")));
         }
 
-        auto& random = juce::Random::getSystemRandom();
-        uint32_t clientId = 0;
+        uint32_t clientId = randomClientId();
 
-        while (clientId == 0 || std::any_of (controls.begin(), controls.end(), [clientId] (const ConnectionPtr& o) { return o->clientId == clientId; }))
-            clientId = (uint32_t) (random.nextInt() & 0x7fffffff);
+        while (std::any_of (controls.begin(), controls.end(), [clientId] (const ConnectionPtr& o) { return o->clientId == clientId; }))
+            clientId = randomClientId();
 
         c.kind = Connection::Kind::control;
         c.kindForReader = Connection::Kind::control;
@@ -901,6 +1036,7 @@ struct ProjectHost::Impl
         c.name = name;
         c.clientId = clientId;
         c.token = randomToken();
+        c.identified.store (true, std::memory_order_release);
 
         c.send (object ({ { "t", "welcome" }, { "clientId", (int) clientId }, { "token", c.token },
                           { "udpPort", boundPort }, { "isHost", user == hostUser },
@@ -915,7 +1051,8 @@ struct ProjectHost::Impl
 
     bool handleDataHello (Connection& c, const juce::var& message)
     {
-        const auto clientId = (uint32_t) (juce::int64) message["clientId"];
+        const auto clientIdValue = hostdetail::readInteger (message["clientId"], 1, 0x7fffffff);
+        const auto clientId = clientIdValue ? (uint32_t) *clientIdValue : 0u;
         const auto token = message["token"].toString();
         const auto& have = message["have"];
 
@@ -924,7 +1061,7 @@ struct ProjectHost::Impl
         ConnectionPtr control;
 
         for (auto& o : controls)
-            if (o->clientId == clientId && token.isNotEmpty() && o->token == token)
+            if (clientId != 0 && o->clientId == clientId && token.isNotEmpty() && o->token == token)
                 control = o;
 
         if (control == nullptr)
@@ -940,6 +1077,7 @@ struct ProjectHost::Impl
         c.user = control->user;
         c.name = control->name;
         c.clientId = clientId;
+        c.identified.store (true, std::memory_order_release);
 
         // Catch-up of everything stored so far; segments stored later are pushed live after these items (same FIFO).
         const auto p = project.load();
@@ -948,8 +1086,10 @@ struct ProjectHost::Impl
         {
             int from = 0;
 
-            if (auto* o = have.getDynamicObject(); o != nullptr && isNumber (o->getProperty (take.id)))
-                from = (int) juce::jlimit<juce::int64> (0, take.segments, (juce::int64) o->getProperty (take.id));
+            // A missing or out-of-range count is treated as "nothing yet".
+            if (auto* o = have.getDynamicObject(); o != nullptr)
+                if (const auto count = hostdetail::readInteger (o->getProperty (take.id), 0, INT_MAX))
+                    from = (int) std::min<int64_t> (*count, take.segments);
 
             if (from < take.segments)
             {
@@ -1027,7 +1167,7 @@ struct ProjectHost::Impl
     void handleRecStart (Connection& c, const juce::var& message)
     {
         const auto takeId = message["take"].toString(), trackId = message["track"].toString();
-        const auto& start = message["start"];
+        const auto start = hostdetail::readInteger (message["start"], 0, (int64_t) 1 << 50);
 
         const std::lock_guard<std::mutex> scoped (stateLock);
         const auto p = project.load();
@@ -1035,13 +1175,13 @@ struct ProjectHost::Impl
         const auto* track = p->findTrack (trackId);
 
         if (take == nullptr || take->author != c.user || track == nullptr || ! canEditTrack (*p, *track, c.user)
-             || ! isNumber (start))
+             || ! start)
         {
             log ("rec_start ignorado de " + c.name);
             return;
         }
 
-        c.recording = Connection::Recording { takeId, trackId, (int64_t) (juce::int64) start };
+        c.recording = Connection::Recording { takeId, trackId, *start };
         relayToOthers (c, message);
         broadcastPresence();
     }
@@ -1069,20 +1209,23 @@ struct ProjectHost::Impl
     //==========================================================================
     bool handleSegment (Connection& c, const juce::var& message)
     {
-        const auto& bytesVar = message["bytes"];
+        const auto byteCount = hostdetail::readInteger (message["bytes"], 1, maxSegmentBytes);
 
-        if (! isNumber (bytesVar) || (juce::int64) bytesVar <= 0 || (juce::int64) bytesVar > maxSegmentBytes)
+        if (! byteCount)
             return refuse (c, juce::String (juce::CharPointer_UTF8 ("segmento demasiado grande o inv\xc3\xa1lido")));
 
         juce::MemoryBlock bytes;
 
-        if (! c.readExactly (bytes, (size_t) (juce::int64) bytesVar))
+        if (! c.readExactly (bytes, (size_t) *byteCount))
             return false;
 
         const auto takeId = message["take"].toString();
-        const auto index = isNumber (message["index"]) ? (int) message["index"] : -1;
-        const auto samples = isNumber (message["samples"]) ? (int64_t) (juce::int64) message["samples"] : -1;
-        const auto channels = isNumber (message["channels"]) ? (int) message["channels"] : -1;
+        const auto indexValue = hostdetail::readInteger (message["index"], 0, INT_MAX);
+        const auto samplesValue = hostdetail::readInteger (message["samples"], 1, segmentSamples);
+        const auto channelsValue = hostdetail::readInteger (message["channels"], 1, 2);
+        const auto index = indexValue ? (int) *indexValue : -1;
+        const auto samples = samplesValue ? *samplesValue : 0;
+        const auto channels = channelsValue ? (int) *channelsValue : 0;
         const auto sha1 = message["sha1"].toString().toLowerCase();
 
         auto bad = [&] (int expected, const juce::String& reason)
@@ -1111,6 +1254,9 @@ struct ProjectHost::Impl
 
         if (take->complete)
             return bad (take->segments, "la toma ya esta completa");
+
+        if (! indexValue || ! samplesValue || ! channelsValue)
+            return bad (take->segments, "segmento malformado");
 
         if (index != take->segments)
             return bad (take->segments, "fuera de orden");

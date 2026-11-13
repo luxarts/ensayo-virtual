@@ -127,7 +127,7 @@ set(ENSAYO_DEFINITIONS
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_MP3AUDIOFORMAT=1 JUCE_USE_FLAC=1
     JUCE_USE_OGGVORBIS=1 CUSTOM_MODES=1 JUCE_DISPLAY_SPLASH_SCREEN=0)
 
-set(ENSAYO_SYSTEM_LIBS ws2_32 avrt winmm mf mfplat mfreadwrite mfuuid)
+set(ENSAYO_SYSTEM_LIBS ws2_32 avrt bcrypt winmm mf mfplat mfreadwrite mfuuid)
 
 juce_add_gui_app(EnsayoVirtual PRODUCT_NAME "Ensayo Virtual" COMPANY_NAME "EnsayoVirtual")
 target_sources(EnsayoVirtual PRIVATE src/Main.cpp ${ENSAYO_UI_SOURCES} ${ENSAYO_SERVER_SOURCES} ${ENSAYO_CORE_SOURCES})
