@@ -1,5 +1,7 @@
 # Ensayo Virtual — Grabación multipista colaborativa (diseño)
 
+> **Ampliado por** `2026-11-13-chat-de-voz-y-transporte-design.md`: el "escuchar en vivo" opcional (`daw.listen`) se reemplazó por un chat de voz siempre activo, y los botones Stop/Grabar por un único Play/Pausa. Donde este documento diga otra cosa, manda la ampliación.
+
 Fecha: 2026-11-13. Estado: aprobado por Lucas (diseño presentado en 5 partes y validado en conversación;
 boceto de interfaz en `.nashe/brainstorm/*/content/daw-layout.html`, local).
 
