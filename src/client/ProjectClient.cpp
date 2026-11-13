@@ -483,6 +483,28 @@ struct ProjectClient::Impl
                         pendings.end());
     }
 
+    // Caller holds `lock`. A pending take this user cannot upload (the host says another user made it, e.g. after the
+    // settings lost the user id): its folder moves to <project>/pending-orphaned/ so the recording survives.
+    void orphanPendingLocked (const Id& take)
+    {
+        const auto from = takeDir (take);
+        const auto orphanedRoot = config.cacheRoot.getChildFile (projectId).getChildFile ("pending-orphaned");
+        const auto to = orphanedRoot.getNonexistentChildFile (take, {}, false);
+
+        if (from.isDirectory())
+        {
+            if (orphanedRoot.createDirectory() && from.moveFileTo (to))
+                postError ("La toma " + take + utf8 (" es de otro usuario en el anfitri\xc3\xb3n: no se sube y queda guardada en ")
+                           + to.getFullPathName() + " (pending-orphaned)");
+            else
+                postError ("La toma " + take + utf8 (" es de otro usuario en el anfitri\xc3\xb3n y no se pudo mover a ")
+                           + to.getFullPathName() + "; queda en " + from.getFullPathName());
+        }
+
+        pendings.erase (std::remove_if (pendings.begin(), pendings.end(), [&take] (const Pending& p) { return p.take == take; }),
+                        pendings.end());
+    }
+
     void deleteSegmentFilesLocked (const Pending& p, int from, int to)
     {
         for (int i = std::max (0, from); i < to; ++i)
@@ -614,7 +636,7 @@ struct ProjectClient::Impl
 
         {
             const std::lock_guard<std::mutex> scoped (lock);
-            std::vector<Id> drop;
+            std::vector<Id> drop, orphaned;
 
             for (auto& p : pendings)
             {
@@ -633,7 +655,7 @@ struct ProjectClient::Impl
 
                 if (t->author != config.user)
                 {
-                    drop.push_back (p.take);   // cannot be ours to upload
+                    orphaned.push_back (p.take);   // cannot be ours to upload, but its audio is never deleted
                     continue;
                 }
 
@@ -680,6 +702,9 @@ struct ProjectClient::Impl
 
             for (const auto& take : drop)
                 dropPendingLocked (take);
+
+            for (const auto& take : orphaned)
+                orphanPendingLocked (take);
         }
 
         for (const auto& op : ops)

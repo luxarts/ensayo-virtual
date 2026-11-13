@@ -126,6 +126,7 @@ public:
         testDestroyWhileBusy();
         testQueueMisuse();
         testRestartFinishesTake();
+        testForeignPendingKept();
         testUnfinishedTakes();
         testCacheReuse();
         testVersionGap();
@@ -782,6 +783,58 @@ public:
         expect (b2.errors.isEmpty(), b2.errors.joinIntoString ("; "));
 
         b2->disconnect();
+        host.stop();
+    }
+
+    //==========================================================================
+    void testForeignPendingKept()
+    {
+        beginTest ("a pending take the host says belongs to another user is moved to pending-orphaned, never deleted");
+
+        const auto root = testDir ("orphaned");
+        const auto hostUser = newId(), userB = newId(), userB2 = newId();
+        const auto cacheB = root.getChildFile ("cacheB");
+        ProjectHost host ({ 22211, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+
+        const auto track = newId(), take = newId();
+        Id projectId;
+
+        {
+            Peer b (cacheB, userB, "Ana");
+            expect (b.connectTo (22211, host.getSessionId()));
+            expect (addOwnTrack (b, track, "Voz"));
+            projectId = b->project()->id;
+            b->beginTake (take, 1, track, 0);
+            expect (waitUntil ([&] { return host.snapshot()->findTake (take) != nullptr; }, 5000), "add_take applied");
+            b->disconnect();
+
+            // Recorded while offline: never uploaded.
+            b->queueSegment (take, 0, makeSegment (48000, 1, 220.0f));
+            expectEquals (b->transfers().pendingUploads, 1);
+        }
+
+        // The same cache under another user id (settings lost): the host's take is not ours to upload.
+        const auto pending = cacheB.getChildFile (projectId).getChildFile ("pending").getChildFile (take);
+        expect (pending.getChildFile ("0.flac").existsAsFile());
+
+        Peer other (cacheB, userB2, "Ana");
+        expect (other.connectTo (22211, host.getSessionId()));
+        expect (waitUntil ([&] { return other->transfers().pendingTakes == 0; }, 5000), "the take is no longer pending");
+        expect (! pending.exists(), "the pending folder is still there");
+
+        const auto orphaned = cacheB.getChildFile (projectId).getChildFile ("pending-orphaned");
+        const auto kept = orphaned.findChildFiles (juce::File::findDirectories, false);
+        expectEquals (kept.size(), 1);
+
+        if (kept.size() == 1)
+        {
+            expect (kept[0].getFileName().startsWith (take));
+            expect (kept[0].getChildFile ("0.flac").existsAsFile(), "the recorded audio was not kept");
+        }
+
+        expect (other.errors.joinIntoString ("; ").contains ("pending-orphaned"), other.errors.joinIntoString ("; "));
+        other->disconnect();
         host.stop();
     }
 
