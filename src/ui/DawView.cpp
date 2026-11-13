@@ -107,11 +107,12 @@ struct DawView::Impl
     };
 
     //==========================================================================
-    struct TrackHeader : juce::Component
+    struct TrackHeader : juce::Component, private juce::Timer
     {
         Impl& impl;
         Id trackId;
-        bool draggingVolume = false, draggingPan = false;
+        bool draggingVolume = false, draggingPan = false, pendingVolume = false, pendingPan = false;
+        double sentVolume = 0.0, sentPan = 0.0;   // what the project last said (or what we last emitted)
         Swatch swatch;
         juce::Label name, author, kind, lock, volumeText, panLabel;
         juce::TextButton mute, solo, arm;
@@ -151,7 +152,6 @@ struct DawView::Impl
             lock.setText ("Bloq.", juce::dontSendNotification);
             lock.setFont (plainFont (11.0f));
             lock.setColour (juce::Label::textColourId, juce::Colour (0xff6c7886));
-            lock.setTooltip (juce::String ("S") + ES ("\xC3\xB3") + "lo su autor puede grabar en esta pista");
             lock.setJustificationType (juce::Justification::centred);
             addAndMakeVisible (lock);
 
@@ -197,9 +197,9 @@ struct DawView::Impl
                 volumeText.setText (dbText (volume.getValue()), juce::dontSendNotification);
 
                 if (! draggingVolume)
-                    emitMix (true);
+                    schedule (pendingVolume);   // wheel or keyboard nudge: coalesced into one op
             };
-            volume.onDragEnd = [this] { draggingVolume = false; emitMix (true); };
+            volume.onDragEnd = [this] { draggingVolume = false; pendingVolume = false; emitMix (true); };
 
             pan.onDragStart = [this] { draggingPan = true; };
             pan.onValueChange = [this]
@@ -207,9 +207,9 @@ struct DawView::Impl
                 panLabel.setText (panText ((float) pan.getValue()), juce::dontSendNotification);
 
                 if (! draggingPan)
-                    emitMix (false);
+                    schedule (pendingPan);
             };
-            pan.onDragEnd = [this] { draggingPan = false; emitMix (false); };
+            pan.onDragEnd = [this] { draggingPan = false; pendingPan = false; emitMix (false); };
         }
 
         void setupSlider (juce::Slider& s, const juce::String& n, double lo, double hi, double step)
@@ -224,15 +224,46 @@ struct DawView::Impl
             addAndMakeVisible (s);
         }
 
+        void schedule (bool& pending)
+        {
+            pending = true;
+            startTimer (300);
+        }
+
+        void timerCallback() override
+        {
+            stopTimer();
+
+            if (pendingVolume)  { pendingVolume = false; emitMix (true); }
+            if (pendingPan)     { pendingPan = false; emitMix (false); }
+        }
+
+        // Emits only when the value differs from what the project holds (or what was last emitted).
         void emitMix (bool isVolume)
         {
-            if (! impl.v.onOp)
+            if (! impl.v.onOp || ! impl.canEdit (currentTrack()))
                 return;
 
             if (isVolume)
-                impl.v.onOp (Ops::setMix (trackId, (float) volume.getValue(), std::nullopt, std::nullopt));
+            {
+                if (volume.getValue() == sentVolume)  return;
+                sentVolume = volume.getValue();
+                impl.v.onOp (Ops::setMix (trackId, (float) sentVolume, std::nullopt, std::nullopt));
+            }
             else
-                impl.v.onOp (Ops::setMix (trackId, std::nullopt, (float) pan.getValue(), std::nullopt));
+            {
+                if (pan.getValue() == sentPan)  return;
+                sentPan = pan.getValue();
+                impl.v.onOp (Ops::setMix (trackId, std::nullopt, (float) sentPan, std::nullopt));
+            }
+        }
+
+        const Track& currentTrack() const
+        {
+            static const Track none;
+            const auto* p = impl.currentProject();
+            const auto* t = p != nullptr ? p->findTrack (trackId) : nullptr;
+            return t != nullptr ? *t : none;
         }
 
         void renameFromLabel()
@@ -240,7 +271,7 @@ struct DawView::Impl
             const auto* track = impl.currentProject() != nullptr ? impl.currentProject()->findTrack (trackId) : nullptr;
             const auto text = name.getText().trim();
 
-            if (track == nullptr || text.isEmpty() || text == track->name)
+            if (track == nullptr || text.isEmpty() || text == track->name || ! impl.canEdit (*track))
             {
                 if (track != nullptr)
                     name.setText (track->name, juce::dontSendNotification);
@@ -255,7 +286,8 @@ struct DawView::Impl
         void update (const Project& p, const Track& t)
         {
             trackId = t.id;
-            const bool editable = impl.canEdit (t);
+            const bool editable = impl.canEdit (t);              // false while I am recording
+            const bool mine = impl.canEditBase (t);              // arm/lock follow ownership only
             const auto colour = authorColour (p, t.author);
 
             swatch.colour = colour;
@@ -265,17 +297,19 @@ struct DawView::Impl
                 name.setText (t.name, juce::dontSendNotification);
 
             name.setEditable (false, editable, true);
-            author.setText (juce::String ("\xC2\xB7 ") .isEmpty() ? juce::String() : ES ("\xC2\xB7") + " " + p.userName (t.author), juce::dontSendNotification);
+            author.setText (ES ("\xC2\xB7") + " " + p.userName (t.author), juce::dontSendNotification);
             kind.setText (ES ("\xC2\xB7") + " " + kindText (t.kind), juce::dontSendNotification);
 
             mute.setToggleState (t.muted, juce::dontSendNotification);
             solo.setToggleState (impl.state.solo.count (t.id) > 0, juce::dontSendNotification);
             arm.setToggleState (impl.state.armedTrack == t.id, juce::dontSendNotification);
-            arm.setVisible (editable && t.kind != TrackKind::imported);
-            lock.setVisible (! editable);
+            arm.setVisible (mine && t.kind != TrackKind::imported);
+            lock.setVisible (! mine);
+            lock.setTooltip (impl.state.readOnly ? ES ("S\xC3\xB3lo lectura: el host est\xC3\xA1 desconectado")
+                                                 : ES ("S\xC3\xB3lo su autor puede grabar en esta pista"));
 
-            if (! draggingVolume)  volume.setValue (t.gainDb, juce::dontSendNotification);
-            if (! draggingPan)     pan.setValue (t.pan, juce::dontSendNotification);
+            if (! draggingVolume && ! pendingVolume)  { volume.setValue (t.gainDb, juce::dontSendNotification); sentVolume = volume.getValue(); }
+            if (! draggingPan && ! pendingPan)        { pan.setValue (t.pan, juce::dontSendNotification); sentPan = pan.getValue(); }
 
             volumeText.setText (dbText (volume.getValue()), juce::dontSendNotification);
             panLabel.setText (panText ((float) pan.getValue()), juce::dontSendNotification);
@@ -677,7 +711,8 @@ struct DawView::Impl
     bool userZoomed = false;
     int64_t originSample = 0;
     Id selected;
-    std::map<Id, std::vector<Peak>> peaksCache;
+    struct CachedPeaks { std::vector<Peak> peaks; int64_t samples = -1; float availability = -1.0f; };
+    std::map<Id, CachedPeaks> peaksCache;
     std::vector<Id> headerIds;
     std::vector<std::unique_ptr<TrackHeader>> headers;
     juce::Label projectName, link, bpmLabel, meterLabel, timeLabel;
@@ -815,10 +850,14 @@ struct DawView::Impl
     //==========================================================================
     const Project* currentProject() const noexcept { return state.project.get(); }
 
-    bool canEdit (const Track& t) const
+    // Ownership and read-only only (what arm/lock and selection clean-up follow).
+    bool canEditBase (const Track& t) const
     {
         return ! state.readOnly && currentProject() != nullptr && canEditTrack (*currentProject(), t, state.me);
     }
+
+    // While I am recording, editing is locked as well.
+    bool canEdit (const Track& t) const { return ! state.recording && canEditBase (t); }
 
     int timelineWidth() const { return juce::jmax (1, timeline.getWidth()); }
 
@@ -900,17 +939,26 @@ struct DawView::Impl
         if (peaksProvider == nullptr)
             return none;
 
+        // Peaks only grow, so a take is re-fetched only when its known length or download progress changed.
+        const auto* known = currentProject() != nullptr ? currentProject()->findTake (take) : nullptr;
+        const int64_t samples = known != nullptr ? known->samples : 0;
+        const auto availability = state.takeAvailability.find (take);
+        const float fraction = availability != state.takeAvailability.end() ? availability->second : 1.0f;
         auto it = peaksCache.find (take);
 
-        if (it != peaksCache.end())
-            return it->second;
+        if (it != peaksCache.end() && it->second.samples == samples && it->second.availability == fraction)
+            return it->second.peaks;
 
         auto peaks = peaksProvider->peaksFor (take);
 
         if (peaks.empty())
-            return none;   // not cached: the peaks may still arrive
+            return it != peaksCache.end() ? it->second.peaks : none;   // not cached: the peaks may still arrive
 
-        return peaksCache.emplace (take, std::move (peaks)).first->second;
+        auto& entry = peaksCache[take];
+        entry.peaks = std::move (peaks);
+        entry.samples = samples;
+        entry.availability = fraction;
+        return entry.peaks;
     }
 
     // One pixel column per min/max over the peaks that cover it; `firstSample` is the take sample under r's left edge.
@@ -1024,6 +1072,9 @@ struct DawView::Impl
 
     void select (const Id& region)
     {
+        if (state.recording)
+            return;   // editing (selection included) is locked while I record
+
         if (region.isNotEmpty())
         {
             const auto* track = trackOfRegion (region);
@@ -1054,16 +1105,22 @@ struct DawView::Impl
     {
         const auto* p = currentProject();
 
-        if (p == nullptr || ! state.isHost || state.readOnly)
+        if (p == nullptr || ! state.isHost || state.readOnly || state.recording)
         {
             refreshTempoLabels();
             return;
         }
 
         const double bpm = bpmLabel.getText().getDoubleValue();
-        const int beats = meterLabel.getText().upToFirstOccurrenceOf ("/", false, false).getIntValue();
 
-        if (bpm >= 30.0 && bpm <= 300.0 && beats >= 1 && beats <= 32)
+        // The model has no denominator: accept "N" or "N/4" with N in [1, 12], reject anything else.
+        const auto meter = meterLabel.getText().trim();
+        const auto numerator = meter.upToFirstOccurrenceOf ("/", false, false).trim();
+        const auto denominator = meter.contains ("/") ? meter.fromFirstOccurrenceOf ("/", false, false).trim() : juce::String ("4");
+        const int beats = numerator.getIntValue();
+        const bool meterOk = numerator.isNotEmpty() && numerator.containsOnly ("0123456789") && denominator == "4" && beats >= 1 && beats <= 12;
+
+        if (bpm >= 30.0 && bpm <= 300.0 && meterOk)
         {
             if ((bpm != p->bpm || beats != p->beatsPerBar) && v.onOp)
                 v.onOp (Ops::setTempo (bpm, beats));
@@ -1106,13 +1163,15 @@ struct DawView::Impl
     void applyState()
     {
         const auto* p = currentProject();
-        const bool hostEditable = state.isHost && ! state.readOnly;
+        const bool hostEditable = state.isHost && ! state.readOnly && ! state.recording;
 
         projectName.setText (p != nullptr ? p->name : juce::String(), juce::dontSendNotification);
         link.setText (state.link, juce::dontSendNotification);
         timeLabel.setText (timeText(), juce::dontSendNotification);
         bpmLabel.setEditable (hostEditable, false, true);
         meterLabel.setEditable (hostEditable, false, true);
+        bpmLabel.setEnabled (hostEditable);
+        meterLabel.setEnabled (hostEditable);
         refreshTempoLabels();
 
         listen.setToggleState (state.listen, juce::dontSendNotification);
@@ -1181,7 +1240,7 @@ struct DawView::Impl
         {
             const auto* track = trackOfRegion (selected);
 
-            if (track == nullptr || ! canEdit (*track))
+            if (track == nullptr || ! canEditBase (*track))
                 selected = {};
         }
 
@@ -1235,11 +1294,7 @@ DawView::~DawView() = default;
 
 void DawView::setState (const DawState& s)
 {
-    const bool cacheStale = impl->state.project != s.project || impl->state.takeAvailability != s.takeAvailability;
     impl->state = s;
-
-    if (cacheStale)
-        impl->peaksCache.clear();
 
     impl->applyState();
 }

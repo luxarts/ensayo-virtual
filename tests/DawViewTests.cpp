@@ -72,6 +72,18 @@ public:
         pumpMessages (250);
     }
 
+    static juce::MouseEvent mouse (juce::Component& c, juce::Point<float> pos, juce::Point<float> downPos, bool dragged)
+    {
+        return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos, juce::ModifierKeys(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                 &c, &c, juce::Time::getCurrentTime(), downPos, juce::Time::getCurrentTime(), 1, dragged);
+    }
+
+    struct CountingPeaks : PeaksProvider
+    {
+        mutable int calls = 0;
+        std::vector<Peak> peaksFor (const Id&) const override { ++calls; return std::vector<Peak> (500, Peak { -0.5f, 0.5f }); }
+    };
+
     static juce::String opName (const juce::var& v) { return v["op"].toString(); }
 
     struct Peaks : PeaksProvider
@@ -310,6 +322,220 @@ public:
             expectEquals (stops, 1);
             view.keyPressed (juce::KeyPress ('r'));
             expectEquals (records, 1);
+        }
+
+        beginTest ("rename, tempo and pan edits emit the right ops and respect the host");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            std::vector<juce::var> ops;
+            view.onOp = [&] (const juce::var& op) { ops.push_back (op); };
+            view.setState (f.state (f.guest));
+
+            auto* name = dynamic_cast<juce::Label*> (find (view, "track.1.name"));
+            expect (name != nullptr && name->isEditableOnDoubleClick());
+            expect (! dynamic_cast<juce::Label*> (find (view, "track.3.name"))->isEditableOnDoubleClick());
+            name->setText ("Coros", juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("rename_track"));
+            expectEquals (ops[0]["name"].toString(), juce::String ("Coros"));
+            expect (ops[0]["track"].toString() == f.t1);
+
+            // Non-host: tempo controls are disabled and nothing is emitted.
+            auto* bpm = dynamic_cast<juce::Label*> (find (view, "transport.bpm"));
+            auto* meter = dynamic_cast<juce::Label*> (find (view, "transport.meter"));
+            expect (! bpm->isEnabled() && ! meter->isEnabled());
+            ops.clear();
+            bpm->setText ("100", juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 0);
+            expectEquals (bpm->getText(), juce::String ("120"));   // reverted
+
+            view.setState (f.state (f.host));
+            expect (bpm->isEnabled() && meter->isEnabled());
+            bpm->setText ("100", juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("set_tempo"));
+            expectWithinAbsoluteError ((double) ops[0]["bpm"], 100.0, 0.001);
+            expectEquals ((int) ops[0]["beatsPerBar"], 4);
+
+            ops.clear();
+            expectEquals (meter->getText(), juce::String ("4/4"));
+            meter->setText ("3/4", juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 1);
+            expectEquals ((int) ops[0]["beatsPerBar"], 3);
+            meter->setText ("5", juce::sendNotificationSync);   // numerator alone is accepted
+            expectEquals ((int) ops.size(), 2);
+            expectEquals ((int) ops[1]["beatsPerBar"], 5);
+            meter->setText ("5/8", juce::sendNotificationSync);   // other denominators are rejected
+            meter->setText ("13", juce::sendNotificationSync);    // out of [1, 12]
+            meter->setText ("abc", juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 2);
+            expectEquals (meter->getText(), juce::String ("4/4"));   // label back to what the project says
+
+            // Pan: only at drag end, only the pan field, and only when it changed.
+            view.setState (f.state (f.guest));
+            ops.clear();
+            auto* pan = dynamic_cast<juce::Slider*> (find (view, "track.1.pan"));
+            pan->onDragStart();
+            pan->setValue (0.5, juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 0);
+            pan->onDragEnd();
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("set_mix"));
+            expectWithinAbsoluteError ((double) ops[0]["pan"], 0.5, 0.001);
+            expect (! ops[0].hasProperty ("gainDb"));
+            pan->onDragStart();
+            pan->onDragEnd();   // nothing moved
+            expectEquals ((int) ops.size(), 1);
+
+            // A wheel spin / keyboard nudge (no drag) is coalesced into one op.
+            ops.clear();
+            auto* volume = dynamic_cast<juce::Slider*> (find (view, "track.1.volume"));
+            for (double v : { -10.0, -12.0, -15.0 })
+                volume->setValue (v, juce::sendNotificationSync);
+            expectEquals ((int) ops.size(), 0);
+            pumpMessages (700);
+            expectEquals ((int) ops.size(), 1);
+            expectWithinAbsoluteError ((double) ops[0]["gainDb"], -15.0, 0.001);
+        }
+
+        beginTest ("a mouse drag on the timeline emits one move on mouse up and the keys split and delete");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            auto s = f.state (f.guest);
+            s.playhead = 150000;
+            view.setState (s);
+            view.setSamplesPerPixel (1000.0);
+            std::vector<juce::var> ops;
+            view.onOp = [&] (const juce::var& op) { ops.push_back (op); };
+            auto* timeline = find (view, "timeline");
+
+            // r1 spans x 96..288 on lane 0; grab the middle and drag 50 px right.
+            timeline->mouseDown (mouse (*timeline, { 192.0f, 30.0f }, { 192.0f, 30.0f }, false));
+            expect (view.getSelectedRegion() == f.r1);
+            timeline->mouseDrag (mouse (*timeline, { 217.0f, 30.0f }, { 192.0f, 30.0f }, true));
+            timeline->mouseDrag (mouse (*timeline, { 242.0f, 30.0f }, { 192.0f, 30.0f }, true));
+            expectEquals ((int) ops.size(), 0);
+            timeline->mouseUp (mouse (*timeline, { 242.0f, 30.0f }, { 192.0f, 30.0f }, true));
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("move_region"));
+            expectEquals ((int64_t) ops[0]["start"], (int64_t) 146000);
+
+            // Edge zone trims instead.
+            ops.clear();
+            timeline->mouseDown (mouse (*timeline, { 98.0f, 30.0f }, { 98.0f, 30.0f }, false));
+            timeline->mouseUp (mouse (*timeline, { 88.0f, 30.0f }, { 98.0f, 30.0f }, true));
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("trim_region"));
+
+            // A click without moving emits nothing; a click on empty space deselects.
+            ops.clear();
+            timeline->mouseDown (mouse (*timeline, { 192.0f, 30.0f }, { 192.0f, 30.0f }, false));
+            timeline->mouseUp (mouse (*timeline, { 192.0f, 30.0f }, { 192.0f, 30.0f }, false));
+            expectEquals ((int) ops.size(), 0);
+            timeline->mouseDown (mouse (*timeline, { 900.0f, 30.0f }, { 900.0f, 30.0f }, false));
+            expect (view.getSelectedRegion().isEmpty());
+
+            view.selectRegion (f.r1);
+            expect (view.keyPressed (juce::KeyPress ('S')));
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("split_region"));
+            expect (view.keyPressed (juce::KeyPress (juce::KeyPress::deleteKey)));
+            expectEquals ((int) ops.size(), 2);
+            expectEquals (opName (ops[1]), juce::String ("delete_region"));
+        }
+
+        beginTest ("editing is locked while I am recording");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            auto s = f.state (f.host);
+            s.playhead = 150000;
+            view.setState (s);
+            view.setSamplesPerPixel (1000.0);
+            view.selectRegion (f.r1);
+            expect (view.getSelectedRegion() == f.r1);
+            std::vector<juce::var> ops;
+            view.onOp = [&] (const juce::var& op) { ops.push_back (op); };
+
+            s.recording = true;
+            view.setState (s);
+            expect (view.getSelectedRegion() == f.r1);   // selection untouched
+            view.selectRegion (f.r3);
+            expect (view.getSelectedRegion() == f.r1);
+            expect (! view.splitSelectedAtPlayhead());
+            expect (! view.deleteSelected());
+            view.dragRegion (f.r1, 10);
+            view.dragEdge (f.r1, true, -5);
+            auto* timeline = find (view, "timeline");
+            timeline->mouseDown (mouse (*timeline, { 900.0f, 30.0f }, { 900.0f, 30.0f }, false));
+            expect (view.getSelectedRegion() == f.r1);
+
+            expect (! find (view, "track.1.mute")->isEnabled());
+            expect (! find (view, "track.1.volume")->isEnabled());
+            expect (! find (view, "track.1.pan")->isEnabled());
+            expect (! find (view, "transport.bpm")->isEnabled());
+            expect (! find (view, "edit.split")->isEnabled());
+            expect (shownWithin (view, find (view, "track.1.arm")));   // arming stays available
+
+            dynamic_cast<juce::Label*> (find (view, "track.1.name"))->setText ("X", juce::sendNotificationSync);
+            dynamic_cast<juce::Label*> (find (view, "transport.bpm"))->setText ("90", juce::sendNotificationSync);
+            auto* volume = dynamic_cast<juce::Slider*> (find (view, "track.1.volume"));
+            volume->setValue (-20.0, juce::sendNotificationSync);
+            pumpMessages (600);
+            expectEquals ((int) ops.size(), 0);
+
+            s.recording = false;
+            view.setState (s);
+            expect (view.splitSelectedAtPlayhead());
+        }
+
+        beginTest ("peaks are cached across state changes and refetched only when a take grows");
+        {
+            Fixture f;
+            DawView view;
+            CountingPeaks peaks;
+            view.setPeaksProvider (&peaks);
+            view.setSize (1100, 760);
+            view.setState (f.state (f.guest));
+            render (view);
+            const int first = peaks.calls;
+            expect (first >= 1);
+
+            auto copy = std::make_shared<Project> (*f.project);   // a new project object, same takes
+            auto s = f.state (f.guest);
+            s.project = copy;
+            s.playhead = 4000;
+            view.setState (s);
+            render (view);
+            expectEquals (peaks.calls, first);
+
+            copy = std::make_shared<Project> (*copy);
+            for (auto& t : copy->takes)
+                t.samples += 48000;   // the take grew
+            s.project = copy;
+            view.setState (s);
+            render (view);
+            expect (peaks.calls > first);
+        }
+
+        beginTest ("the lock tooltip tells why in read-only mode");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            view.setState (f.state (f.guest));
+            auto* lock = dynamic_cast<juce::Label*> (find (view, "track.3.lock"));
+            expect (lock->getTooltip().contains ("autor"));
+            auto s = f.state (f.guest);
+            s.readOnly = true;
+            view.setState (s);
+            expect (lock->getTooltip().contains ("lectura"));
+            expect (shownWithin (view, find (view, "track.1.lock")));
         }
 
         beginTest ("renders empty, one-track and twelve-track projects");
