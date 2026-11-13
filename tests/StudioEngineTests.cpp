@@ -421,11 +421,13 @@ public:
     // 1.5 x the source's own largest step, including the stream's start, an optional lost packet mid-stream and the
     // end of the stream (concealment, then a faded cut).
     // cutMidStream: listening is turned off (setPreviewBuffer (nullptr)) while packets still arrive.
-    void previewReceive (bool dropOne, bool cutMidStream = false)
+    // offAndOn: listening is turned off and, one device block later (while the faded tail still plays), on again;
+    // the stream goes on.
+    void previewReceive (bool dropOne, bool cutMidStream = false, bool offAndOn = false, int blockSize = 256)
     {
         StudioEngine engine;
         engine.setMonitor (0.0f, 0.0f);
-        engine.useFakeDevice (256, TestSignal::silence);
+        engine.useFakeDevice (blockSize, TestSignal::silence);
         OutputCapture out (48000 * 3);
         out.attach (*engine.getFakeDevice());
 
@@ -457,10 +459,44 @@ public:
         engine.setPreviewBuffer (&rx);
         const double startMs = juce::Time::getMillisecondCounterHiRes();
 
+        // offAndOn: toggled from the device thread between two callbacks, so the second switch lands exactly one
+        // block after the first.
+        std::atomic<int> toggle { 0 };   // 1: turn off at the next block end, 2: turn on at the next one, 3: done
+
+        if (offAndOn)
+        {
+            engine.getFakeDevice()->onOutputBlock = [&] (const float* l, const float* r, int n, int64_t, double)
+            {
+                {
+                    std::lock_guard<std::mutex> g (out.lock);
+
+                    for (int i = 0; i < n && out.L.size() < out.L.capacity(); ++i)
+                    {
+                        out.L.push_back (l[i]);
+                        out.R.push_back (r[i]);
+                    }
+                }
+
+                if (toggle.load() == 1)
+                {
+                    engine.setPreviewBuffer (nullptr);
+                    toggle.store (2);
+                }
+                else if (toggle.load() == 2)
+                {
+                    engine.setPreviewBuffer (&rx);
+                    toggle.store (3);
+                }
+            };
+        }
+
         for (int b = prefill; b < blocks; ++b)
         {
             while (juce::Time::getMillisecondCounterHiRes() < startMs + (b - prefill) * blockMs)
                 juce::Thread::sleep (1);
+
+            if (offAndOn && b == cutAt)
+                toggle.store (1);
 
             if (cutMidStream && b == cutAt)
             {
@@ -470,6 +506,9 @@ public:
 
             push (b);
         }
+
+        if (offAndOn)
+            expectEquals (toggle.load(), 3, "listening was turned off and on again");
 
         const auto stats = rx.getStats();
         pumpMessages (150);                          // the stream ends: concealment, then a faded cut
@@ -484,11 +523,11 @@ public:
         const auto bound = 1.5f * maxStepOf (pure);
         std::lock_guard<std::mutex> g (out.lock);
         const auto peak = peakOfVector (out.L), step = maxStepOf (out.L);
-        logMessage (juce::String (cutMidStream ? "cut mid-stream" : dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
+        logMessage (juce::String (offAndOn ? "off and on" : cutMidStream ? "cut mid-stream" : dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
                     + juce::String ((int) stats.underruns) + ", output peak " + juce::String (peak, 4) + ", max step "
                     + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
 
-        if (! dropOne)
+        if (! dropOne && ! offAndOn)
             expectEquals ((int) stats.underruns, 0, "the stream was paced without gaps");
 
         expect (peak >= 0.425f && peak <= 0.575f, "output peak " + juce::String (peak, 4));
@@ -852,6 +891,9 @@ public:
 
         beginTest ("live preview: turning listening off mid-stream fades out without a click");
         previewReceive (false, true);
+
+        beginTest ("live preview: listening off and on again during the faded tail (64-sample blocks) plays the tail out");
+        previewReceive (false, false, true, 64);
     }
 };
 

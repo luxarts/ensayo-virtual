@@ -466,10 +466,10 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
             ramp (dl, dr, false);
             previewFill += previewFrame;
         }
-        else
-        {
-            previewFill = 0;
-        }
+
+        // Otherwise previewFill is kept too: what is left is already faded out (the tail of a stream switched off,
+        // possibly being played out while the buffer was nullptr) or silence, so it plays to its end and anything
+        // new is decoded after it - cutting it short would step.
 
         monoState = {};
         stereoState = {};
