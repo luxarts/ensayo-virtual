@@ -1185,7 +1185,7 @@ struct DawView::Impl
         countIn.setToggleState (state.countIn, juce::dontSendNotification);
         play.setToggleState (state.playing, juce::dontSendNotification);
         record.setButtonText (ES ("\xE2\x97\x8F") + (state.recording ? " Grabando" : " Grabar"));
-        record.setEnabled (! state.readOnly);
+        record.setEnabled (! state.readOnly || state.recording);   // a running take can always be stopped
         for (auto* b : { &addVoice, &addInstrument, &importFile })
             b->setEnabled (! state.readOnly);
         youtube.setEnabled (! state.readOnly);
@@ -1465,7 +1465,7 @@ bool DawView::keyPressed (const juce::KeyPress& key)
 
     if (code == juce::KeyPress::deleteKey)  { deleteSelected(); return true; }
     if (letter == 's')                      { splitSelectedAtPlayhead(); return true; }
-    if (letter == 'r')                      { if (onRecord && ! impl->state.readOnly) onRecord(); return true; }
+    if (letter == 'r')                      { if (onRecord && (! impl->state.readOnly || impl->state.recording)) onRecord(); return true; }
 
     return false;
 }

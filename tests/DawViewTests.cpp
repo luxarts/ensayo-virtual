@@ -542,6 +542,20 @@ public:
             view.setState (s);
             expect (lock->getTooltip().contains ("lectura"));
             expect (shownWithin (view, find (view, "track.1.lock")));
+
+            // Read-only blocks starting a take, but a take already running can always be stopped.
+            int records = 0;
+            view.onRecord = [&] { ++records; };
+            auto* record = find (view, "transport.record");
+            expect (! record->isEnabled());
+            view.keyPressed (juce::KeyPress ('r'));
+            expectEquals (records, 0);
+
+            s.recording = true;
+            view.setState (s);
+            expect (record->isEnabled(), "the record button must stay usable to stop the take");
+            view.keyPressed (juce::KeyPress ('r'));
+            expectEquals (records, 1);
         }
 
         beginTest ("renders empty, one-track and twelve-track projects");
