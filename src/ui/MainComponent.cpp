@@ -861,7 +861,13 @@ void MainComponent::wireSession()
     session.onExportFinished = [this] (const juce::File& file, const juce::Result& result)
     {
         if (result.wasOk())
-            setStatus ("Mezcla exportada: " + file.getFullPathName());
+        {
+            const auto info = session.lastExportInfo();
+            const auto clipped = info.clippedSamples > 0
+                ? ES (" (la mezcla satur\xC3\xB3: pico +") + juce::String (info.peakDb(), 1) + " dBFS)"
+                : juce::String();
+            setStatus ("Mezcla exportada: " + file.getFullPathName() + clipped, clipped.isNotEmpty(), false);
+        }
         else
             setStatus ("No se pudo exportar: " + result.getErrorMessage(), true, false);
     };

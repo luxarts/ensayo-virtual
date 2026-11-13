@@ -641,6 +641,9 @@ juce::Result SessionController::exportMix (const juce::File& wav)
     if (exportBusy)
         return juce::Result::fail (ES ("Ya hay una exportaci\xC3\xB3n en curso"));
 
+    if (const auto cached = checkTakesCached (*client->project(), *client->cache()); cached.failed())
+        return cached;
+
     if (exportThread.joinable())
         exportThread.join();
 
@@ -652,6 +655,7 @@ juce::Result SessionController::exportMix (const juce::File& wav)
     exportThread = std::thread ([this, snapshot, source, wav]
     {
         int lastPercent = -1;
+        ExportInfo info;
         const auto result = ensayo::exportMix (snapshot, *source, wav, [this, &lastPercent] (float fraction)
         {
             if (const int percent = (int) (fraction * 100.0f); percent != lastPercent)
@@ -661,14 +665,17 @@ juce::Result SessionController::exportMix (const juce::File& wav)
             }
 
             return ! exportCancel.load();
-        });
+        }, &info);
 
-        post ([this, wav, result]
+        post ([this, wav, result, info]
         {
             if (exportThread.joinable())
                 exportThread.join();
 
             exportBusy = false;
+
+            if (result.wasOk())
+                exportInfo = info;
 
             if (onExportFinished) onExportFinished (wav, result);
         });

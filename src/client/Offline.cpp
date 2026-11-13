@@ -127,8 +127,25 @@ std::vector<juce::MemoryBlock> makeSegments (const juce::AudioBuffer<float>& aud
     return segments;
 }
 
+juce::Result checkTakesCached (const Project& project, const TakeCache& cache)
+{
+    for (const auto& track : project.tracks)
+    {
+        for (const auto& region : track.regions)
+        {
+            const auto* take = project.findTake (region.take);
+
+            if (take != nullptr && cache.sampleCount (take->id) < take->samples)
+                return juce::Result::fail (juce::String (juce::CharPointer_UTF8 (
+                    "Esper\xc3\xa1 a que terminen de descargarse las tomas antes de exportar")));
+        }
+    }
+
+    return juce::Result::ok();
+}
+
 juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSource& source, const juce::File& wav,
-                        std::function<bool (float)> progress)
+                        std::function<bool (float)> progress, ExportInfo* info)
 {
     if (project == nullptr)
         return juce::Result::fail ("No project");
@@ -170,6 +187,7 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
     };
 
     std::vector<int> intLeft (exportBlock), intRight (exportBlock);
+    ExportInfo measured;
 
     bool cancelled = false;
 
@@ -186,6 +204,15 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
 
         for (int i = 0; i < n; ++i)
         {
+            for (const float x : { left[(size_t) i], right[(size_t) i] })
+            {
+                const float magnitude = std::abs (x);
+                measured.peak = std::max (measured.peak, magnitude);
+
+                if (magnitude > 1.0f)
+                    ++measured.clippedSamples;
+            }
+
             intLeft[(size_t) i] = quantise (left[(size_t) i]);
             intRight[(size_t) i] = quantise (right[(size_t) i]);
         }
@@ -217,6 +244,9 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
 
     if (progress)
         progress (1.0f);   // the file is complete, so a late cancel has nothing left to stop
+
+    if (info != nullptr)
+        *info = measured;
 
     return juce::Result::ok();
 }

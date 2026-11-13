@@ -294,6 +294,107 @@ public:
             }
         }
 
+        beginTest ("exportMix reports the mix peak and how many samples clipped, without changing the audio");
+        {
+            class DcSource : public SampleSource
+            {
+            public:
+                explicit DcSource (float v) : value (v) {}
+                int channels (const Id&) const noexcept override { return 1; }
+                void read (const Id&, int, int64_t, int n, float* dest) const noexcept override { for (int i = 0; i < n; ++i) dest[i] = value; }
+                const float value;
+            };
+
+            auto p = std::make_shared<Project>();
+            Track t; t.id = newId();
+            Region r; r.id = newId(); r.take = "d"; r.length = 9000;
+            t.regions.push_back (r);
+            p->tracks.push_back (t);
+
+            // The renderer's output for this DC (region edges fade), to know the exact peak and clipped count.
+            int64_t renderedClipped = 0;
+            const auto renderedPeak = [&p, &renderedClipped] (const SampleSource& s)
+            {
+                renderedClipped = 0;
+                Renderer renderer;
+                renderer.prepare (4096);
+                renderer.setProject (p);
+                renderer.snapRamps();
+                std::vector<float> L (4096), R (4096);
+                float peak = 0.0f;
+
+                for (int pos = 0; pos < 9000; pos += 4096)
+                {
+                    const int b = std::min (4096, 9000 - pos);
+                    renderer.render (s, pos, b, L.data(), R.data());
+
+                    for (int i = 0; i < b; ++i)
+                    {
+                        peak = std::max ({ peak, std::abs (L[(size_t) i]), std::abs (R[(size_t) i]) });
+                        renderedClipped += (std::abs (L[(size_t) i]) > 1.0f ? 1 : 0) + (std::abs (R[(size_t) i]) > 1.0f ? 1 : 0);
+                    }
+                }
+
+                return peak;
+            };
+
+            const DcSource quiet (0.25f), loud (3.0f);
+            ExportInfo info;
+            expect (exportMix (p, quiet, testDir().getChildFile ("quiet.wav"), {}, &info).wasOk());
+            expectWithinAbsoluteError (info.peak, renderedPeak (quiet), 1.0e-6f);
+            expectEquals (info.clippedSamples, (int64_t) 0);
+
+            const auto f = testDir().getChildFile ("loud.wav");
+            expect (exportMix (p, loud, f, {}, &info).wasOk());
+            const auto loudPeak = renderedPeak (loud);
+            expect (loudPeak > 1.0f);
+            expectWithinAbsoluteError (info.peak, loudPeak, 1.0e-6f);
+            expectEquals (info.clippedSamples, renderedClipped);
+            expect (renderedClipped > 9000, "most of both channels clip");
+            expectWithinAbsoluteError (info.peakDb(), juce::Decibels::gainToDecibels (loudPeak), 1.0e-3f);
+
+            // The audio is still hard clipped at full scale, as before.
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (f.createInputStream().release(), true));
+            expect (rd != nullptr);
+
+            if (rd != nullptr)
+            {
+                juce::AudioBuffer<int> raw (2, 9000);
+                int* dest[2] = { raw.getWritePointer (0), raw.getWritePointer (1) };
+                expect (rd->read (dest, 2, 0, 9000, false));
+                expectEquals (raw.getSample (0, 4500) >> 8, 8388607);
+            }
+        }
+
+        beginTest ("checkTakesCached refuses a region whose take is not fully downloaded");
+        {
+            const auto dir = testDir().getChildFile ("cached");
+            dir.deleteRecursively();
+            TakeCache cache (dir);
+            const Id host = newId(), take = newId(), track = newId();
+            auto project = makeProject ("Song", host, "Lucas");
+            expect (applyOp (project, Ops::addTake (take, 1), host).ok);
+            expect (applyOp (project, Ops::updateTake (take, 2, 48000 + 1000, true), host).ok);
+            expect (applyOp (project, Ops::addTrack (track, "Voz", TrackKind::voice), host).ok);
+            expect (checkTakesCached (project, cache).wasOk(), "a project without regions can always be exported");
+            expect (applyOp (project, Ops::addRegion (track, { newId(), take, 0, 0, 2000 }), host).ok);
+
+            juce::AudioBuffer<float> audio (1, 48000 + 1000);
+            audio.clear();
+            const auto segments = makeSegments (audio);
+            expectEquals ((int) segments.size(), 2);
+
+            auto refused = checkTakesCached (project, cache);
+            expect (refused.failed());
+            expect (refused.getErrorMessage().contains (juce::String (juce::CharPointer_UTF8 ("Esper\xc3\xa1"))), refused.getErrorMessage());
+
+            expect (cache.appendSegment (take, 0, segments[0].getData(), segments[0].getSize()));
+            expect (checkTakesCached (project, cache).failed(), "one segment of two is not enough");
+            expect (cache.appendSegment (take, 1, segments[1].getData(), segments[1].getSize()));
+            expect (checkTakesCached (project, cache).wasOk());
+        }
+
         beginTest ("cancelling at 50 percent keeps an existing target and leaves no partial file");
         {
             const auto project = makeTestProject (100000);

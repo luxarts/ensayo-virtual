@@ -867,6 +867,8 @@ int runHeadless (const HeadlessOptions& o)
 
         if (cache == nullptr)
             markFailed ("no local cache to export from");
+        else if (const auto cached = checkTakesCached (*p, *cache); cached.failed())
+            markFailed ("export: " + cached.getErrorMessage());
         else if (const auto exported = exportMix (p, *cache, o.exportFile); exported.failed())
             markFailed ("export: " + exported.getErrorMessage());
         else

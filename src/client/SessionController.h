@@ -1,6 +1,7 @@
 #pragma once
 #include "client/ProjectClient.h"
 #include "client/StudioEngine.h"
+#include "client/Offline.h"
 #include "server/ProjectHost.h"
 #include <atomic>
 #include <functional>
@@ -68,9 +69,11 @@ public:
     // the track: a rejected add_track or a lost connection ends the import with an error and nothing recorded.
     juce::Result importFile (const juce::File&, const juce::String& trackName = {});
     bool isImporting() const noexcept       { return importBusy; }
-    // Export: offline render of the whole project to a 24-bit WAV on a thread.
+    // Export: offline render of the whole project to a 24-bit WAV on a thread. Refused while a take used by a region
+    // is not fully downloaded (it would be written as silence).
     juce::Result exportMix (const juce::File& wav);
     bool isExporting() const noexcept       { return exportBusy; }
+    ExportInfo lastExportInfo() const       { return exportInfo; }   // peak / clipping of the last successful export
 
     std::function<void()> onConnected, onProjectChanged, onTransfersChanged, onPresenceChanged;
     std::function<void (const juce::String&)> onDisconnected, onError, onRejected;
@@ -118,6 +121,7 @@ private:
     // Import / export.
     std::thread importThread, exportThread;
     std::atomic<bool> importBusy { false }, importCancel { false }, exportBusy { false }, exportCancel { false };
+    ExportInfo exportInfo;                      // message thread
     std::optional<ImportWait> importWait;       // message thread: the import's add_track is not applied yet
     std::optional<ImportFinish> importFinish;   // message thread: set before the queueing thread starts
     std::atomic<bool> importQueued { false };   // the queueing thread queued every segment
