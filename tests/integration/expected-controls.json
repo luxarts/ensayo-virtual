@@ -1,23 +1,25 @@
 {
   "lobby": [
-    "lobby.name", "lobby.role", "lobby.create", "lobby.link", "lobby.join",
+    "lobby.name", "lobby.role", "lobby.create", "lobby.open", "lobby.link", "lobby.join",
     "audio.device", "audio.rate", "audio.buffer", "audio.panel", "audio.mic", "audio.instrument",
-    "audio.output", "audio.latency",
+    "audio.output", "audio.latency", "lobby.calibrate", "lobby.calibration",
     "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
     "status.text", "status.retry"
   ],
   "session": [
-    "session.link", "session.copy", "session.leave", "session.editor",
-    "me.voice.fader", "me.voice.mute", "me.voice.meter",
-    "me.instrument.fader", "me.instrument.mute", "me.instrument.meter",
-    "participant.1.name", "participant.1.role", "participant.1.voice.fader", "participant.1.voice.mute",
-    "participant.1.instrument.fader", "participant.1.instrument.mute", "participant.1.meter",
-    "participant.2.name", "participant.2.role", "participant.2.voice.fader", "participant.2.voice.mute",
-    "participant.2.instrument.fader", "participant.2.instrument.mute", "participant.2.meter",
-    "participant.3.name", "participant.3.role", "participant.3.voice.fader", "participant.3.voice.mute",
-    "participant.3.instrument.fader", "participant.3.instrument.mute", "participant.3.meter",
-    "track.load", "track.url", "track.download", "track.name", "track.play", "track.stop", "track.loop",
-    "track.position", "track.time", "track.fader", "track.mute", "track.progress",
-    "status.ping", "status.jitter", "status.latency", "status.loss", "status.cpu", "status.text", "status.retry"
+    "daw.project", "daw.link", "daw.copy", "daw.users", "daw.listen", "daw.editor", "daw.leave",
+    "transport.home", "transport.play", "transport.stop", "transport.record", "transport.time",
+    "transport.bpm", "transport.meter", "transport.click", "transport.countin",
+    "edit.split", "edit.delete", "daw.export", "timeline", "timeline.ruler",
+    "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
+    "track.1.color", "track.1.name", "track.1.author", "track.1.kind", "track.1.mute", "track.1.solo", "track.1.arm",
+    "track.1.volume", "track.1.volume.text", "track.1.pan", "track.1.pan.text",
+    "track.2.color", "track.2.name", "track.2.author", "track.2.kind", "track.2.mute", "track.2.solo", "track.2.arm",
+    "track.2.volume", "track.2.volume.text", "track.2.pan", "track.2.pan.text",
+    "track.3.color", "track.3.name", "track.3.author", "track.3.kind", "track.3.mute", "track.3.solo", "track.3.lock",
+    "track.3.volume", "track.3.volume.text", "track.3.pan", "track.3.pan.text",
+    "track.4.color", "track.4.name", "track.4.author", "track.4.kind", "track.4.mute", "track.4.solo",
+    "track.4.volume", "track.4.volume.text", "track.4.pan", "track.4.pan.text",
+    "status.text", "status.sync", "status.ping", "status.transfers", "status.device", "status.cpu", "status.retry"
   ]
 }

@@ -1,4 +1,5 @@
 #include "Settings.h"
+#include "core/Project.h"
 
 namespace ensayo
 {
@@ -25,10 +26,16 @@ juce::String readString (const juce::var& v, const char* name, const juce::Strin
 }
 }
 
+juce::String calibrationKey (const juce::String& deviceName, int bufferSize)
+{
+    return deviceName + "@" + juce::String (bufferSize);
+}
+
 juce::String toJson (const AppSettings& s)
 {
     auto* root = new juce::DynamicObject();
     root->setProperty ("name", s.name);
+    root->setProperty ("userId", s.userId);
     root->setProperty ("role", roleToString (s.role));
     root->setProperty ("deviceType", s.deviceType);
     root->setProperty ("deviceName", s.deviceName);
@@ -50,6 +57,14 @@ juce::String toJson (const AppSettings& s)
     root->setProperty ("hostPort", s.hostPort);
     root->setProperty ("lastLink", s.lastLink);
     root->setProperty ("ytDlpPath", s.ytDlpPath);
+
+    auto* calibration = new juce::DynamicObject();
+
+    for (const auto& [key, samples] : s.calibration)
+        calibration->setProperty (key, samples);
+
+    root->setProperty ("calibration", juce::var (calibration));
+    root->setProperty ("lastProject", s.lastProject);
     return juce::JSON::toString (juce::var (root));
 }
 
@@ -62,6 +77,11 @@ AppSettings fromJson (const juce::String& json)
         return s;
 
     s.name = readString (root, "name", s.name);
+    s.userId = readString (root, "userId", s.userId);
+
+    if (! isValidId (s.userId))
+        s.userId.clear();
+
     s.role = roleFromString (readString (root, "role", roleToString (s.role))).value_or (Role::both);
     s.deviceType = readString (root, "deviceType", s.deviceType);
     s.deviceName = readString (root, "deviceName", s.deviceName);
@@ -83,6 +103,13 @@ AppSettings fromJson (const juce::String& json)
     s.hostPort = readInt (root, "hostPort", s.hostPort);
     s.lastLink = readString (root, "lastLink", s.lastLink);
     s.ytDlpPath = readString (root, "ytDlpPath", s.ytDlpPath);
+    s.lastProject = readString (root, "lastProject", s.lastProject);
+
+    if (auto* calibration = root["calibration"].getDynamicObject())
+        for (const auto& property : calibration->getProperties())
+            if (property.value.isInt() || property.value.isInt64() || property.value.isDouble())
+                s.calibration[property.name.toString()] = (int) property.value;
+
     return s;
 }
 
@@ -95,10 +122,15 @@ juce::File defaultSettingsFile()
 
 AppSettings loadSettings (const juce::File& file)
 {
-    if (! file.existsAsFile())
-        return {};
+    auto s = file.existsAsFile() ? fromJson (file.loadFileAsString()) : AppSettings();
 
-    return fromJson (file.loadFileAsString());
+    if (s.userId.isEmpty())
+    {
+        s.userId = newId();
+        saveSettings (s, file);   // best effort: the id must survive the next load
+    }
+
+    return s;
 }
 
 bool saveSettings (const AppSettings& settings, const juce::File& file)

@@ -44,17 +44,12 @@ set(ENSAYO_CORE_SOURCES
     src/core/Render.cpp
     src/core/OpusCodec.cpp
     src/core/JitterBuffer.cpp
-    # T4
-    src/server/BackingTrack.cpp
-    src/server/MixServer.cpp
     # T6
     src/client/PluginSlot.cpp
     src/client/FakeAudioDevice.cpp
-    src/client/AudioEngine.cpp
     src/client/Settings.cpp
     # T7
     src/client/SessionLink.cpp
-    src/client/SessionClient.cpp
     src/client/YouTubeImporter.cpp
     # T8
     src/client/HeadlessClient.cpp
@@ -67,10 +62,11 @@ set(ENSAYO_CORE_SOURCES
     src/client/Offline.cpp
     # T8
     src/client/StudioEngine.cpp
+    # T10
+    src/client/SessionController.cpp
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
-    src/server/ServerHost.cpp
     src/server/HighResClock.cpp
     src/server/MediaFoundationAudioFormat.cpp
     # T4
@@ -80,9 +76,7 @@ set(ENSAYO_UI_SOURCES
     # T9
     src/ui/DawView.cpp
     src/ui/LobbyView.cpp
-    src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
-    src/ui/AudioDiagnosis.cpp
     # T10
     src/ui/Screenshot.cpp
 )
@@ -103,24 +97,18 @@ set(ENSAYO_TEST_SOURCES
     tests/JitterBufferTests.cpp
     tests/SpscQueueTests.cpp
     # T4-tests
-    tests/BackingTrackTests.cpp
     tests/MediaFoundationAudioFormatTests.cpp
-    tests/MixServerTests.cpp
     # T5-tests
-    tests/ServerHostTests.cpp
     # T6-tests
     tests/PluginSlotTests.cpp
     tests/FakeAudioDeviceTests.cpp
-    tests/AudioEngineTests.cpp
     tests/SettingsTests.cpp
     # T7-tests
     tests/SessionLinkTests.cpp
-    tests/SessionClientTests.cpp
     tests/YouTubeImporterTests.cpp
     # T8-tests
     tests/HeadlessClientTests.cpp
     tests/UiTests.cpp
-    tests/AudioDiagnosisTests.cpp
     # T10-tests
     tests/ScreenshotTests.cpp
     # T4

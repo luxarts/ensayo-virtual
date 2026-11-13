@@ -12,8 +12,12 @@ class EnsayoVirtualApplication : public juce::JUCEApplication
 public:
     const juce::String getApplicationName() override       { return "Ensayo Virtual"; }
     const juce::String getApplicationVersion() override    { return "0.1.0"; }
-    // Headless instances (tests, latency probes) must be able to run side by side on one machine.
-    bool moreThanOneInstanceAllowed() override             { return getCommandLineParameterArray().contains ("--headless"); }
+    // Headless instances (tests, integration scripts) and screenshot runs must be able to run beside the app.
+    bool moreThanOneInstanceAllowed() override
+    {
+        const auto args = getCommandLineParameterArray();
+        return args.contains ("--headless") || args.contains ("--screenshot");
+    }
 
     void initialise (const juce::String& commandLine) override
     {
@@ -102,8 +106,8 @@ private:
             main = new MainComponent();
             setContentOwned (main, true);
             setResizable (true, false);
-            setResizeLimits (1100, 760, 8192, 8192);
-            centreWithSize (1100, 760);
+            setResizeLimits (1100, 760, 8192, 8192);   // the DAW view needs at least 1100 px for its transport row
+            centreWithSize (1280, 800);
             setVisible (true);
         }
 

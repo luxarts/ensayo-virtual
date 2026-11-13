@@ -1,5 +1,5 @@
 #include "server/MediaFoundationAudioFormat.h"
-#include "server/BackingTrack.h"
+#include "client/Offline.h"
 
 #include <cmath>
 
@@ -169,7 +169,7 @@ public:
             }
         }
 
-        beginTest ("BackingTrack::load accepts the m4a");
+        beginTest ("loadAndResample (import) accepts the m4a");
         {
             const auto file = fragmentedM4a();
 
@@ -179,13 +179,11 @@ public:
             }
             else
             {
-                BackingTrack track;
-                const auto result = track.load (file);
+                juce::AudioBuffer<float> audio;
+                const auto result = loadAndResample (file, audio);
                 expect (result.wasOk(), result.getErrorMessage());
-                const auto state = track.getState();
-                expect (state.loaded);
-                expect (state.length > 15LL * sampleRate && state.length < 25LL * sampleRate,
-                        "length = " + juce::String (state.length));
+                const auto length = (juce::int64) audio.getNumSamples();
+                expect (length > 15LL * sampleRate && length < 25LL * sampleRate, "length = " + juce::String (length));
             }
         }
     }

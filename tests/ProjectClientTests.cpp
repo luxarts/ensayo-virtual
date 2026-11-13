@@ -3,6 +3,7 @@
 #include "core/Segments.h"
 #include "MessagePump.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <string>
@@ -122,6 +123,7 @@ public:
         testDestroyWhileBusy();
         testQueueMisuse();
         testRestartFinishesTake();
+        testUnfinishedTakes();
         testCacheReuse();
         testVersionGap();
         testPreview();
@@ -636,6 +638,68 @@ public:
         const auto* t = host.snapshot()->findTake (take);
         expect (t != nullptr && t->segments == 3 && t->samples == 96100 && t->author == userB);
         expect (waitUntil ([&] { return countChildren (pendingDir (cacheB, *b2->project())) == 0; }, 5000), "pending dir empty");
+        expect (b2.errors.isEmpty(), b2.errors.joinIntoString ("; "));
+
+        b2->disconnect();
+        host.stop();
+    }
+
+    //==========================================================================
+    void testUnfinishedTakes()
+    {
+        beginTest ("unfinishedTakes lists a begun take with its track, start and offset after a restart; discardTake forgets it");
+
+        const auto root = testDir ("unfinished");
+        const auto hostUser = newId(), userB = newId();
+        const auto cacheB = root.getChildFile ("cacheB");
+        ProjectHost host ({ 22256, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+        const auto track = newId(), take = newId(), empty = newId(), finished = newId();
+
+        {
+            Peer b (cacheB, userB, "Ana");
+            expect (b.connectTo (22256, host.getSessionId()));
+            expect (addOwnTrack (b, track, "Voz"));
+            b->beginTake (take, 1, track, 96000, 1234);
+            b->queueSegment (take, 0, makeSegment (48000, 1, 220.0f));
+            b->queueSegment (take, 1, makeSegment (2000, 1, 330.0f));
+            b->beginTake (empty, 2, track, 5000, 10);
+            b->beginTake (finished, 1, track, 0, 0);
+            b->queueSegment (finished, 0, makeSegment (4800, 1, 440.0f));
+            b->finishTake (finished, track, Region { newId(), finished, 0, 0, 4800 });
+            expectEquals (b->transfers().pendingTakes, 3);
+            expect (waitUntil ([&] { return b->transfers().pendingTakes == 2; }, 8000), "the finished take is done");
+            b->disconnect();   // the "crash": two takes never got finishTake
+        }
+
+        Peer b2 (cacheB, userB, "Ana");
+        expect (b2.connectTo (22256, host.getSessionId()));
+        auto unfinished = b2->unfinishedTakes();
+        std::stable_partition (unfinished.begin(), unfinished.end(), [&] (const UnfinishedTake& x) { return x.take == take; });
+        expectEquals ((int) unfinished.size(), 2);
+
+        if (unfinished.size() == 2)
+        {
+            const auto& u = unfinished[0];
+            expectEquals (u.take, take);
+            expectEquals (u.track, track);
+            expectEquals ((juce::int64) u.start, (juce::int64) 96000);
+            expectEquals ((juce::int64) u.offset, (juce::int64) 1234);
+            expectEquals (u.channels, 1);
+            expectEquals ((juce::int64) u.samples, (juce::int64) 50000);
+            expectEquals (unfinished[1].take, empty);
+            expectEquals ((juce::int64) unfinished[1].samples, (juce::int64) 0);
+        }
+
+        b2->discardTake (empty);
+        expectEquals ((int) b2->unfinishedTakes().size(), 1);
+        expect (! pendingDir (cacheB, *b2->project()).getChildFile (empty).exists());
+        expectEquals (b2->transfers().pendingTakes, 1);
+
+        b2->finishTake (take, track, Region { newId(), take, 96000, 1234, 50000 - 1234 });
+        expect (waitUntil ([&] { return b2->transfers().pendingTakes == 0; }, 8000), "finished after the restart");
+        const auto* t = host.snapshot()->findTake (take);
+        expect (t != nullptr && t->complete && t->samples == 50000);
         expect (b2.errors.isEmpty(), b2.errors.joinIntoString ("; "));
 
         b2->disconnect();

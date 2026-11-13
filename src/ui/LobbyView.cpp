@@ -51,6 +51,9 @@ LobbyView::LobbyView()
     setupLabel (pluginLabel, "Plugin");
     setupLabel (latencyLabel, "Latencia: --");
     latencyLabel.setName ("audio.latency");
+    setupLabel (calibrationLabel, "");
+    calibrationLabel.setName ("lobby.calibration");
+    setCalibration (std::nullopt);
 
     nameEditor.setName ("lobby.name");
     nameEditor.setTextToShowWhenEmpty ("Tu nombre", juce::Colours::grey);
@@ -65,7 +68,13 @@ LobbyView::LobbyView()
 
     createButton.setName ("lobby.create");
     createButton.setButtonText (ES ("Crear sesión"));
+    createButton.setTooltip ("Crea un proyecto nuevo y lo comparte");
     addAndMakeVisible (createButton);
+
+    openButton.setName ("lobby.open");
+    openButton.setButtonText (ES ("Abrir proyecto…"));
+    openButton.setTooltip ("Abre un proyecto guardado y lo comparte");
+    addAndMakeVisible (openButton);
 
     linkEditor.setName ("lobby.link");
     linkEditor.setTextToShowWhenEmpty ("ensayo://host:puerto/ID", juce::Colours::grey);
@@ -89,6 +98,11 @@ LobbyView::LobbyView()
     panelButton.setName ("audio.panel");
     panelButton.setButtonText ("Panel ASIO");
     addAndMakeVisible (panelButton);
+
+    calibrateButton.setName ("lobby.calibrate");
+    calibrateButton.setButtonText ("Calibrar latencia");
+    calibrateButton.setTooltip (ES ("Conectá la salida elegida a la entrada del micrófono (cable o loopback de la placa)"));
+    addAndMakeVisible (calibrateButton);
 
     micBox.setName ("audio.mic");
     addAndMakeVisible (micBox);
@@ -121,6 +135,13 @@ LobbyView::LobbyView()
     addAndMakeVisible (removeButton);
 }
 
+void LobbyView::setCalibration (std::optional<int> samples)
+{
+    calibrationLabel.setText (samples ? ES ("Calibración: ") + juce::String (*samples) + " muestras"
+                                      : ES ("Calibración: sin calibrar"),
+                              juce::dontSendNotification);
+}
+
 void LobbyView::paint (juce::Graphics& g)
 {
     g.fillAll (findColour (juce::ResizableWindow::backgroundColourId));
@@ -137,7 +158,7 @@ void LobbyView::resized()
 
     // Session group.
     {
-        sessionGroup.setBounds (left.withHeight (6 * rowH + 7 * gap + 24));
+        sessionGroup.setBounds (left.withHeight (7 * rowH + 9 * gap + 32));
         auto r = sessionGroup.getBounds().reduced (12).withTrimmedTop (16);
 
         auto row = r.removeFromTop (rowH);
@@ -150,8 +171,10 @@ void LobbyView::resized()
         roleBox.setBounds (row);
         r.removeFromTop (gap);
 
-        row = r.removeFromTop (rowH + 4);
-        createButton.setBounds (row.withTrimmedLeft (labelW));
+        row = r.removeFromTop (rowH + 4).withTrimmedLeft (labelW);
+        createButton.setBounds (row.removeFromLeft ((row.getWidth() - gap) / 2));
+        row.removeFromLeft (gap);
+        openButton.setBounds (row);
         r.removeFromTop (gap * 2);
 
         row = r.removeFromTop (rowH);
@@ -165,7 +188,7 @@ void LobbyView::resized()
 
     // Audio group.
     {
-        audioGroup.setBounds (right.removeFromTop (7 * rowH + 8 * gap + 24));
+        audioGroup.setBounds (right.removeFromTop (8 * rowH + 9 * gap + 24));
         auto r = audioGroup.getBounds().reduced (12).withTrimmedTop (16);
 
         auto row = r.removeFromTop (rowH);
@@ -204,6 +227,12 @@ void LobbyView::resized()
         panelButton.setBounds (row.removeFromLeft (labelW));
         row.removeFromLeft (gap);
         latencyLabel.setBounds (row);
+        r.removeFromTop (gap);
+
+        row = r.removeFromTop (rowH);
+        calibrateButton.setBounds (row.removeFromLeft (labelW));
+        row.removeFromLeft (gap);
+        calibrationLabel.setBounds (row);
     }
 
     right.removeFromTop (16);

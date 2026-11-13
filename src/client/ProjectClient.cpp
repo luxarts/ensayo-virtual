@@ -76,7 +76,7 @@ namespace
         return value;
     }
 
-    // Same retry rule as SessionClient: a bare send on a non-blocking socket, retried with a short sleep (never
+    // Same retry rule as the old live-mix client: a bare send on a non-blocking socket, retried with a short sleep (never
     // waitUntilReady, whose read lock is held by the reader thread). Gives up after writeStallTimeoutMs without progress.
     bool writeAll (juce::StreamingSocket& socket, const void* data, size_t len, const juce::Thread* thread)
     {
@@ -237,7 +237,7 @@ struct ProjectClient::Impl
         Id take;
         int channels = 0;
         Id recTrack;
-        int64_t recStart = 0, created = 0;
+        int64_t recStart = 0, recOffset = 0, created = 0;
         std::optional<Finish> finish;
         int queued = 0;       // segments 0 .. queued-1 have been queued
         int nextIndex = 0;    // the next index to send (the host's take.segments once hostReady)
@@ -377,7 +377,8 @@ struct ProjectClient::Impl
     void writeMetaLocked (const Pending& p)
     {
         auto meta = object ({ { "take", p.take }, { "channels", p.channels }, { "track", p.recTrack },
-                              { "start", (juce::int64) p.recStart }, { "created", (juce::int64) p.created },
+                              { "start", (juce::int64) p.recStart }, { "offset", (juce::int64) p.recOffset },
+                              { "created", (juce::int64) p.created },
                               { "queued", p.queued } });
 
         if (p.finish)
@@ -437,6 +438,7 @@ struct ProjectClient::Impl
                 p.channels = (int) readInteger (meta["channels"], 1, 2).value_or (0);
                 p.recTrack = meta["track"].toString();
                 p.recStart = readInteger (meta["start"], 0, INT64_MAX / 4).value_or (0);
+                p.recOffset = readInteger (meta["offset"], 0, INT64_MAX / 4).value_or (0);
                 p.created = readInteger (meta["created"], 0, INT64_MAX).value_or (0);
 
                 const auto& finish = meta["finish"];
@@ -1407,7 +1409,7 @@ struct ProjectClient::Impl
     }
 
     //==========================================================================
-    // UDP: receive thread (this one) plus a nested send thread, as in SessionClient.
+    // UDP: receive thread (this one) plus a nested send thread.
     void startUdp()
     {
        #if JUCE_WINDOWS
@@ -1623,7 +1625,7 @@ void ProjectClient::sendOp (const juce::var& op)
     impl->sendOpInternal (op);
 }
 
-void ProjectClient::beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart)
+void ProjectClient::beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset)
 {
     bool sendAddTake = false;
 
@@ -1640,6 +1642,7 @@ void ProjectClient::beginTake (const Id& take, int channels, const Id& track, in
         p.channels = channels;
         p.recTrack = track;
         p.recStart = timelineStart;
+        p.recOffset = std::max<int64_t> (0, takeOffset);
         impl->writeMetaLocked (p);
 
         if (impl->welcomed && ! p.addTakeSent && ! p.hostReady)
@@ -1782,6 +1785,43 @@ void ProjectClient::sendPreview (const uint8_t* packet, size_t len) noexcept
    #endif
 }
 
+std::vector<UnfinishedTake> ProjectClient::unfinishedTakes() const
+{
+    std::vector<UnfinishedTake> out;
+    const std::lock_guard<std::mutex> scoped (impl->lock);
+
+    for (const auto& p : impl->pendings)
+    {
+        if (p.finish || p.failed)
+            continue;
+
+        UnfinishedTake u;
+        u.take = p.take;
+        u.track = p.recTrack;
+        u.start = p.recStart;
+        u.offset = p.recOffset;
+        u.channels = p.channels;
+        u.samples = impl->takeCache != nullptr ? impl->takeCache->sampleCount (p.take) : 0;
+        out.push_back (u);
+    }
+
+    return out;
+}
+
+void ProjectClient::discardTake (const Id& take)
+{
+    {
+        const std::lock_guard<std::mutex> scoped (impl->lock);
+
+        if (impl->projectId.isEmpty() || impl->findPending (take) == nullptr)
+            return;
+
+        impl->dropPendingLocked (take);
+    }
+
+    impl->postTransfers();
+}
+
 JitterBuffer* ProjectClient::previewBuffer() noexcept   { return &impl->preview; }
 std::vector<Presence> ProjectClient::presence() const   { return impl->presenceList; }
 std::vector<LiveRecording> ProjectClient::liveRecordings() const   { return impl->live; }
@@ -1792,8 +1832,12 @@ Transfers ProjectClient::transfers() const
     const std::lock_guard<std::mutex> scoped (impl->lock);
 
     for (const auto& p : impl->pendings)
+    {
         if (! p.failed)
             t.pendingUploads += std::max (0, p.queued - p.nextIndex);
+
+        ++t.pendingTakes;
+    }
 
     if (impl->replica != nullptr && impl->takeCache != nullptr)
         for (const auto& take : impl->replica->takes)

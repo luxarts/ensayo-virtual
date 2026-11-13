@@ -1,4 +1,5 @@
 #include "client/Settings.h"
+#include "core/Project.h"
 
 namespace ensayo
 {
@@ -34,6 +35,9 @@ public:
             s.hostPort = 22150;
             s.lastLink = "ensayo://192.168.1.10:22140/ABC234";
             s.ytDlpPath = "C:\\tools\\yt-dlp.exe";
+            s.userId = newId();
+            s.calibration = { { calibrationKey ("MiniFuse ASIO Driver", 256), 37 }, { calibrationKey ("Fake Audio", 64), -12 } };
+            s.lastProject = "C:\\projects\\abc";
 
             const auto file = juce::File::createTempFile (".json");
             expect (saveSettings (s, file));
@@ -41,9 +45,59 @@ public:
             file.deleteFile();
         }
 
-        beginTest ("missing file gives defaults");
-        expectSame (loadSettings (juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ensayo-does-not-exist.json")),
-                    AppSettings());
+        beginTest ("missing file gives defaults plus a new user id, saved at once");
+        {
+            const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ensayo-does-not-exist.json");
+            file.deleteFile();
+            auto loaded = loadSettings (file);
+            expect (isValidId (loaded.userId), "no user id: " + loaded.userId);
+            expect (file.existsAsFile(), "the new user id was not written back");
+            expectEquals (loadSettings (file).userId, loaded.userId);
+            loaded.userId.clear();
+            expectSame (loaded, AppSettings());
+            file.deleteFile();
+        }
+
+        beginTest ("userId is generated once and stable across loads; an old file keeps its other fields");
+        {
+            const auto file = juce::File::createTempFile (".json");
+            file.replaceWithText (R"({ "name": "Ana", "bufferSize": 128, "hostPort": 22150 })");   // pre-userId settings file
+            const auto first = loadSettings (file);
+            expect (isValidId (first.userId));
+            expectEquals (first.name, juce::String ("Ana"));
+            expectEquals (first.bufferSize, 128);
+            expectEquals (first.hostPort, 22150);
+            expect (first.calibration.empty() && first.lastProject.isEmpty());
+
+            for (int i = 0; i < 3; ++i)
+                expectEquals (loadSettings (file).userId, first.userId);
+
+            auto changed = first;
+            changed.name = "Ana B";
+            expect (saveSettings (changed, file));
+            expectEquals (loadSettings (file).userId, first.userId);
+            file.deleteFile();
+        }
+
+        beginTest ("calibration map round trip and key format");
+        {
+            expectEquals (calibrationKey ("MiniFuse ASIO Driver", 256), juce::String ("MiniFuse ASIO Driver@256"));
+            AppSettings s;
+            s.userId = newId();
+            s.calibration[calibrationKey ("A", 64)] = 0;
+            s.calibration[calibrationKey ("A", 256)] = 41;
+            s.calibration[calibrationKey ("B@x", 128)] = -7;
+            const auto back = fromJson (toJson (s));
+            expect (back.calibration == s.calibration);
+            expect (fromJson (R"({ "calibration": { "A@64": "bad", "A@128": 5 } })").calibration
+                    == std::map<juce::String, int> { { "A@128", 5 } });
+        }
+
+        beginTest ("defaults: buffer 256, an invalid userId is dropped");
+        {
+            expectEquals (AppSettings().bufferSize, 256);
+            expect (fromJson (R"({ "userId": "not-an-id" })").userId.isEmpty());
+        }
 
         beginTest ("invalid JSON gives defaults");
         expectSame (fromJson ("{ not json"), AppSettings());
@@ -96,6 +150,9 @@ private:
         expectEquals (a.hostPort, b.hostPort);
         expectEquals (a.lastLink, b.lastLink);
         expectEquals (a.ytDlpPath, b.ytDlpPath);
+        expectEquals (a.userId, b.userId);
+        expect (a.calibration == b.calibration);
+        expectEquals (a.lastProject, b.lastProject);
     }
 };
 

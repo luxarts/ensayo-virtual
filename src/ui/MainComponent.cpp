@@ -1,5 +1,7 @@
 ﻿#include "ui/MainComponent.h"
-#include "ui/AudioDiagnosis.h"
+#include "ui/Text.h"
+#include "core/MixMath.h"
+#include <cmath>
 
 namespace ensayo
 {
@@ -22,11 +24,24 @@ namespace
         return dir;
     }
 
-    ChannelGain combinedMonitor (const ChannelGain& voice, const ChannelGain& instrument)
+    juce::String percentText (float fraction)
     {
-        return { voice.muted ? minFaderDb : voice.voiceDb,
-                 instrument.muted ? minFaderDb : instrument.instrumentDb,
-                 voice.muted && instrument.muted };
+        return juce::String (juce::jlimit (0, 100, juce::roundToInt (fraction * 100.0f))) + " %";
+    }
+
+    // Synthetic waveform for the demo session.
+    std::vector<Peak> demoPeaks (int count, float seed)
+    {
+        std::vector<Peak> out;
+        out.reserve ((size_t) count);
+
+        for (int i = 0; i < count; ++i)
+        {
+            const float a = 0.15f + 0.7f * std::abs (std::sin ((float) i * 0.013f + seed)) * (0.5f + 0.5f * std::sin ((float) i * 0.11f + seed));
+            out.push_back ({ -a, a * 0.9f });
+        }
+
+        return out;
     }
 }
 
@@ -42,14 +57,15 @@ StatusBar::StatusBar()
 
     retry.setName ("status.retry");
     retry.setButtonText ("Reintentar");
+    retry.setWantsKeyboardFocus (false);
     retry.onClick = [this] { if (onRetry) onRetry(); };
     addAndMakeVisible (retry);
 
-    const std::pair<juce::Label*, const char*> numbers[] = {
-        { &ping, "status.ping" }, { &jitter, "status.jitter" }, { &latency, "status.latency" },
-        { &loss, "status.loss" }, { &cpu, "status.cpu" } };
+    const std::pair<juce::Label*, const char*> labels[] = {
+        { &sync, "status.sync" }, { &ping, "status.ping" }, { &transfers, "status.transfers" },
+        { &device, "status.device" }, { &cpu, "status.cpu" } };
 
-    for (auto& [label, name] : numbers)
+    for (auto& [label, name] : labels)
     {
         label->setName (name);
         label->setJustificationType (juce::Justification::centred);
@@ -58,7 +74,7 @@ StatusBar::StatusBar()
         addChildComponent (*label);
     }
 
-    setNumbers (-1, 0, 0, 0.0, 0.0, 0.0);
+    setSession ({}, false, -1, 0, 0, {}, 0.0);
 }
 
 void StatusBar::paint (juce::Graphics& g)
@@ -72,7 +88,7 @@ void StatusBar::setSessionMode (bool enabled)
 {
     sessionMode = enabled;
 
-    for (auto* l : { &ping, &jitter, &latency, &loss, &cpu })
+    for (auto* l : { &sync, &ping, &transfers, &device, &cpu })
         l->setVisible (enabled);
 
     resized();
@@ -85,12 +101,15 @@ void StatusBar::setMessage (const juce::String& message, bool isError, bool show
     retry.setEnabled (showRetry);
 }
 
-void StatusBar::setNumbers (int pingMs, int clientBlocks, int serverBlocks, double latencyMs, double lossPercent, double cpuPercent)
+void StatusBar::setSession (const juce::String& syncText, bool readOnly, int pingMs, int uploads, int downloads,
+                            const juce::String& deviceText, double cpuPercent)
 {
+    sync.setText (syncText, juce::dontSendNotification);
+    sync.setColour (juce::Label::textColourId, readOnly ? juce::Colours::orange : juce::Colour (0xff8fd19e));
     ping.setText (pingMs < 0 ? juce::String ("Ping: --") : "Ping: " + juce::String (pingMs) + " ms", juce::dontSendNotification);
-    jitter.setText ("Jitter: " + juce::String (clientBlocks) + "/" + juce::String (serverBlocks), juce::dontSendNotification);
-    latency.setText ("Latencia est.: " + juce::String (juce::roundToInt (latencyMs)) + " ms", juce::dontSendNotification);
-    loss.setText (ES ("Pérdida: ") + juce::String (lossPercent, 1) + " %", juce::dontSendNotification);
+    transfers.setText ("Subidas: " + juce::String (uploads) + ES (" \xC2\xB7 Descargas: ") + juce::String (downloads),
+                       juce::dontSendNotification);
+    device.setText (deviceText, juce::dontSendNotification);
     cpu.setText ("CPU: " + juce::String (juce::roundToInt (cpuPercent)) + " %", juce::dontSendNotification);
 }
 
@@ -100,8 +119,8 @@ void StatusBar::resized()
 
     if (sessionMode)
     {
-        const int widths[] = { 90, 90, 140, 110, 80 };
-        juce::Label* labels[] = { &ping, &jitter, &latency, &loss, &cpu };
+        const int widths[] = { 210, 90, 180, 200, 80 };
+        juce::Label* labels[] = { &sync, &ping, &transfers, &device, &cpu };
 
         for (int i = 4; i >= 0; --i)
         {
@@ -133,6 +152,16 @@ PluginWindow::PluginWindow (juce::AudioPluginInstance& plugin, std::function<voi
 }
 
 //==============================================================================
+juce::File MainComponent::projectsRoot()
+{
+    return testMode ? tempFolder().getChildFile ("test-projects") : defaultProjectsDirectory();
+}
+
+juce::File MainComponent::cacheRoot()
+{
+    return testMode ? tempFolder().getChildFile ("test-cache") : defaultCacheRoot();
+}
+
 MainComponent::MainComponent()
 {
     setName ("main");
@@ -142,33 +171,19 @@ MainComponent::MainComponent()
                             : defaultSettingsFile();
     settings = loadSettings (settingsFile);
 
-    // The hook stays installed for the lifetime of the engine (device reopens keep it); it only ticks while an
-    // embedded host is active. Handshake with detachHostFromAudioThread(): the flag is raised BEFORE the pointer
-    // is read, and the message thread clears the pointer BEFORE it waits on the flag (both seq_cst), so either
-    // this call sees nullptr or the teardown sees the flag and waits for tick() to return.
-    engine.setFrameHook ([this]
-    {
-        hookTicking.store (true, std::memory_order_seq_cst);
-
-        if (auto* h = activeHost.load (std::memory_order_seq_cst))
-            h->tick();
-
-        hookTicking.store (false, std::memory_order_release);
-    });
-
     addAndMakeVisible (lobby);
-    addChildComponent (session);
+    addChildComponent (daw);
     addAndMakeVisible (status);
     status.onRetry = [this] { retry(); };
+    daw.setPeaksProvider (this);
 
     wireLobby();
     wireSession();
-    wireClient();
+    wireDaw();
 
-    engine.setRole (settings.role);
     engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
-    engine.setReceiveGain (settings.receiveDb);
     applyMonitorFromSettings();
+    session.setMetronome (click, countIn);
 
     scanPlugins();
 
@@ -183,11 +198,12 @@ MainComponent::MainComponent()
     {
         lobby.deviceBox.clear (juce::dontSendNotification);
         refreshDeviceCombos();
+        applyCalibrationFromSettings();
         setStatus ("Modo de prueba: sin dispositivo de audio");
     }
 
     showLobby();
-    startTimerHz (30);
+    startTimer (50);
     setSize (1100, 760);
 }
 
@@ -196,16 +212,15 @@ MainComponent::~MainComponent()
     stopTimer();
     pluginWindow = nullptr;
     importer.cancel();
-    client.onStateChanged = nullptr;
-    client.onError = nullptr;
-    client.onJoined = nullptr;
+    importer.onProgress = nullptr;
+    importer.onFinished = nullptr;
+    importer.onError = nullptr;
 
-    // Audio thread first: nothing may be inside processFrame (transport → client, hook → host) once the device
-    // is closed, so the client's threads and the host can be stopped and the members destroyed safely after.
-    detachHostFromAudioThread();
-    engine.setTransport (nullptr);
+    // A running take is finished (its finish intent persists), threads are joined and the client and host go away
+    // while the engine (and its device) still exist.
+    session.leave();
+    daw.setPeaksProvider (nullptr);
     engine.getDeviceManager().closeAudioDevice();
-    teardownConnection();
     saveSettingsNow();   // settings also persist on change, debounced 1 s in timerCallback
 }
 
@@ -219,7 +234,7 @@ void MainComponent::resized()
     auto area = getLocalBounds();
     status.setBounds (area.removeFromBottom (30));
     lobby.setBounds (area);
-    session.setBounds (area);
+    daw.setBounds (area);
 }
 
 //==============================================================================
@@ -241,33 +256,14 @@ void MainComponent::saveSettingsNow()
     saveSettings (settings, settingsFile);
 }
 
-// The address other people on the LAN can reach: a private (RFC 1918) IPv4 first, then any other routable IPv4.
-// Link-local 169.254.x.x comes from adapters without a network (virtual switches, unplugged ports) and is never useful.
-juce::String MainComponent::firstLanAddress()
+SessionIdentity MainComponent::identity() const
 {
-    juce::String fallback;
+    return { settings.userId, settings.name, cacheRoot() };
+}
 
-    for (const auto& address : juce::IPAddress::getAllAddresses (false))
-    {
-        if (address.isIPv6 || address == juce::IPAddress::local())
-            continue;
-
-        const auto text = address.toString();
-        const auto a = address.address[0], b = address.address[1];
-
-        if (text == "0.0.0.0" || (a == 169 && b == 254))
-            continue;
-
-        const bool isPrivate = (a == 10) || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31);
-
-        if (isPrivate)
-            return text;
-
-        if (fallback.isEmpty())
-            fallback = text;
-    }
-
-    return fallback.isNotEmpty() ? fallback : "127.0.0.1";
+juce::String MainComponent::deviceKey() const
+{
+    return calibrationKey (settings.deviceName, settings.bufferSize);
 }
 
 //==============================================================================
@@ -280,14 +276,15 @@ void MainComponent::wireLobby()
     lobby.roleBox.onChange = [this]
     {
         settings.role = LobbyView::roleFromId (lobby.roleBox.getSelectedId());
-        engine.setRole (settings.role);
         markSettingsDirty();
     };
 
     lobby.linkEditor.setText (settings.lastLink, juce::dontSendNotification);
-    lobby.createButton.onClick = [this] { createSession(); };
+    lobby.createButton.onClick = [this] { createProject(); };
+    lobby.openButton.onClick = [this] { chooseProjectToOpen(); };
     lobby.joinButton.onClick = [this] { joinFromLinkField(); };
     lobby.linkEditor.onReturnKey = [this] { joinFromLinkField(); };
+    lobby.calibrateButton.onClick = [this] { startCalibration(); };
 
     lobby.deviceBox.onChange = [this]
     {
@@ -319,7 +316,7 @@ void MainComponent::wireLobby()
 
     lobby.panelButton.onClick = [this]
     {
-        if (auto* device = engine.getDevice())
+        if (auto* device = engine.getDeviceManager().getCurrentAudioDevice())
         {
             if (device->hasControlPanel() && device->showControlPanel())
                 openAudioFromSettings();
@@ -342,7 +339,7 @@ void MainComponent::wireLobby()
 
     lobby.browseButton.onClick = [this]
     {
-        chooser = std::make_unique<juce::FileChooser> (ES ("Elegí un plugin VST3"), vst3Folder(), "*.vst3");
+        chooser = std::make_unique<juce::FileChooser> (ES ("Eleg\xC3\xAD un plugin VST3"), vst3Folder(), "*.vst3");
         chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
                                   | juce::FileBrowserComponent::canSelectDirectories,
                               [this] (const juce::FileChooser& fc)
@@ -369,13 +366,17 @@ void MainComponent::applyLobbyToSettings()
 {
     settings.name = lobby.nameEditor.getText().trim();
     settings.role = LobbyView::roleFromId (lobby.roleBox.getSelectedId());
-    engine.setRole (settings.role);
+}
+
+void MainComponent::applyMonitorFromSettings()
+{
+    engine.setMonitor (settings.monitorVoiceMuted ? 0.0f : dbToGain (settings.monitorVoiceDb),
+                       settings.monitorInstrumentMuted ? 0.0f : dbToGain (settings.monitorInstrumentDb));
 }
 
 void MainComponent::openAudioFromSettings()
 {
     deviceOpen = false;
-    audioError = false;
 
     const auto names = engine.getAsioDeviceNames();
     lobby.deviceBox.clear (juce::dontSendNotification);
@@ -386,6 +387,7 @@ void MainComponent::openAudioFromSettings()
     if (names.isEmpty())
     {
         refreshDeviceCombos();
+        applyCalibrationFromSettings();
         setStatus ("No se encontraron drivers ASIO", true, true);
         return;
     }
@@ -395,33 +397,39 @@ void MainComponent::openAudioFromSettings()
 
     lobby.deviceBox.setSelectedId (names.indexOf (settings.deviceName) + 1, juce::dontSendNotification);
 
-    const auto error = engine.openDevice ("ASIO", settings.deviceName, settings.sampleRate, settings.bufferSize);
+    // The studio runs at 48 kHz only (spec: global constraints); any buffer size.
+    const auto error = engine.openDevice ("ASIO", settings.deviceName, (double) sampleRate, settings.bufferSize);
 
     if (error.isNotEmpty())
     {
-        audioError = true;
         refreshDeviceCombos();
+        applyCalibrationFromSettings();
         setStatus ("Error de audio: " + error, true, true);
         return;
     }
 
     deviceOpen = true;
-    refreshDeviceCombos();
 
-    if (auto* device = engine.getDevice())
+    if (auto* device = engine.getDeviceManager().getCurrentAudioDevice())
     {
         settings.sampleRate = device->getCurrentSampleRate();
         settings.bufferSize = device->getCurrentBufferSizeSamples();
     }
 
+    refreshDeviceCombos();
+    applyCalibrationFromSettings();
     engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
-    setStatus ("Audio: " + settings.deviceName + " @ " + juce::String ((int) settings.sampleRate) + " Hz, "
-               + juce::String (settings.bufferSize) + " muestras");
+
+    if ((int) settings.sampleRate != sampleRate)
+        setStatus ("El dispositivo funciona a " + juce::String ((int) settings.sampleRate)
+                   + " Hz: cambialo a 48000 Hz en el Panel ASIO", true, true);
+    else
+        setStatus ("Audio: " + settings.deviceName + " @ 48000 Hz, " + juce::String (settings.bufferSize) + " muestras");
 }
 
 void MainComponent::refreshDeviceCombos()
 {
-    auto* device = engine.getDevice();
+    auto* device = engine.getDeviceManager().getCurrentAudioDevice();
 
     lobby.rateBox.clear (juce::dontSendNotification);
     lobby.bufferBox.clear (juce::dontSendNotification);
@@ -429,16 +437,21 @@ void MainComponent::refreshDeviceCombos()
     lobby.instrumentBox.clear (juce::dontSendNotification);
     lobby.outputBox.clear (juce::dontSendNotification);
 
+    lobby.rateBox.addItem ("48000 Hz", 1);
+    lobby.rateBox.setSelectedId (1, juce::dontSendNotification);
+
     if (device == nullptr)
     {
-        lobby.rateBox.addItem ("48000 Hz", 1);
-        lobby.rateBox.setSelectedId (1, juce::dontSendNotification);
-        const int sizes[] = { 64, 128, 256 };
+        const int sizes[] = { 64, 128, 256, 512 };
 
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 4; ++i)
+        {
             lobby.bufferBox.addItem (juce::String (sizes[i]), i + 1);
 
-        lobby.bufferBox.setSelectedId (settings.bufferSize == 64 ? 1 : (settings.bufferSize == 256 ? 3 : 2), juce::dontSendNotification);
+            if (sizes[i] == settings.bufferSize)
+                lobby.bufferBox.setSelectedId (i + 1, juce::dontSendNotification);
+        }
+
         lobby.micBox.addItem ("Entrada " + juce::String (settings.micChannel + 1), settings.micChannel + 1);
         lobby.micBox.setSelectedId (settings.micChannel + 1, juce::dontSendNotification);
         lobby.instrumentBox.addItem ("Entrada " + juce::String (settings.instrumentChannel + 1), settings.instrumentChannel + 1);
@@ -447,16 +460,6 @@ void MainComponent::refreshDeviceCombos()
         lobby.outputBox.setSelectedId (settings.outputPair + 1, juce::dontSendNotification);
         lobby.latencyLabel.setText ("Latencia: --", juce::dontSendNotification);
         return;
-    }
-
-    const auto rates = device->getAvailableSampleRates();
-
-    for (int i = 0; i < rates.size(); ++i)
-    {
-        lobby.rateBox.addItem (juce::String ((int) rates[i]) + " Hz", i + 1);
-
-        if ((int) rates[i] == (int) device->getCurrentSampleRate())
-            lobby.rateBox.setSelectedId (i + 1, juce::dontSendNotification);
     }
 
     const auto sizes = device->getAvailableBufferSizes();
@@ -487,38 +490,87 @@ void MainComponent::refreshDeviceCombos()
 
     lobby.outputBox.setSelectedId (juce::jlimit (0, outputs.size() / 2, settings.outputPair + 1), juce::dontSendNotification);
 
-    const double inMs = device->getInputLatencyInSamples() * 1000.0 / device->getCurrentSampleRate();
-    const double outMs = device->getOutputLatencyInSamples() * 1000.0 / device->getCurrentSampleRate();
-    lobby.latencyLabel.setText ("Latencia ASIO: " + juce::String (inMs, 1) + " ms entrada / " + juce::String (outMs, 1) + " ms salida",
+    const double rate = juce::jmax (1.0, device->getCurrentSampleRate());
+    lobby.latencyLabel.setText ("Latencia ASIO: " + juce::String (device->getInputLatencyInSamples() * 1000.0 / rate, 1) + " ms entrada / "
+                                + juce::String (device->getOutputLatencyInSamples() * 1000.0 / rate, 1) + " ms salida",
                                 juce::dontSendNotification);
 }
 
 void MainComponent::applyAudioSelection()
 {
-    auto* device = engine.getDevice();
+    auto* device = engine.getDeviceManager().getCurrentAudioDevice();
+    const int bufferId = lobby.bufferBox.getSelectedId();
 
     if (device == nullptr)
     {
-        const int id = lobby.bufferBox.getSelectedId();
-        settings.bufferSize = id == 1 ? 64 : (id == 3 ? 256 : 128);
+        const int sizes[] = { 64, 128, 256, 512 };
+
+        if (bufferId >= 1 && bufferId <= 4)
+            settings.bufferSize = sizes[bufferId - 1];
+
         markSettingsDirty();
+        applyCalibrationFromSettings();
         return;
     }
 
-    const auto rates = device->getAvailableSampleRates();
     const auto sizes = device->getAvailableBufferSizes();
-    const int rateId = lobby.rateBox.getSelectedId(), bufferId = lobby.bufferBox.getSelectedId();
-
-    if (rateId >= 1 && rateId <= rates.size())
-        settings.sampleRate = rates[rateId - 1];
 
     if (bufferId >= 1 && bufferId <= sizes.size())
         settings.bufferSize = sizes[bufferId - 1];
 
     markSettingsDirty();
 
-    if (settings.sampleRate != device->getCurrentSampleRate() || settings.bufferSize != device->getCurrentBufferSizeSamples())
+    if (settings.bufferSize != device->getCurrentBufferSizeSamples())
         openAudioFromSettings();
+}
+
+void MainComponent::applyCalibrationFromSettings()
+{
+    const auto it = settings.calibration.find (deviceKey());
+    const auto value = it != settings.calibration.end() ? std::optional<int> (it->second) : std::nullopt;
+    session.setCalibration (value.value_or (0));
+    lobby.setCalibration (value);
+}
+
+void MainComponent::startCalibration()
+{
+    if (! deviceOpen || engine.getDeviceManager().getCurrentAudioDevice() == nullptr)
+    {
+        setStatus (ES ("Abr\xC3\xAD un dispositivo ASIO antes de calibrar"), true, false);
+        return;
+    }
+
+    if (calibrating || session.isRecording())
+        return;
+
+    calibrating = true;
+    lobby.calibrateButton.setEnabled (false);
+    engine.startCalibration();
+    setStatus (ES ("Calibrando\xE2\x80\xA6 Conect\xC3\xA1 la salida a la entrada del micr\xC3\xB3" "fono (8 clicks, unos 5 s)"));
+}
+
+void MainComponent::pollCalibration()
+{
+    if (! calibrating || engine.isCalibrating())
+        return;
+
+    calibrating = false;
+    lobby.calibrateButton.setEnabled (true);
+    auto* device = engine.getDeviceManager().getCurrentAudioDevice();
+    const auto roundTrip = engine.calibrationRoundTrip();
+
+    if (! roundTrip || device == nullptr)
+    {
+        setStatus (ES ("No se detectaron los clicks en la entrada: revis\xC3\xA1 el cable o el loopback y el canal de micr\xC3\xB3" "fono"),
+                   true, false);
+        return;
+    }
+
+    const int value = LatencyCalibrator::calibrationFor (*roundTrip, device->getInputLatencyInSamples(), device->getOutputLatencyInSamples());
+    settings.calibration[deviceKey()] = value;
+    markSettingsDirty();
+    applyCalibrationFromSettings();
+    setStatus (ES ("Calibraci\xC3\xB3n: ") + juce::String (value) + " muestras (ida y vuelta " + juce::String (*roundTrip) + ")");
 }
 
 //==============================================================================
@@ -538,7 +590,7 @@ void MainComponent::scanPlugins()
 void MainComponent::loadPlugin (const juce::File& file)
 {
     const bool reloadSameState = file == juce::File (settings.pluginFile);
-    const auto result = engine.getPluginSlot().load (file, settings.sampleRate, settings.bufferSize,
+    const auto result = engine.getPluginSlot().load (file, (double) sampleRate, settings.bufferSize,
                                                      reloadSameState ? settings.pluginState : juce::String());
 
     if (result.failed())
@@ -591,6 +643,10 @@ void MainComponent::togglePluginEditor()
             }
         });
     }
+    else if (inSession)
+    {
+        setStatus (ES ("No hay un plugin VST cargado: elegilo en el lobby"), true, false);
+    }
 
     updatePluginButtons();
 }
@@ -602,237 +658,103 @@ void MainComponent::updatePluginButtons()
     lobby.removeButton.setEnabled (loaded);
     lobby.bypassButton.setEnabled (loaded);
     lobby.editorButton.setButtonText (pluginWindow != nullptr ? "Cerrar editor" : "Abrir editor");
-    session.setPluginEditorState (loaded, pluginWindow != nullptr);
 }
 
 //==============================================================================
-void MainComponent::wireSession()
-{
-    session.onToggleEditor = [this] { togglePluginEditor(); };
-
-    session.onCopyLink = [this]
-    {
-        juce::SystemClipboard::copyTextToClipboard (currentLink);
-        setStatus ("Link copiado al portapapeles");
-    };
-
-    session.onLeave = [this] { leaveSession(); };
-
-    session.onMonitorChanged = [this] (const ChannelGain& voice, const ChannelGain& instrument)
-    {
-        settings.monitorVoiceDb = voice.voiceDb;
-        settings.monitorVoiceMuted = voice.muted;
-        settings.monitorInstrumentDb = instrument.instrumentDb;
-        settings.monitorInstrumentMuted = instrument.muted;
-        engine.setMonitor (combinedMonitor (voice, instrument));
-        markSettingsDirty();
-    };
-
-    session.onParticipantGain = [this] (uint32_t id, const ChannelGain& gain) { queueGain (id, gain); };
-
-    session.onTrackGain = [this] (const ChannelGain& gain)
-    {
-        settings.trackDb = gain.voiceDb;
-        settings.trackMuted = gain.muted;
-        markSettingsDirty();
-        queueGain (0, gain);
-    };
-
-    session.onTransport = [this] (const juce::String& cmd, int64_t position, bool loop)
-    {
-        if (demoMode)
-        {
-            auto s = session.getState();
-
-            if (cmd == "play")       s.transport.playing = true;
-            else if (cmd == "pause") s.transport.playing = false;
-            else if (cmd == "stop")  { s.transport.playing = false; s.transport.position = 0; }
-            else if (cmd == "seek")  s.transport.position = position;
-            else if (cmd == "loop")  s.transport.loop = loop;
-
-            session.setState (s);
-            return;
-        }
-
-        client.sendTransport (cmd, position, loop);
-    };
-
-    session.onLoadFile = [this] { chooseTrackFile(); };
-    session.onDownload = [this] (const juce::String& url) { downloadTrack (url); };
-
-    importer.onProgress = [this] (float fraction) { session.setUploadProgress (ES ("Descargando…"), fraction); };
-    importer.onFinished = [this] (const juce::File& file)
-    {
-        session.setUploadProgress ("Subiendo " + file.getFileName(), 0.0f);
-        client.uploadTrack (file);
-    };
-    importer.onError = [this] (const juce::String& message)
-    {
-        session.setUploadProgress ("", 0.0f);
-        setStatus ("yt-dlp: " + message, true, false);
-    };
-}
-
-void MainComponent::wireClient()
-{
-    client.onJoined = [this]
-    {
-        setConnecting (false);
-        const auto& s = client.getState();
-        juce::String frameNote;
-
-        // Must happen before the transport is attached: a 64-sample client in a 128-sample session would send
-        // packets the server rejects and decode the mix with the wrong frame size (silence, no message).
-        if (! matchSessionFrameSize (s.frameSize, frameNote))
-            return;
-
-        engine.setTransport (&client);
-        SessionLink link { host != nullptr ? firstLanAddress() : s.host, s.port, s.sessionId };
-        currentLink = link.toString();
-        settings.lastLink = currentLink;
-        lobby.linkEditor.setText (currentLink, juce::dontSendNotification);
-        markSettingsDirty();
-
-        const auto hint = host != nullptr
-            ? ES ("Compartí este link con tu banda. Si están fuera de tu red, abrí el puerto UDP/TCP ") + juce::String (s.port) + " en tu router."
-            : ES ("Conectado a ") + s.host + ":" + juce::String (s.port);
-
-        session.setLink (currentLink, hint);
-        session.setState (s);
-        sessionStartMs = juce::Time::getMillisecondCounter();
-        participantSeenMs.clear();
-        lastDiagnosis.clear();
-        lastMixCount = 0;
-        lastMixChangeMs = 0;
-        showSession();
-        setStatus ((host != nullptr ? ES ("Sesión creada: ") + s.sessionId : ES ("Conectado a la sesión ") + s.sessionId)
-                   + (frameNote.isNotEmpty() ? ". " + frameNote : juce::String()));
-        queueGain (0, { settings.trackDb, settings.trackDb, settings.trackMuted });
-        flushGains (true);
-    };
-
-    client.onStateChanged = [this] (const SessionState& s)
-    {
-        if (inSession && ! demoMode)
-            session.setState (s);
-    };
-
-    client.onError = [this] (const juce::String& message)
-    {
-        teardownConnection();
-        showLobby();
-        setStatus (message, true, true);
-    };
-}
-
 void MainComponent::setConnecting (bool pending)
 {
     connecting = pending;
     lobby.createButton.setEnabled (! pending);
+    lobby.openButton.setEnabled (! pending);
     lobby.joinButton.setEnabled (! pending);
 }
 
-FrameSize MainComponent::localFrameSize() const noexcept
+void MainComponent::createProject()
 {
-    if (deviceOpen && engine.getDevice() != nullptr)
-        return engine.getFrameSize();
-
-    return settings.bufferSize == 64 ? FrameSize::f64 : FrameSize::f128;
+    const auto dir = projectsRoot().getChildFile (newId());
+    hostProject (dir);
 }
 
-bool MainComponent::matchSessionFrameSize (FrameSize wanted, juce::String& note)
+void MainComponent::chooseProjectToOpen()
 {
-    if (localFrameSize() == wanted)
-        return true;
+    const auto projects = listProjects (projectsRoot());
+    juce::PopupMenu menu;
+    std::vector<juce::File> dirs;
 
-    const int samples = frameSamples (wanted);
-    settings.bufferSize = samples;
-    markSettingsDirty();
-    note = "Buffer ajustado a " + juce::String (samples) + ES (" muestras para coincidir con la sesión");
-
-    // Test mode, no device open yet, or the fake device: only the setting changes (used on the next open).
-    if (testMode || ! deviceOpen || engine.getDevice() == nullptr || engine.getFakeDevice() != nullptr)
+    for (const auto& dir : projects)
     {
-        refreshDeviceCombos();
-        return true;
+        juce::String error;
+        const auto parsed = projectFromJson (dir.getChildFile ("project.json").loadFileAsString(), error);
+
+        if (! parsed)
+            continue;
+
+        dirs.push_back (dir);
+        const auto when = dir.getChildFile ("project.json").getLastModificationTime().formatted ("%d/%m/%Y %H:%M");
+        menu.addItem ((int) dirs.size(), parsed->name + "  (" + when + ")");
     }
 
-    // Same device and rate, new block size. The frame hook is a member of the engine and survives the reopen;
-    // audioDeviceAboutToStart rebuilds the codecs for the new size before the first callback.
-    const auto error = engine.openDevice ("ASIO", settings.deviceName, settings.sampleRate, samples);
+    if (dirs.empty())
+        menu.addItem (-2, "No hay proyectos guardados", false);
 
-    if (error.isNotEmpty())
-    {
-        audioError = true;
-        deviceOpen = false;
-        refreshDeviceCombos();
-        teardownConnection();
-        showLobby();
-        setStatus ("No se pudo ajustar el buffer a " + juce::String (samples) + " muestras: " + error, true, true);
-        return false;
-    }
+    menu.addSeparator();
+    menu.addItem (-1, ES ("Buscar project.json en otra carpeta\xE2\x80\xA6"));
 
-    deviceOpen = true;
-    audioError = false;
-    refreshDeviceCombos();
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&lobby.openButton),
+                        [safe = juce::Component::SafePointer<MainComponent> (this), dirs] (int result)
+                        {
+                            if (safe == nullptr || result == 0)
+                                return;
 
-    if (auto* device = engine.getDevice())
-    {
-        settings.sampleRate = device->getCurrentSampleRate();
-        settings.bufferSize = device->getCurrentBufferSizeSamples();
-    }
+                            if (result > 0 && result <= (int) dirs.size())
+                            {
+                                safe->hostProject (dirs[(size_t) result - 1]);
+                                return;
+                            }
 
-    engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
+                            if (result != -1)
+                                return;
 
-    if (engine.getFrameSize() != wanted)   // the driver kept its own block size (e.g. fixed at 256 for a 64 session)
-    {
-        teardownConnection();
-        showLobby();
-        setStatus ("El dispositivo no admite bloques de " + juce::String (samples) + ES (" muestras (la sesión usa ")
-                   + juce::String (samples) + ES ("); cambialo en el Panel ASIO"), true, true);
-        return false;
-    }
-
-    return true;
+                            safe->chooser = std::make_unique<juce::FileChooser> (ES ("Eleg\xC3\xAD el project.json del proyecto"),
+                                                                                  projectsRoot(), "project.json");
+                            safe->chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                                        [safe] (const juce::FileChooser& fc)
+                                                        {
+                                                            if (safe != nullptr && fc.getResult().existsAsFile())
+                                                                safe->hostProject (fc.getResult().getParentDirectory());
+                                                        });
+                        });
 }
 
-void MainComponent::createSession()
+void MainComponent::hostProject (const juce::File& projectDir)
 {
     applyLobbyToSettings();
 
     if (settings.name.isEmpty())
     {
-        setStatus (ES ("Ingresá tu nombre antes de crear la sesión"), true, false);
+        setStatus (ES ("Ingres\xC3\xA1 tu nombre antes de crear la sesi\xC3\xB3n"), true, false);
         return;
     }
 
-    // Unconditional: a second click while the previous TCP join is still pending must not replace `host` under
-    // the frame hook's feet, nor leave the old client threads running.
-    teardownConnection();
+    if (inSession)
+        leaveSession();
 
-    ServerConfig config;
-    config.tcpPort = config.udpPort = settings.hostPort;
-    config.frameSize = localFrameSize();
-    host = std::make_unique<ServerHost> (config);
-    const auto result = host->start();
+    lastAction = LastAction::host;
+    lastProjectDir = projectDir;
+    const auto newName = "Proyecto " + juce::Time::getCurrentTime().formatted ("%d-%m-%Y %H.%M");
+    const auto result = session.host (projectDir, settings.hostPort, identity(), newName);
 
     if (result.failed())
     {
-        host = nullptr;
-        setStatus ("No se pudo abrir el puerto " + juce::String (settings.hostPort) + ": " + result.getErrorMessage()
-                   + ES (". Probá con otro puerto en la configuración."), true, true);
+        setStatus ("No se pudo abrir el proyecto en el puerto " + juce::String (settings.hostPort) + ": " + result.getErrorMessage(),
+                   true, true);
         return;
     }
 
-    if (engine.getDevice() != nullptr && deviceOpen)
-        activeHost.store (host.get(), std::memory_order_release);
-    else
-        host->startInternalClock();
-
-    lastWasCreate = true;
+    settings.lastProject = projectDir.getFullPathName();
+    markSettingsDirty();
     setConnecting (true);
-    setStatus (ES ("Creando sesión… Conectando…"));
-    client.create ("127.0.0.1", settings.hostPort, settings.name, settings.role);
+    setStatus (ES ("Abriendo el proyecto\xE2\x80\xA6 Conectando\xE2\x80\xA6"));
 }
 
 void MainComponent::joinFromLinkField()
@@ -841,7 +763,7 @@ void MainComponent::joinFromLinkField()
 
     if (! link)
     {
-        setStatus (ES ("Link inválido. Formato: ensayo://host:puerto/ID"), true, false);
+        setStatus (ES ("Link inv\xC3\xA1lido. Formato: ensayo://host:puerto/ID"), true, false);
         return;
     }
 
@@ -855,60 +777,366 @@ void MainComponent::joinFromLink (const SessionLink& link)
     if (settings.name.isEmpty())
         settings.name = "Invitado";
 
-    teardownConnection();   // unconditional, see createSession
+    if (inSession)
+        leaveSession();
 
+    demoMode = false;
     lobby.linkEditor.setText (link.toString(), juce::dontSendNotification);
+    settings.lastLink = link.toString();
+    markSettingsDirty();
+    lastAction = LastAction::join;
     lastJoinLink = link;
-    lastWasCreate = false;
     setConnecting (true);
-    setStatus ("Conectando a " + link.host + ":" + juce::String (link.port) + ES ("…"));
-    client.join (link, settings.name, settings.role);
+    setStatus ("Conectando a " + link.host + ":" + juce::String (link.port) + ES ("\xE2\x80\xA6"));
+    session.join (link, identity());
+}
+
+//==============================================================================
+void MainComponent::wireSession()
+{
+    session.onConnected = [this]
+    {
+        setConnecting (false);
+        const bool reconnected = inSession;
+
+        if (! inSession)
+            showSession();
+
+        const auto p = session.project();
+        setStatus (reconnected ? ES ("Reconectado: sincronizado con el anfitri\xC3\xB3n")
+                               : (session.isHosting() ? ES ("Proyecto abierto: ") : ES ("Conectado a ")) + (p != nullptr ? p->name : juce::String())
+                                     + (session.isHosting() ? ES (". Compart\xC3\xAD el link con tu banda (puerto ")
+                                                                  + juce::String (session.getConnectLink().port) + " abierto en el router si es por internet)."
+                                                            : juce::String()));
+        refreshSessionView();
+    };
+
+    session.onProjectChanged = [this] { if (inSession) refreshSessionView(); };
+
+    session.onDisconnected = [this] (const juce::String& reason)
+    {
+        if (! inSession)
+        {
+            abandonConnection (reason);
+            return;
+        }
+
+        // Spec §8: read-only until the user reconnects; a take in progress keeps recording locally.
+        setStatus (ES ("S\xC3\xB3lo lectura: host desconectado (") + reason + ES ("). Toc\xC3\xA1 Reintentar para reconectar."), true, true);
+        refreshSessionView();
+    };
+
+    session.onError = [this] (const juce::String& message)
+    {
+        if (! session.hasConnected())
+        {
+            abandonConnection (message);   // the connection or the join failed before any welcome
+            return;
+        }
+
+        setStatus (message, true, ! session.isConnected());
+    };
+
+    session.onRejected = [this] (const juce::String& reason) { setStatus (ES ("Operaci\xC3\xB3n rechazada: ") + reason, true, false); };
+    session.onImportProgress = [this] (const juce::String& name, float fraction)
+    {
+        setStatus ("Importando " + name + ": " + percentText (fraction));
+    };
+    session.onImportFinished = [this] (const juce::String& name, const juce::Result& result)
+    {
+        if (result.wasOk())
+            setStatus ("Importado: " + name + ES (" (se sube en segundo plano)"));
+        else
+            setStatus (result.getErrorMessage(), true, false);
+    };
+    session.onExportProgress = [this] (float fraction) { setStatus ("Exportando la mezcla: " + percentText (fraction)); };
+    session.onExportFinished = [this] (const juce::File& file, const juce::Result& result)
+    {
+        if (result.wasOk())
+            setStatus ("Mezcla exportada: " + file.getFullPathName());
+        else
+            setStatus ("No se pudo exportar: " + result.getErrorMessage(), true, false);
+    };
+    session.onTakeAborted = [this] (const juce::String& reason) { setStatus (reason, true, false); };
+
+    importer.onProgress = [this] (float fraction) { setStatus ("Descargando de YouTube: " + percentText (fraction)); };
+    importer.onFinished = [this] (const juce::File& file)
+    {
+        if (! inSession || demoMode)
+            return;
+
+        if (const auto result = session.importFile (file, file.getFileNameWithoutExtension()); result.failed())
+            setStatus (result.getErrorMessage(), true, false);
+    };
+    importer.onError = [this] (const juce::String& message) { setStatus ("yt-dlp: " + message, true, false); };
+}
+
+// Called from inside a ProjectClient callback: the client is destroyed on the next message, not under its own call.
+void MainComponent::abandonConnection (const juce::String& message)
+{
+    setConnecting (false);
+    showLobby();
+    setStatus (message, true, true);
+
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<MainComponent> (this)]
+    {
+        if (safe != nullptr && ! safe->inSession && ! safe->connecting)
+            safe->session.leave();
+    });
+}
+
+void MainComponent::wireDaw()
+{
+    daw.onOp = [this] (const juce::var& op)
+    {
+        if (demoMode)
+        {
+            if (const auto r = applyOp (*demoProject, op, demoState.me); ! r.ok)
+                setStatus (ES ("Operaci\xC3\xB3n rechazada: ") + r.error, true, false);
+
+            demoState.project = std::make_shared<const Project> (*demoProject);
+            daw.setState (demoState);
+            return;
+        }
+
+        if (auto* c = session.getClient())
+            c->sendOp (op);
+    };
+
+    daw.onPlay = [this]
+    {
+        if (demoMode) { demoState.playing = true; daw.setState (demoState); return; }
+        if (! session.isRecording()) engine.play();
+    };
+
+    daw.onStop = [this]
+    {
+        if (demoMode) { demoState.playing = false; demoState.recording = false; daw.setState (demoState); return; }
+
+        if (session.isRecording())
+            stopTake();
+        else
+            engine.stop();
+    };
+
+    daw.onRecord = [this] { recordOrStop(); };
+
+    daw.onHome = [this]
+    {
+        if (demoMode) { demoState.playhead = 0; daw.setState (demoState); return; }
+        engine.setPosition (0);
+    };
+
+    daw.onSeek = [this] (int64_t position)
+    {
+        if (demoMode) { demoState.playhead = juce::jmax ((int64_t) 0, position); daw.setState (demoState); return; }
+        engine.setPosition (juce::jmax ((int64_t) 0, position));
+    };
+
+    daw.onArm = [this] (const Id& track) { armedTrack = track; if (demoMode) { demoState.armedTrack = track; daw.setState (demoState); } };
+
+    daw.onSolo = [this] (const Id& track, bool on)
+    {
+        if (on) solo.insert (track); else solo.erase (track);
+        engine.setSolo (solo);
+        if (demoMode) { demoState.solo = solo; daw.setState (demoState); }
+    };
+
+    daw.onClick = [this] (bool on) { click = on; session.setMetronome (click, countIn); if (demoMode) demoState.click = on; };
+    daw.onCountIn = [this] (bool on) { countIn = on; session.setMetronome (click, countIn); if (demoMode) demoState.countIn = on; };
+
+    daw.onListen = [this] (bool on)
+    {
+        listen = on;
+
+        if (demoMode) { demoState.listen = on; return; }
+
+        session.setListening (on);
+    };
+
+    daw.onCopyLink = [this]
+    {
+        juce::SystemClipboard::copyTextToClipboard (daw.getState().link);
+        setStatus ("Link copiado al portapapeles");
+    };
+
+    daw.onLeave = [this] { leaveSession(); };
+    daw.onExport = [this] { chooseExportFile(); };
+    daw.onToggleEditor = [this] { togglePluginEditor(); };
+    daw.onImportFile = [this] { chooseImportFile(); };
+    daw.onImportYouTube = [this] (const juce::String& url) { downloadFromYouTube (url); };
+    daw.onAddVoice = [this] { addTrack (TrackKind::voice); };
+    daw.onAddInstrument = [this] { addTrack (TrackKind::instrument); };
+}
+
+void MainComponent::addTrack (TrackKind kind)
+{
+    const auto p = demoMode ? std::shared_ptr<const Project> (demoProject) : session.project();
+    const auto me = demoMode ? demoState.me : settings.userId;
+
+    if (p == nullptr)
+        return;
+
+    int count = 1;
+
+    for (const auto& t : p->tracks)
+        if (t.author == me && t.kind == kind)
+            ++count;
+
+    const auto name = (kind == TrackKind::voice ? juce::String ("Voz ") : juce::String ("Instrumento ")) + juce::String (count);
+    daw.onOp (Ops::addTrack (newId(), name, kind));
+}
+
+void MainComponent::recordOrStop()
+{
+    if (demoMode)
+    {
+        demoState.recording = ! demoState.recording;
+        demoState.playing = demoState.recording;
+        daw.setState (demoState);
+        return;
+    }
+
+    if (session.isRecording())
+    {
+        stopTake();
+        return;
+    }
+
+    if (armedTrack.isEmpty())
+    {
+        setStatus (ES ("Arm\xC3\xA1 una pista propia (\xE2\x97\x8FR) para grabar"), true, false);
+        return;
+    }
+
+    if (const auto result = session.startTake (armedTrack); result.failed())
+        setStatus (result.getErrorMessage(), true, false);
+    else
+        setStatus (countIn ? ES ("Grabando (cuenta de un comp\xC3\xA1s)\xE2\x80\xA6") : ES ("Grabando\xE2\x80\xA6"));
+
+    refreshSessionView();
+}
+
+void MainComponent::stopTake()
+{
+    const auto result = session.stopTake();
+
+    if (result)
+        setStatus ("Toma terminada: " + formatTime (result->region.length) + ES (" (se sube en segundo plano)"));
+    else
+        setStatus ("La toma fue demasiado corta: no se guarda nada", true, false);
+
+    refreshSessionView();
+}
+
+void MainComponent::chooseImportFile()
+{
+    if (demoMode)
+        return;
+
+    chooser = std::make_unique<juce::FileChooser> (ES ("Eleg\xC3\xAD un archivo de audio"), juce::File(),
+                                                   "*.wav;*.flac;*.ogg;*.mp3;*.m4a;*.mp4;*.aac");
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto file = fc.getResult();
+
+                              if (file == juce::File() || ! inSession)
+                                  return;
+
+                              if (const auto result = session.importFile (file); result.failed())
+                                  setStatus (result.getErrorMessage(), true, false);
+                          });
+}
+
+void MainComponent::downloadFromYouTube (const juce::String& url)
+{
+    if (url.isEmpty())
+    {
+        setStatus (ES ("Peg\xC3\xA1 una URL de YouTube primero"), true, false);
+        return;
+    }
+
+    if (! YouTubeImporter::looksLikeYouTubeUrl (url))
+    {
+        setStatus (ES ("URL de YouTube no v\xC3\xA1lida"), true, false);
+        return;
+    }
+
+    if (demoMode)
+        return;
+
+    const auto ytDlp = YouTubeImporter::findYtDlp (settings.ytDlpPath);
+
+    if (ytDlp == juce::File())
+    {
+        setStatus (ES ("Falta tools\\yt-dlp.exe junto al programa (viene en el zip de la app). Respet\xC3\xA1 los t\xC3\xA9rminos de uso de YouTube."),
+                   true, false);
+        return;
+    }
+
+    setStatus (ES ("Descargando de YouTube\xE2\x80\xA6"));
+    const auto outDir = tempFolder().getChildFile ("youtube");
+    outDir.createDirectory();
+    importer.start (ytDlp, url, outDir, YouTubeImporter::findDeno (ytDlp));
+}
+
+void MainComponent::chooseExportFile()
+{
+    if (demoMode)
+        return;
+
+    const auto p = session.project();
+
+    if (p == nullptr)
+        return;
+
+    const auto safeName = juce::File::createLegalFileName (p->name.isNotEmpty() ? p->name : juce::String ("mezcla"));
+    const auto initial = juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile (safeName + ".wav");
+    chooser = std::make_unique<juce::FileChooser> ("Exportar la mezcla", initial, "*.wav");
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                              | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              auto file = fc.getResult();
+
+                              if (file == juce::File() || ! inSession)
+                                  return;
+
+                              if (! file.hasFileExtension ("wav"))
+                                  file = file.withFileExtension ("wav");
+
+                              if (const auto result = session.exportMix (file); result.failed())
+                                  setStatus (result.getErrorMessage(), true, false);
+                          });
 }
 
 void MainComponent::leaveSession()
 {
-    teardownConnection();
-    showLobby();
-    setStatus (ES ("Saliste de la sesión"));
-}
+    int pending = 0;
 
-// Safe order: the audio thread stops ticking the host, then stops sending through the client, then the client's
-// threads go away, then the host. Safe to call when nothing is connected.
-void MainComponent::teardownConnection()
-{
-    detachHostFromAudioThread();
-    engine.setTransport (nullptr);
-    client.leave();
-    stopEmbeddedHost();
+    if (auto* c = session.getClient())
+        pending = c->transfers().pendingUploads;
+
+    importer.cancel();
+    session.leave();
     demoMode = false;
+    armedTrack.clear();
+    solo.clear();
+    engine.setSolo ({});
+    listen = false;
+    showLobby();
     setConnecting (false);
-}
 
-void MainComponent::detachHostFromAudioThread()
-{
-    activeHost.store (nullptr, std::memory_order_seq_cst);
-
-    // A tick() that loaded the old pointer before our store has already raised hookTicking (seq_cst on both
-    // sides), so spinning here guarantees it has returned before the host can be destroyed. A tick is a few
-    // microseconds; the device being stopped simply leaves the flag down.
-    while (hookTicking.load (std::memory_order_seq_cst))
-        juce::Thread::yield();
-}
-
-void MainComponent::stopEmbeddedHost()
-{
-    if (host == nullptr)
-        return;
-
-    detachHostFromAudioThread();
-    host->stop();
-    host = nullptr;
+    setStatus (pending > 0 ? ES ("Saliste de la sesi\xC3\xB3n. Quedan ") + juce::String (pending)
+                                 + ES (" segmentos por subir: se env\xC3\xAD" "an la pr\xC3\xB3xima vez que abras este proyecto.")
+                           : ES ("Saliste de la sesi\xC3\xB3n"));
 }
 
 void MainComponent::showLobby()
 {
     inSession = false;
-    session.setVisible (false);
+    daw.setVisible (false);
     lobby.setVisible (true);
     status.setSessionMode (false);
 }
@@ -917,133 +1145,153 @@ void MainComponent::showSession()
 {
     inSession = true;
     lobby.setVisible (false);
-    session.setVisible (true);
+    daw.setVisible (true);
     status.setSessionMode (true);
-    session.getLocalStrip().setGain ({ settings.monitorVoiceDb, settings.monitorVoiceDb, settings.monitorVoiceMuted },
-                                     { settings.monitorInstrumentDb, settings.monitorInstrumentDb, settings.monitorInstrumentMuted },
-                                     juce::dontSendNotification);
-    session.setTrackGain ({ settings.trackDb, settings.trackDb, settings.trackMuted }, juce::dontSendNotification);
-    updateNumbers();
-}
+    refreshSessionView();
 
-void MainComponent::applyMonitorFromSettings()
-{
-    engine.setMonitor (combinedMonitor ({ settings.monitorVoiceDb, settings.monitorVoiceDb, settings.monitorVoiceMuted },
-                                        { settings.monitorInstrumentDb, settings.monitorInstrumentDb, settings.monitorInstrumentMuted }));
-}
-
-void MainComponent::queueGain (uint32_t target, const ChannelGain& gain)
-{
-    pendingGains[target] = gain;
-    flushGains (false);
-}
-
-void MainComponent::flushGains (bool force)
-{
-    if (pendingGains.empty() || demoMode)
-    {
-        if (demoMode)
-            pendingGains.clear();
-
-        return;
-    }
-
-    const auto now = juce::Time::getMillisecondCounter();
-
-    if (! force && now - lastGainSendMs < 50)
-        return;
-
-    for (const auto& [target, gain] : pendingGains)
-        client.sendGain (target, gain);
-
-    pendingGains.clear();
-    lastGainSendMs = now;
-}
-
-void MainComponent::chooseTrackFile()
-{
-    chooser = std::make_unique<juce::FileChooser> (ES ("Elegí un backing track"), juce::File(), "*.wav;*.mp3;*.flac;*.ogg");
-    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                          [this] (const juce::FileChooser& fc)
-                          {
-                              const auto file = fc.getResult();
-
-                              if (file == juce::File())
-                                  return;
-
-                              if (demoMode)
-                              {
-                                  auto s = session.getState();
-                                  s.transport.name = file.getFileName();
-                                  s.transport.loaded = true;
-                                  session.setState (s);
-                                  return;
-                              }
-
-                              session.setUploadProgress ("Subiendo " + file.getFileName(), 0.0f);
-                              client.uploadTrack (file);
-                          });
-}
-
-void MainComponent::downloadTrack (const juce::String& url)
-{
-    if (url.isEmpty())
-    {
-        setStatus ("Pegá una URL de YouTube primero", true, false);
-        return;
-    }
-
-    if (! YouTubeImporter::looksLikeYouTubeUrl (url))
-    {
-        setStatus (ES ("URL de YouTube no válida"), true, false);
-        return;
-    }
-
-    const auto ytDlp = YouTubeImporter::findYtDlp (settings.ytDlpPath);
-
-    if (ytDlp == juce::File())
-    {
-        setStatus (ES ("Falta tools\\yt-dlp.exe junto al programa (viene en el zip de la app). Respetá los términos de uso de YouTube."), true, false);
-        return;
-    }
-
-    session.setUploadProgress (ES ("Descargando…"), 0.0f);
-    importer.start (ytDlp, url, tempFolder(), YouTubeImporter::findDeno (ytDlp));
+    if (daw.isShowing())
+        daw.grabKeyboardFocus();
 }
 
 void MainComponent::retry()
 {
     if (inSession)
     {
-        // §3.7: the session survives a device error; Reintentar only reopens the device, at the session's block
-        // size. An embedded host keeps the internal clock it was handed in timerCallback.
-        if (demoMode || deviceOpen)
+        if (demoMode)
             return;
 
-        settings.bufferSize = frameSamples (client.getState().frameSize);
-        openAudioFromSettings();
+        if (! deviceOpen && ! testMode)
+            openAudioFromSettings();
 
-        if (! deviceOpen)
-            return;
-
-        juce::String note;
-
-        if (matchSessionFrameSize (client.getState().frameSize, note))   // tears down + explains if the driver refused the size
-            setStatus ("Audio restablecido: " + settings.deviceName + " @ " + juce::String (settings.bufferSize) + " muestras");
+        if (session.isActive() && ! session.isConnected())
+        {
+            setStatus (ES ("Reconectando\xE2\x80\xA6"));
+            session.reconnect();
+        }
 
         return;
     }
 
-    if (! deviceOpen)
+    if (! deviceOpen && ! testMode)
         openAudioFromSettings();
 
-    if (lastWasCreate && ! deviceOpen)
+    if (lastAction == LastAction::host && lastProjectDir != juce::File())
+        hostProject (lastProjectDir);
+    else if (lastAction == LastAction::join && lastJoinLink.port > 0)
+        joinFromLink (lastJoinLink);
+}
+
+//==============================================================================
+std::vector<Peak> MainComponent::peaksFor (const Id& take) const
+{
+    if (demoMode)
+        return demoPeaks (8000, (float) (take.hashCode() % 97) * 0.1f);
+
+    if (auto* c = const_cast<SessionController&> (session).getClient())
+        if (auto* cache = c->cache())
+            return cache->peaks (take);
+
+    return {};
+}
+
+DawState MainComponent::buildState() const
+{
+    if (demoMode)
+        return demoState;
+
+    DawState s;
+    auto& controller = const_cast<SessionController&> (session);
+    auto* c = controller.getClient();
+
+    if (c == nullptr)
+        return s;
+
+    s.project = c->project();
+    s.me = settings.userId;
+    s.isHost = c->isHost();
+    s.readOnly = ! c->isConnected();
+    s.link = controller.getShareLink().toString();
+
+    for (const auto& p : c->presence())
+        s.online[p.user] = p.online;
+
+    s.online[settings.userId] = true;
+
+    for (const auto& live : c->liveRecordings())
+        s.live.push_back ({ live.user, live.take, live.track, live.start, live.peaks });
+
+    if (const auto own = controller.ownLiveRecording())
+        s.live.push_back ({ own->user, own->take, own->track, own->start, own->peaks });
+
+    if (auto* cache = c->cache(); cache != nullptr && s.project != nullptr)
+    {
+        for (const auto& take : s.project->takes)
+        {
+            if (take.samples <= 0)
+                continue;
+
+            const auto cached = cache->sampleCount (take.id);
+
+            if (cached < take.samples)
+                s.takeAvailability[take.id] = (float) ((double) cached / (double) take.samples);
+        }
+    }
+
+    s.playhead = engine.getPosition();
+    s.playing = engine.isPlaying();
+    s.recording = controller.isRecording();
+    s.armedTrack = armedTrack;
+
+    // Forget an arm or a solo whose track was deleted.
+    if (s.project != nullptr && s.project->findTrack (armedTrack) == nullptr)
+        s.armedTrack.clear();
+
+    s.solo = solo;
+    s.click = click;
+    s.countIn = countIn;
+    s.listen = listen;
+    return s;
+}
+
+void MainComponent::updateSessionStatus()
+{
+    if (demoMode)
+    {
+        status.setSession ("Sincronizado (v " + juce::String ((juce::int64) demoProject->version) + ")", false, 12, 0, 1,
+                           ES ("Demo \xC2\xB7 48 kHz \xC2\xB7 256"), 3.0);
+        return;
+    }
+
+    auto* c = session.getClient();
+
+    if (c == nullptr)
         return;
 
-    if (lastWasCreate)
-        createSession();
-    else if (lastJoinLink.port > 0)
-        joinFromLink (lastJoinLink);
+    const auto p = c->project();
+    const bool connected = c->isConnected();
+    const auto transfers = c->transfers();
+    juce::String deviceText = "Sin dispositivo";
+
+    if (auto* device = engine.getDeviceManager().getCurrentAudioDevice(); device != nullptr && deviceOpen)
+        deviceText = device->getName() + ES (" \xC2\xB7 ") + juce::String (juce::roundToInt (device->getCurrentSampleRate() / 1000.0))
+                     + ES (" kHz \xC2\xB7 ") + juce::String (device->getCurrentBufferSizeSamples());
+
+    status.setSession (connected ? "Sincronizado (v " + juce::String ((juce::int64) (p != nullptr ? p->version : 0)) + ")"
+                                 : ES ("S\xC3\xB3lo lectura: host desconectado"),
+                       ! connected, connected ? c->pingMs() : -1, transfers.pendingUploads, transfers.downloadingTakes,
+                       deviceText, engine.getDeviceManager().getCpuUsage() * 100.0);
+
+    if (! connected)
+        status.retry.setEnabled (true);
+}
+
+void MainComponent::refreshSessionView()
+{
+    if (! inSession)
+        return;
+
+    daw.setState (buildState());
+    updateSessionStatus();
 }
 
 //==============================================================================
@@ -1054,177 +1302,99 @@ void MainComponent::showDemoSession()
 
     demoMode = true;
 
-    SessionState s;
-    s.connected = true;
-    s.sessionId = "DEMO42";
-    s.clientId = 7;
-    s.host = "192.168.1.10";
-    s.port = defaultPort;
-    s.participants = { { 7, settings.name.isNotEmpty() ? settings.name : juce::String ("Lucas"), Role::both },
-                       { 1, "Ana", Role::voice }, { 2, "Bruno", Role::instrument }, { 3, "Caro", Role::both } };
-    s.stats = { { 7, 4, 0, 0, 0.0f, 0.0f }, { 1, 4, 0, 0, 0.45f, 0.0f }, { 2, 5, 2, 1, 0.0f, 0.7f }, { 3, 3, 0, 0, 0.3f, 0.55f } };
-    s.transport.loaded = true;
-    s.transport.playing = true;
-    s.transport.loop = false;
-    s.transport.name = "ensayo.mp3";
-    s.transport.position = (int64_t) (83 * sampleRate);
-    s.transport.length = (int64_t) (225 * sampleRate);
-    s.pingMs = 12;
-    s.frameSize = FrameSize::f128;
+    const Id me = settings.userId.isNotEmpty() ? settings.userId : newId();
+    const Id other = newId();
+    const Id guitarTake = newId(), voiceTake = newId(), importedTake = newId(), liveTake = newId();
+    const Id guitar = newId(), voice = newId(), bass = newId(), drums = newId();
 
-    currentLink = SessionLink { s.host, s.port, s.sessionId }.toString();
-    session.setLink (currentLink, ES ("Compartí este link con tu banda. Si están fuera de tu red, abrí el puerto UDP/TCP ")
-                                  + juce::String (s.port) + " en tu router.");
-    session.setState (s);
-    session.setLocalMeters (0.4f, 0.6f);
-    sessionStartMs = juce::Time::getMillisecondCounter();
+    auto p = std::make_shared<Project>();
+    p->id = newId();
+    p->name = "Tema nuevo";
+    p->hostUser = other;   // I am a guest: the other user's track shows its lock
+    p->bpm = 92.0;
+    p->beatsPerBar = 4;
+    p->version = 128;
+    p->users = { { other, ES ("Mart\xC3\xADn") }, { me, settings.name.isNotEmpty() ? settings.name : juce::String ("Lucas") } };
+    p->takes = { { guitarTake, me, 2, 12, 560000, true }, { voiceTake, me, 1, 8, 360000, true },
+                 { importedTake, me, 2, 40, 1900000, true }, { liveTake, other, 1, 3, 150000, false } };
+    p->tracks.push_back ({ guitar, ES ("Guitarra r\xC3\xADtmica"), me, TrackKind::instrument, -3.0f, -0.2f, false,
+                           { { newId(), guitarTake, 48000, 0, 240000 }, { newId(), guitarTake, 340000, 260000, 280000 } } });
+    p->tracks.push_back ({ voice, ES ("Voz gu\xC3\xAD" "a"), me, TrackKind::voice, -6.0f, 0.0f, false,
+                           { { newId(), voiceTake, 144000, 0, 300000 } } });
+    p->tracks.push_back ({ bass, "Bajo", other, TrackKind::instrument, 0.0f, 0.1f, false, {} });
+    p->tracks.push_back ({ drums, ES ("Bater\xC3\xAD" "a (YouTube)"), me, TrackKind::imported, -8.5f, 0.0f, false,
+                           { { newId(), importedTake, 0, 0, 1900000 } } });
+    demoProject = p;
+
+    DawState s;
+    s.project = std::make_shared<const Project> (*p);
+    s.me = me;
+    s.isHost = false;
+    s.link = SessionLink { "192.168.1.10", defaultPort, "DEMO42" }.toString();
+    s.online[me] = true;
+    s.online[other] = true;
+    s.takeAvailability[importedTake] = 0.64f;
+    s.live.push_back ({ other, liveTake, bass, 5 * (int64_t) sampleRate, demoPeaks (400, 1.3f) });
+    s.playhead = 5 * (int64_t) sampleRate;
+    s.armedTrack = guitar;
+    s.click = click;
+    s.countIn = countIn;
+    demoState = s;
+    armedTrack = guitar;
+    demoLastMs = juce::Time::getMillisecondCounter();
+
     showSession();
-    setStatus (ES ("Sesión de demostración"));
+    setStatus (ES ("Sesi\xC3\xB3n de demostraci\xC3\xB3n"));
+}
+
+void MainComponent::demoTick()
+{
+    const auto now = juce::Time::getMillisecondCounter();
+    const auto elapsedSamples = (int64_t) (now - demoLastMs) * sampleRate / 1000;
+    demoLastMs = now;
+
+    if (demoState.playing)
+        demoState.playhead += elapsedSamples;
+
+    // The other user's take keeps growing: one peak per 256 samples.
+    if (! demoState.live.empty())
+    {
+        auto& live = demoState.live.front();
+        const auto target = live.peaks.size() + (size_t) (elapsedSamples / peakBlock);
+        const auto more = demoPeaks ((int) target, 1.3f);
+        live.peaks.assign (more.begin(), more.end());
+    }
+
+    daw.setState (demoState);
+    updateSessionStatus();
 }
 
 //==============================================================================
-void MainComponent::updateNumbers()
-{
-    if (! inSession)
-        return;
-
-    const auto& s = demoMode ? session.getState() : client.getState();
-    const double frameMs = frameSamples (s.frameSize) * 1000.0 / sampleRate;
-
-    int clientBlocks = demoMode ? 4 : client.receiveBuffer().getStats().sizeBlocks;
-    int serverBlocks = 0;
-    uint32_t underruns = 0;
-
-    for (const auto& st : s.stats)
-    {
-        if (st.id == s.clientId)
-        {
-            serverBlocks = st.jitterBlocks;
-            underruns = st.underruns;
-        }
-    }
-
-    double asioMs = demoMode ? 6.0 : 0.0;
-
-    if (auto* device = engine.getDevice(); device != nullptr && ! demoMode)
-        asioMs = (device->getInputLatencyInSamples() + device->getOutputLatencyInSamples()) * 1000.0 / juce::jmax (1.0, device->getCurrentSampleRate());
-
-    const double ping = s.pingMs < 0 ? 0.0 : (double) s.pingMs;
-    const double latency = ping + frameMs + 0.7 * (clientBlocks + serverBlocks) * frameMs + asioMs + 1.5;
-
-    double lossPercent = 0.0;
-
-    if (! demoMode)
-    {
-        const auto stats = client.receiveBuffer().getStats();
-        const double elapsedFrames = juce::jmax (1.0, (juce::Time::getMillisecondCounter() - sessionStartMs) / frameMs);
-        lossPercent = juce::jlimit (0.0, 100.0, 100.0 * (double) (stats.underruns + stats.late + underruns) / elapsedFrames);
-    }
-
-    const double cpu = demoMode ? 3.0 : engine.getDeviceManager().getCpuUsage() * 100.0;
-    status.setNumbers (s.pingMs, clientBlocks, serverBlocks, latency, lossPercent, cpu);
-}
-
 void MainComponent::timerCallback()
 {
-    const auto peaks = engine.takePeaks();
-
-    if (inSession && ! demoMode)
-        session.setLocalMeters (peaks.voice, peaks.instrument);
-
     if (const auto error = engine.takeDeviceError(); error.isNotEmpty())
     {
-        audioError = true;
-        deviceOpen = false;
-        juce::String suffix;
+        deviceOpen = engine.getDeviceManager().getCurrentAudioDevice() != nullptr
+                     && engine.getDeviceManager().getCurrentAudioDevice()->isPlaying();
 
-        // Spec §3.7: the session is kept. The embedded host was clocked only by this device's callback, so hand it
-        // to its internal clock or every participant's mix stops. ServerHost has no stopInternalClock(), so from
-        // here on the host stays on its own clock for the rest of its life: a later successful Reintentar reopens
-        // the device but never re-attaches the hook (activeHost is only set in createSession). Same mix stream.
-        if (host != nullptr && activeHost.load (std::memory_order_seq_cst) != nullptr)
-        {
-            detachHostFromAudioThread();
-            host->startInternalClock();
-            suffix = ES (". La sesión sigue con el reloj interno del servidor");
-        }
+        // Spec §8: a device error while recording stops the take and keeps what was recorded.
+        if (session.isRecording())
+            session.stopTake();
 
-        setStatus ("Error de audio: " + error + suffix, true, true);
+        setStatus ("Error de audio: " + error, true, true);
     }
 
-    flushGains (false);
+    pollCalibration();
 
     if (settingsDirty && juce::Time::getMillisecondCounter() - settingsDirtyAtMs > 1000)
         saveSettingsNow();
 
-    if (demoMode && inSession)
-    {
-        auto s = session.getState();
-
-        if (s.transport.playing)
-        {
-            s.transport.position += sampleRate / 30;
-
-            if (s.transport.position >= s.transport.length)
-                s.transport.position = s.transport.loop ? 0 : s.transport.length;
-
-            if (s.transport.position >= s.transport.length)
-                s.transport.playing = false;
-
-            session.setState (s);
-        }
-
-        session.setLocalMeters (0.4f + 0.2f * (float) std::sin (juce::Time::getMillisecondCounterHiRes() / 300.0),
-                                0.6f + 0.2f * (float) std::sin (juce::Time::getMillisecondCounterHiRes() / 410.0));
-    }
-
-    if (inSession)
-    {
-        updateNumbers();
-
-        if (! demoMode && ! audioError && engine.getDevice() != nullptr)
-            updateAudioDiagnosis();
-    }
-}
-
-void MainComponent::updateAudioDiagnosis()
-{
-    const auto now = juce::Time::getMillisecondCounter();
-    const auto& s = client.getState();
-
-    AudioDiagnosisInput in;
-    in.clientId = s.clientId;
-    in.host = s.host;
-    in.port = s.port;
-    in.secondsInSession = (now - sessionStartMs) / 1000.0;
-    in.udpFailure = client.getUdpFailure();
-    in.mixPacketsReceived = client.getMixPacketsReceived();
-    if (in.mixPacketsReceived != lastMixCount)
-    {
-        lastMixCount = in.mixPacketsReceived;
-        lastMixChangeMs = now;
-    }
-
-    in.secondsSinceLastMix = in.mixPacketsReceived == 0 ? 0.0 : (now - lastMixChangeMs) / 1000.0;
-    in.participants = s.participants;
-    in.stats = s.stats;
-
-    for (const auto& p : s.participants)
-    {
-        participantSeenMs.emplace (p.id, now);   // keeps the first time
-        in.secondsSinceJoined[p.id] = (now - participantSeenMs[p.id]) / 1000.0;
-    }
-
-    const auto diagnosis = diagnoseAudio (in);
-
-    if (diagnosis == lastDiagnosis)
+    if (! inSession)
         return;
 
-    if (diagnosis.isNotEmpty())
-        setStatus (diagnosis, true, false);
-    else if (lastDiagnosis.isNotEmpty())
-        setStatus (ES ("Audio OK en las dos direcciones"), false, false);
-
-    lastDiagnosis = diagnosis;
+    if (demoMode)
+        demoTick();
+    else
+        refreshSessionView();
 }
 }

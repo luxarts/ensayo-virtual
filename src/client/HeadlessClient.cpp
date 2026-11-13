@@ -1,8 +1,7 @@
 #include "HeadlessClient.h"
-#include "client/AudioEngine.h"
-#include "client/SessionClient.h"
+#include "client/SessionController.h"
+#include "client/Offline.h"
 #include "client/SessionLink.h"
-#include "server/ServerHost.h"
 #include "core/MessagePump.h"
 
 #include <juce_events/juce_events.h>
@@ -17,11 +16,11 @@
  #include <windows.h>
 #endif
 
-#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
 #include <memory>
-#include <vector>
+#include <set>
 
 namespace ensayo
 {
@@ -66,31 +65,22 @@ bool parseInt (const juce::String& text, int& out)
 {
     const auto trimmed = text.trim();
 
-    if (trimmed.isEmpty() || ! trimmed.containsOnly ("0123456789-"))
+    if (trimmed.isEmpty() || ! trimmed.containsOnly ("0123456789-") || trimmed.length() > 9)
         return false;
 
     out = trimmed.getIntValue();
     return true;
 }
 
-// A link whose id is the literal NEW means "create a session on that host:port". parseSessionLink needs a
-// six-character id, so NEW is swapped for a placeholder and restored afterwards.
-std::optional<SessionLink> parseHeadlessLink (const juce::String& text)
+bool parseSeconds (const juce::String& text, double& out)
 {
-    const auto trimmed = text.trim().unquoted().trimCharactersAtEnd ("/");
+    const auto trimmed = text.trim();
 
-    if (trimmed.endsWithIgnoreCase ("/NEW"))
-    {
-        if (auto link = parseSessionLink (trimmed.dropLastCharacters (3) + "AAAAAA"))
-        {
-            link->sessionId = "NEW";
-            return link;
-        }
+    if (trimmed.isEmpty() || ! trimmed.containsOnly ("0123456789.") || trimmed.indexOfChar ('.') != trimmed.lastIndexOfChar ('.'))
+        return false;
 
-        return std::nullopt;
-    }
-
-    return parseSessionLink (trimmed);
+    out = trimmed.getDoubleValue();
+    return std::isfinite (out);
 }
 
 juce::File fileArgument (const juce::String& text)
@@ -108,6 +98,7 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
 {
     HeadlessOptions o;
     error.clear();
+    bool atGiven = false, forGiven = false;
 
     for (int i = 0; i < args.size(); ++i)
     {
@@ -115,15 +106,29 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
         const bool hasValue = i + 1 < args.size();
         const auto value = hasValue ? args[i + 1].trim() : juce::String();
 
-        const auto needValue = [&] (const char* name) -> bool
+        const auto needValue = [&] (const juce::String& flag) -> bool
         {
             if (! hasValue || value.isEmpty())
             {
-                error = juce::String (name) + " requires a value";
+                error = flag + " requires a value";
                 return false;
             }
 
             ++i;
+            return true;
+        };
+
+        const auto needInt = [&] (const juce::String& flag, int low, int high, int& out) -> bool
+        {
+            if (! needValue (flag))
+                return false;
+
+            if (! parseInt (value, out) || out < low || out > high)
+            {
+                error = flag + " must be " + juce::String (low) + ".." + juce::String (high);
+                return false;
+            }
+
             return true;
         };
 
@@ -133,23 +138,18 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
         }
         else if (arg == "--host")
         {
-            o.host = true;
+            if (! needValue (arg)) return std::nullopt;
+            o.hostProject = fileArgument (value);
         }
         else if (arg == "--port")
         {
-            if (! needValue ("--port")) return std::nullopt;
-
-            if (! parseInt (value, o.hostPort) || o.hostPort <= 0 || o.hostPort > 65535)
-            {
-                error = "--port must be 1..65535";
-                return std::nullopt;
-            }
+            if (! needInt (arg, 1, 65535, o.hostPort)) return std::nullopt;
         }
         else if (arg == "--join")
         {
-            if (! needValue ("--join")) return std::nullopt;
+            if (! needValue (arg)) return std::nullopt;
 
-            if (! parseHeadlessLink (value))
+            if (! parseSessionLink (value))
             {
                 error = "--join: invalid session link: " + value;
                 return std::nullopt;
@@ -159,119 +159,156 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
         }
         else if (arg == "--name")
         {
-            if (! needValue ("--name")) return std::nullopt;
+            if (! needValue (arg)) return std::nullopt;
             o.name = value;
         }
-        else if (arg == "--role")
+        else if (arg == "--user")
         {
-            if (! needValue ("--role")) return std::nullopt;
+            if (! needValue (arg)) return std::nullopt;
 
-            if (auto role = roleFromString (value))
-                o.role = *role;
+            if (! isValidId (value.toLowerCase()))
+            {
+                error = "--user must be 32 lowercase hex characters";
+                return std::nullopt;
+            }
+
+            o.user = value.toLowerCase();
+        }
+        else if (arg == "--cache")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.cacheDir = fileArgument (value);
+        }
+        else if (arg == "--fake-audio")
+        {
+            if (! needValue (arg)) return std::nullopt;
+
+            if (value == "silence")       o.signal = TestSignal::silence;
+            else if (value == "sine")     o.signal = TestSignal::sine440;
+            else if (value == "click")    o.signal = TestSignal::click;
+            else if (value == "loopback") o.signal = TestSignal::loopback;
             else
             {
-                error = "--role must be voice, instrument or both";
+                error = "--fake-audio must be silence, sine, click or loopback";
                 return std::nullopt;
             }
         }
         else if (arg == "--block")
         {
-            if (! needValue ("--block")) return std::nullopt;
-
-            if (! parseInt (value, o.blockSize) || (o.blockSize != 64 && o.blockSize != 128 && o.blockSize != 256))
-            {
-                error = "--block must be 64, 128 or 256";
-                return std::nullopt;
-            }
+            if (! needInt (arg, 16, 4096, o.blockSize)) return std::nullopt;
         }
-        else if (arg == "--fake-audio")
+        else if (arg == "--latency-in")
         {
-            if (! needValue ("--fake-audio")) return std::nullopt;
-
-            if (value == "silence")      o.signal = TestSignal::silence;
-            else if (value == "sine")    o.signal = TestSignal::sine440;
-            else if (value == "click")   o.signal = TestSignal::click;
-            else
-            {
-                error = "--fake-audio must be silence, sine or click";
-                return std::nullopt;
-            }
+            if (! needInt (arg, 0, 48000, o.latencyIn)) return std::nullopt;
+        }
+        else if (arg == "--latency-out")
+        {
+            if (! needInt (arg, 0, 48000, o.latencyOut)) return std::nullopt;
         }
         else if (arg == "--asio")
         {
-            if (! needValue ("--asio")) return std::nullopt;
+            if (! needValue (arg)) return std::nullopt;
             o.asioDevice = value;
+        }
+        else if (arg == "--mic")
+        {
+            if (! needInt (arg, 0, 63, o.micChannel)) return std::nullopt;
+        }
+        else if (arg == "--inst")
+        {
+            if (! needInt (arg, 0, 63, o.instrumentChannel)) return std::nullopt;
+        }
+        else if (arg == "--out")
+        {
+            if (! needInt (arg, 0, 63, o.outputPair)) return std::nullopt;
         }
         else if (arg == "--mute-monitor")
         {
             o.muteMonitor = true;
         }
-        else if (arg == "--mic" || arg == "--inst" || arg == "--out")
+        else if (arg == "--calibrate")
         {
-            const auto name = arg.toRawUTF8();
-            if (! needValue (name)) return std::nullopt;
-            int channel = 0;
+            o.calibrate = true;
+        }
+        else if (arg == "--resume")
+        {
+            o.resume = true;
+        }
+        else if (arg == "--add-track")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            const auto kind = trackKindFromString (value);
 
-            if (! parseInt (value, channel) || channel < 0 || channel > 63)
+            if (! kind || *kind == TrackKind::imported)
             {
-                error = arg + " must be 0..63";
+                error = "--add-track kind must be voice or instrument";
                 return std::nullopt;
             }
 
-            if (arg == "--mic")       o.micChannel = channel;
-            else if (arg == "--inst") o.instrumentChannel = channel;
-            else                      o.outputPair = channel;
-        }
-        else if (arg == "--probe")
-        {
-            if (! needValue ("--probe")) return std::nullopt;
-            o.probeLog = fileArgument (value);
-        }
-        else if (arg == "--emit-log")
-        {
-            if (! needValue ("--emit-log")) return std::nullopt;
-            o.emitLog = fileArgument (value);
-        }
-        else if (arg == "--compare")
-        {
-            if (! needValue ("--compare")) return std::nullopt;
-            o.compareLog = fileArgument (value);
-        }
-        else if (arg == "--track")
-        {
-            if (! needValue ("--track")) return std::nullopt;
-            o.trackFile = fileArgument (value);
-        }
-        else if (arg == "--play")
-        {
-            o.playTrack = true;
-        }
-        else if (arg == "--simulate-loss")
-        {
-            if (! needValue ("--simulate-loss")) return std::nullopt;
+            const bool hasName = i + 1 < args.size() && args[i + 1].trim().isNotEmpty() && ! args[i + 1].trim().startsWith ("--");
 
-            if (! parseInt (value, o.lossPercent) || o.lossPercent < 0 || o.lossPercent > 100)
+            if (! hasName)
             {
-                error = "--simulate-loss must be 0..100";
+                error = "--add-track requires a kind and a name";
                 return std::nullopt;
             }
+
+            o.addTracks.push_back ({ *kind, args[++i].trim() });
+        }
+        else if (arg == "--record")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.recordTrack = value;
+        }
+        else if (arg == "--at" || arg == "--for")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            double seconds = 0.0;
+
+            if (! parseSeconds (value, seconds) || seconds > 4 * 3600.0)
+            {
+                error = arg + " must be a number of seconds";
+                return std::nullopt;
+            }
+
+            if (arg == "--at") { o.recordAt = seconds; atGiven = true; }
+            else               { o.recordFor = seconds; forGiven = true; }
+        }
+        else if (arg == "--import")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.importFile = fileArgument (value);
+        }
+        else if (arg == "--ops")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.opsFile = fileArgument (value);
+        }
+        else if (arg == "--wait-takes")
+        {
+            if (! needInt (arg, 1, 100000, o.waitTakes)) return std::nullopt;
+        }
+        else if (arg == "--export")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.exportFile = fileArgument (value);
+        }
+        else if (arg == "--dump-project")
+        {
+            if (! needValue (arg)) return std::nullopt;
+            o.dumpProject = fileArgument (value);
         }
         else if (arg == "--duration")
         {
-            if (! needValue ("--duration")) return std::nullopt;
+            if (! needValue (arg)) return std::nullopt;
 
-            if (! value.containsOnly ("0123456789.") || value.getDoubleValue() <= 0.0)
+            if (! parseSeconds (value, o.durationSeconds) || o.durationSeconds <= 0.0)
             {
                 error = "--duration must be a positive number of seconds";
                 return std::nullopt;
             }
 
-            o.durationSeconds = value.getDoubleValue();
-        }
-        else if (arg == "--stats")
-        {
-            if (! needValue ("--stats")) return std::nullopt;
-            o.statsLog = fileArgument (value);
+            o.durationGiven = true;
         }
         else
         {
@@ -280,21 +317,41 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
         }
     }
 
-    if (o.host && o.link.isNotEmpty())
+    if (o.hostProject != juce::File() && o.link.isNotEmpty())
     {
         error = "--host and --join are mutually exclusive";
         return std::nullopt;
     }
 
-    if (! o.host && o.link.isEmpty())
+    if (! o.hasSession() && ! o.calibrate)
     {
-        error = "--headless needs --host or --join <link>";
+        error = "--headless needs --host <projectDir> or --join <link> (or --calibrate alone)";
         return std::nullopt;
     }
 
-    if (o.playTrack && o.trackFile == juce::File())
+    if (! o.hasSession() && (! o.addTracks.empty() || o.recordTrack.isNotEmpty() || o.importFile != juce::File()
+                             || o.opsFile != juce::File() || o.waitTakes > 0 || o.resume || o.exportFile != juce::File()
+                             || o.dumpProject != juce::File()))
     {
-        error = "--play requires --track <file>";
+        error = "session options need --host or --join";
+        return std::nullopt;
+    }
+
+    if (o.recordTrack.isNotEmpty() && (! forGiven || o.recordFor <= 0.0))
+    {
+        error = "--record needs --for <seconds> greater than 0";
+        return std::nullopt;
+    }
+
+    if (o.recordTrack.isEmpty() && (atGiven || forGiven))
+    {
+        error = "--at and --for need --record <trackName>";
+        return std::nullopt;
+    }
+
+    if (o.asioDevice.isNotEmpty() && (o.signal != TestSignal::silence || o.latencyIn != 0 || o.latencyOut != 0))
+    {
+        error = "--asio cannot be combined with --fake-audio or the fake latencies";
         return std::nullopt;
     }
 
@@ -302,124 +359,48 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
 }
 
 //==============================================================================
-std::vector<ClickEvent> readClickLog (const juce::File& file)
-{
-    std::vector<ClickEvent> events;
-    juce::StringArray lines;
-    file.readLines (lines);
-
-    for (const auto& raw : lines)
-    {
-        const auto line = raw.trim();
-
-        if (line.isEmpty() || ! juce::CharacterFunctions::isDigit (line[0]))
-            continue;
-
-        auto parts = juce::StringArray::fromTokens (line, ",", "");
-
-        if (parts.size() < 2)
-            continue;
-
-        events.push_back ({ (int64_t) parts[1].trim().getLargeIntValue(), parts[0].trim().getDoubleValue() });
-    }
-
-    std::stable_sort (events.begin(), events.end(), [] (const ClickEvent& a, const ClickEvent& b) { return a.qpcMs < b.qpcMs; });
-    return events;
-}
-
-std::vector<double> pairClickLatencies (const std::vector<ClickEvent>& emittedIn, const std::vector<ClickEvent>& detected,
-                                        double maxLatencyMs)
-{
-    auto emitted = emittedIn;
-    std::stable_sort (emitted.begin(), emitted.end(), [] (const ClickEvent& a, const ClickEvent& b) { return a.qpcMs < b.qpcMs; });
-
-    std::vector<double> latencies;
-
-    for (const auto& d : detected)
-    {
-        // Latest emitted click at or before the detection.
-        auto it = std::upper_bound (emitted.begin(), emitted.end(), d.qpcMs,
-                                    [] (double t, const ClickEvent& e) { return t < e.qpcMs; });
-
-        if (it == emitted.begin())
-            continue;
-
-        --it;
-        const double latency = d.qpcMs - it->qpcMs;
-
-        if (latency >= 0.0 && latency <= maxLatencyMs)
-            latencies.push_back (latency);
-    }
-
-    return latencies;
-}
-
-juce::String formatLatencyLine (std::vector<double> latencies)
-{
-    if (latencies.empty())
-        return "latency n 0";
-
-    std::sort (latencies.begin(), latencies.end());
-    const auto at = [&] (double fraction)
-    {
-        const auto index = (size_t) juce::jlimit (0, (int) latencies.size() - 1, (int) std::floor (fraction * (double) (latencies.size() - 1) + 0.5));
-        return latencies[index];
-    };
-
-    return "latency median " + juce::String (at (0.5), 2) + " p95 " + juce::String (at (0.95), 2)
-         + " n " + juce::String ((int) latencies.size());
-}
-
-//==============================================================================
 namespace
 {
-// Click events collected from the device thread and flushed to a CSV from the message thread.
-class ClickLog
+// Owns the engine and the session; tears them down in the safe order on every exit path.
+struct HeadlessRun
 {
-public:
-    void setFile (const juce::File& f)
+    StudioEngine engine;
+    SessionController session { engine };
+
+    ~HeadlessRun()
     {
-        file = f;
-
-        if (file != juce::File())
-        {
-            file.getParentDirectory().createDirectory();
-            file.replaceWithText ("");
-        }
+        // The callbacks capture locals of runHeadless that may already be gone.
+        session.onConnected = nullptr;
+        session.onProjectChanged = nullptr;
+        session.onTransfersChanged = nullptr;
+        session.onPresenceChanged = nullptr;
+        session.onDisconnected = nullptr;
+        session.onError = nullptr;
+        session.onRejected = nullptr;
+        session.onImportProgress = nullptr;
+        session.onImportFinished = nullptr;
+        session.onExportProgress = nullptr;
+        session.onExportFinished = nullptr;
+        session.onTakeAborted = nullptr;
+        session.leave();
+        engine.getDeviceManager().closeAudioDevice();
     }
-
-    void add (ClickEvent e)
-    {
-        const juce::ScopedLock sl (lock);
-        pending.push_back (e);
-    }
-
-    void flush()
-    {
-        std::vector<ClickEvent> batch;
-        {
-            const juce::ScopedLock sl (lock);
-            batch.swap (pending);
-        }
-
-        for (const auto& e : batch)
-        {
-            all.push_back (e);
-
-            if (file != juce::File())
-                file.appendText (juce::String (e.qpcMs, 3) + "," + juce::String ((juce::int64) e.sampleIndex) + "\n");
-        }
-    }
-
-    const std::vector<ClickEvent>& events() const noexcept { return all; }
-
-private:
-    juce::CriticalSection lock;
-    std::vector<ClickEvent> pending, all;
-    juce::File file;
 };
 
-juce::String jsonBool (bool b) { return b ? "true" : "false"; }
+bool waitUntil (const std::function<bool()>& done, double timeoutMs, const std::function<bool()>& failed)
+{
+    const double deadline = juce::Time::getMillisecondCounterHiRes() + timeoutMs;
+
+    while (! done())
+    {
+        if (failed() || juce::Time::getMillisecondCounterHiRes() >= deadline)
+            return done();
+
+        pumpMessages (10);
+    }
+
+    return true;
+}
 }
 
 int runHeadless (const HeadlessOptions& o)
@@ -433,76 +414,11 @@ int runHeadless (const HeadlessOptions& o)
     if (juce::MessageManager::getInstanceWithoutCreating() == nullptr || ! juce::MessageManager::getInstance()->isThisTheMessageThread())
         return fail ("runHeadless must be called on the message thread with JUCE initialised");
 
-    const auto frameSize = frameSizeForSamples (o.blockSize).value_or (FrameSize::f128);
+    auto run = std::make_unique<HeadlessRun>();
+    auto& engine = run->engine;
+    auto& session = run->session;
 
-    std::unique_ptr<ServerHost> host;
-
-    if (o.host)
-    {
-        ServerConfig config;
-        config.tcpPort = o.hostPort;
-        config.udpPort = o.hostPort;
-        config.frameSize = frameSize;
-        host = std::make_unique<ServerHost> (config);
-
-        const auto result = host->start();
-
-        if (result.failed())
-            return fail ("could not start the embedded server on port " + juce::String (o.hostPort) + ": " + result.getErrorMessage());
-    }
-
-    // Declared before the guard: the device thread keeps calling them until the guard closes the device.
-    ClickLog emitted, detected;
-    ClickProbe probe;
-
-    // Runs on every exit path, in this order: detach the client from the audio thread, drop the device hooks and the
-    // client callbacks (they reference locals declared after this guard), close the device (joins the device thread,
-    // which also ends the frame hook into the host), then leave the session and stop the host. Members are destroyed
-    // afterwards, client first, when nothing can reach them any more.
-    struct Guard
-    {
-        std::unique_ptr<ServerHost>& host;
-        AudioEngine engine;
-        SessionClient client;
-
-        ~Guard()
-        {
-            engine.setTransport (nullptr);
-
-            if (auto* fake = engine.getFakeDevice())
-            {
-                fake->onOutputBlock = nullptr;
-                fake->onClickEmitted = nullptr;
-            }
-
-            engine.getDeviceManager().closeAudioDevice();
-
-            client.onJoined = nullptr;
-            client.onStateChanged = nullptr;
-            client.onError = nullptr;
-            client.leave();
-
-            if (host != nullptr)
-                host->stop();
-        }
-    } g { host };
-
-    AudioEngine& engine = g.engine;
-    SessionClient& client = g.client;
-
-    engine.setRole (o.role);
-    engine.setChannels (o.micChannel, o.instrumentChannel, o.outputPair);
-    engine.setSimulatedLossPercent (o.lossPercent);
-
-    // The probe listens to the device output; local monitoring would put our own input clicks there too.
-    if (o.probeLog != juce::File() || o.muteMonitor)
-        engine.setMonitor (ChannelGain { 0.0f, 0.0f, true });
-
-    if (host != nullptr)
-        engine.setFrameHook ([&] { host->tick(); });
-
-    FakeAudioDevice* fake = nullptr;
-
+    // Device.
     if (o.asioDevice.isNotEmpty())
     {
         if (! engine.getAsioDeviceNames().contains (o.asioDevice))
@@ -511,7 +427,7 @@ int runHeadless (const HeadlessOptions& o)
         if (const auto openError = engine.openDevice ("ASIO", o.asioDevice, (double) sampleRate, o.blockSize); openError.isNotEmpty())
             return fail ("ASIO device: " + openError);
 
-        auto* device = engine.getDevice();
+        auto* device = engine.getDeviceManager().getCurrentAudioDevice();
 
         if (device == nullptr)
             return fail ("ASIO device did not open");
@@ -541,220 +457,356 @@ int runHeadless (const HeadlessOptions& o)
 
         for (int i = 0; i < outputs.size(); ++i)
             headlessPrint ("output " + juce::String (i) + " " + outputs[i]);
-
-        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
-            return fail ("ASIO device: " + deviceError);
     }
     else
     {
-        engine.useFakeDevice (o.blockSize, o.signal);
+        engine.useFakeDevice (o.blockSize, o.signal, FakeLatency { o.latencyIn, o.latencyOut });
 
-        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
-            return fail ("fake audio device: " + deviceError);
-
-        fake = engine.getFakeDevice();
-
-        if (fake == nullptr)
-            return fail ("fake audio device not available");
+        if (engine.getFakeDevice() == nullptr)
+            return fail ("fake audio device: " + engine.takeDeviceError());
     }
 
-    emitted.setFile (o.emitLog);
-    detected.setFile (o.probeLog);
+    // Give the device a moment to run its first callbacks (a stopped device makes the source swap wait).
+    pumpMessages (50);
 
-    if (fake != nullptr)
-        fake->onClickEmitted = [&] (ClickEvent e) { emitted.add (e); };
+    if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
+        return fail ("audio device: " + deviceError);
 
-    if (fake != nullptr && o.probeLog != juce::File())
+    engine.setChannels (o.micChannel, o.instrumentChannel, o.outputPair);
+
+    // A looped-back output must not carry the own inputs, or the monitor feeds back on itself.
+    if (o.muteMonitor || o.signal == TestSignal::loopback)
+        engine.setMonitor (0.0f, 0.0f);
+
+    session.setMetronome (false, false);   // --record: count-in off; no click in the output either
+
+    if (o.calibrate)
     {
-        probe.onClickDetected = [&] (ClickEvent e) { detected.add (e); };
-        fake->onOutputBlock = [&] (const float* L, const float* R, int n, int64_t first, double qpcMs)
-        {
-            probe.process (L, R, n, first, qpcMs);
-        };
+        engine.startCalibration();
+
+        if (! waitUntil ([&] { return ! engine.isCalibrating(); }, 10000.0, [] { return false; }))
+            return fail ("calibration did not finish");
+
+        auto* device = engine.getDeviceManager().getCurrentAudioDevice();
+        const auto roundTrip = engine.calibrationRoundTrip();
+
+        if (! roundTrip || device == nullptr)
+            return fail ("calibration failed: fewer than 5 of 8 clicks came back to the input");
+
+        const int value = LatencyCalibrator::calibrationFor (*roundTrip, device->getInputLatencyInSamples(), device->getOutputLatencyInSamples());
+        headlessPrint ("calibration " + juce::String (value));
+        session.setCalibration (value);
+
+        if (! o.hasSession())
+            return 0;
     }
 
     // Session.
-    bool joined = false, failed = false, playSent = false, uploadStarted = false;
+    const Id user = o.user.isNotEmpty() ? o.user : newId();
+    const auto cacheDir = o.cacheDir != juce::File() ? o.cacheDir
+                                                     : defaultCacheRoot().getChildFile ("headless").getChildFile (user);
+    const SessionIdentity identity { user, o.name, cacheDir };
+
+    bool connected = false, failed = false;
+    int rejections = 0;
+    int64_t lastVersion = -1;
     juce::String failure;
-    int lastParticipants = -1;
-    juce::String sessionLinkText;
+    std::set<Id> completeSeen, completePrinted, cachedPrinted;
+    bool takesKnown = false;
+    std::optional<juce::Result> importResult;
 
-    client.onJoined = [&]
+    const auto markFailed = [&] (const juce::String& message)
     {
-        joined = true;
-        const auto& s = client.getState();
+        headlessPrint ("error " + message);
 
-        SessionLink link;
-        link.host = s.host;
-        link.port = s.port;
-        link.sessionId = s.sessionId;
-        sessionLinkText = link.toString();
-
-        headlessPrint ("link " + sessionLinkText);
-        headlessPrint ("joined " + s.sessionId + " client " + juce::String ((juce::int64) s.clientId));
-        lastParticipants = (int) s.participants.size();
-        headlessPrint ("participants " + juce::String (lastParticipants));
-
-        engine.setTransport (&client);
-
-        if (o.trackFile != juce::File() && ! uploadStarted)
-        {
-            uploadStarted = true;
-
-            if (! o.trackFile.existsAsFile())
-                headlessPrint ("error track file not found: " + o.trackFile.getFullPathName());
-            else
-                client.uploadTrack (o.trackFile);
-        }
-    };
-
-    client.onStateChanged = [&] (const SessionState& s)
-    {
-        if (joined && s.connected && (int) s.participants.size() != lastParticipants)
-        {
-            lastParticipants = (int) s.participants.size();
-            headlessPrint ("participants " + juce::String (lastParticipants));
-        }
-
-        if (s.connected && o.playTrack && s.transport.loaded && ! playSent)
-        {
-            playSent = true;
-            client.sendTransport ("play");
-        }
-    };
-
-    client.onError = [&] (const juce::String& message)
-    {
         if (! failed)
         {
             failed = true;
             failure = message;
-            headlessPrint ("error " + message);
         }
     };
 
-    if (host != nullptr)
+    // Prints take_complete for transitions seen during the run and cached once a complete take is fully local.
+    const auto scanTakes = [&]
     {
-        client.create ("127.0.0.1", o.hostPort, o.name, o.role);
+        auto* client = session.getClient();
+        const auto p = session.project();
+
+        if (client == nullptr || p == nullptr)
+            return;
+
+        auto* cache = client->cache();
+
+        for (const auto& take : p->takes)
+        {
+            if (! take.complete)
+                continue;
+
+            if (takesKnown && completeSeen.count (take.id) == 0 && completePrinted.insert (take.id).second)
+                headlessPrint ("take_complete " + take.id + " " + juce::String ((juce::int64) take.samples));
+
+            completeSeen.insert (take.id);
+
+            if (cache != nullptr && cache->segmentCount (take.id) >= take.segments && cachedPrinted.insert (take.id).second)
+                headlessPrint ("cached " + take.id + " " + juce::String (take.segments));
+        }
+
+        takesKnown = true;
+    };
+
+    session.onConnected = [&]
+    {
+        if (connected)
+            return;
+
+        connected = true;
+        const auto p = session.project();
+        lastVersion = p != nullptr ? p->version : 0;
+        headlessPrint ("link " + session.getConnectLink().toString());
+        headlessPrint ("welcome " + session.getConnectLink().sessionId + (session.getClient()->isHost() ? " host" : " guest"));
+        scanTakes();
+    };
+
+    session.onProjectChanged = [&]
+    {
+        if (! connected)
+            return;
+
+        if (const auto p = session.project(); p != nullptr && p->version > lastVersion)
+        {
+            for (auto v = lastVersion + 1; v <= p->version; ++v)
+                headlessPrint ("applied " + juce::String ((juce::int64) v));
+
+            lastVersion = p->version;
+        }
+
+        scanTakes();
+    };
+
+    session.onTransfersChanged = [&] { if (connected) scanTakes(); };
+    session.onRejected = [&] (const juce::String& reason) { ++rejections; headlessPrint ("rejected " + reason); };
+    session.onDisconnected = [&] (const juce::String& reason) { markFailed ("disconnected: " + reason); };
+    session.onError = [&] (const juce::String& message) { markFailed (message); };
+    session.onImportFinished = [&] (const juce::String&, const juce::Result& r) { importResult = r; };
+    session.onTakeAborted = [&] (const juce::String& reason) { markFailed (reason); };
+
+    if (o.hostProject != juce::File())
+    {
+        const auto started = session.host (o.hostProject, o.hostPort, identity, o.hostProject.getFileName());
+
+        if (started.failed())
+            return fail ("could not host " + o.hostProject.getFullPathName() + " on port " + juce::String (o.hostPort) + ": "
+                         + started.getErrorMessage());
     }
     else
     {
-        const auto link = parseHeadlessLink (o.link);
-
-        if (! link)
-            return fail ("invalid link: " + o.link);
-
-        if (link->sessionId == "NEW")
-            client.create (link->host, link->port, o.name, o.role);
-        else
-            client.join (*link, o.name, o.role);
+        session.join (*parseSessionLink (o.link), identity);
     }
 
-    // Wait for the join, then stay for the requested duration while writing stats once per second.
-    const double startMs = juce::Time::getMillisecondCounterHiRes();
-    const double joinDeadlineMs = startMs + 10000.0;
+    const auto isFailed = [&] { return failed; };
 
-    while (! joined && ! failed && juce::Time::getMillisecondCounterHiRes() < joinDeadlineMs)
-        pumpMessages (10);
+    if (! waitUntil ([&] { return connected; }, 15000.0, isFailed))
+        return failed ? 1 : fail ("timed out waiting for the welcome");
 
-    if (failed)
-        return 1;
-
-    if (! joined)
-        return fail ("timed out waiting to join");
-
-    if (o.statsLog != juce::File())
+    const double welcomeMs = juce::Time::getMillisecondCounterHiRes();
+    const auto project = [&] { return session.project(); };
+    const auto myTrack = [&] (const juce::String& trackName) -> Id
     {
-        o.statsLog.getParentDirectory().createDirectory();
-        o.statsLog.replaceWithText ("");
-    }
+        if (const auto p = project())
+            for (const auto& t : p->tracks)
+                if (t.name == trackName && t.author == user)
+                    return t.id;
 
-    const double sessionStartMs = juce::Time::getMillisecondCounterHiRes();
-    const double endMs = sessionStartMs + o.durationSeconds * 1000.0;
-    double nextStatsMs = sessionStartMs + 1000.0;
-
-    const auto writeStats = [&]
-    {
-        emitted.flush();
-        detected.flush();
-
-        if (o.statsLog == juce::File())
-            return;
-
-        const auto& s = client.getState();
-        const auto stats = client.receiveBuffer().getStats();
-        const auto peaks = engine.takePeaks();
-        const double t = (juce::Time::getMillisecondCounterHiRes() - sessionStartMs) / 1000.0;
-
-        // What the server says it receives from this client (-1 until the first stats message).
-        juce::int64 serverPacketsFromMe = -1, serverWrongFrameFromMe = -1;
-
-        for (const auto& st : s.stats)
-        {
-            if (st.id == s.clientId && st.packets != ~0u)
-            {
-                serverPacketsFromMe = (juce::int64) st.packets;
-                serverWrongFrameFromMe = (juce::int64) st.wrongFrame;
-            }
-        }
-
-        juce::String line;
-        line << "{\"t\":" << juce::String (t, 3)
-             << ",\"pingMs\":" << s.pingMs
-             << ",\"jitterBlocks\":" << stats.sizeBlocks
-             << ",\"underruns\":" << (juce::int64) stats.underruns
-             << ",\"late\":" << (juce::int64) stats.late
-             << ",\"participants\":" << (int) s.participants.size()
-             << ",\"trackPlaying\":" << jsonBool (s.transport.playing)
-             << ",\"trackPosition\":" << (juce::int64) client.getTrackPosition()
-             << ",\"peakVoice\":" << juce::String (peaks.voice, 3)
-             << ",\"peakInstrument\":" << juce::String (peaks.instrument, 3)
-             << ",\"peakReceived\":" << juce::String (peaks.received, 3)
-             << ",\"peakOutput\":" << juce::String (peaks.output, 3)
-             << ",\"mixPackets\":" << (juce::int64) client.getMixPacketsReceived()
-             << ",\"serverPacketsFromMe\":" << serverPacketsFromMe
-             << ",\"serverWrongFrameFromMe\":" << serverWrongFrameFromMe
-             << "}\n";
-        o.statsLog.appendText (line);
+        return {};
     };
 
-    while (! failed)
+    // Sends one op and waits until a new version arrives or the host rejects it.
+    const auto sendAndWait = [&] (const juce::var& op, const juce::String& what) -> bool
     {
-        const double now = juce::Time::getMillisecondCounterHiRes();
+        const auto before = project() != nullptr ? project()->version : 0;
+        const int rejectedBefore = rejections;
+        session.getClient()->sendOp (op);
 
-        if (now >= endMs)
-            break;
-
-        if (now >= nextStatsMs)
+        if (! waitUntil ([&] { return (project() != nullptr && project()->version > before) || rejections > rejectedBefore; },
+                         10000.0, isFailed))
         {
-            writeStats();
-            nextStatsMs += 1000.0;
+            if (! failed)
+                markFailed ("timed out waiting for " + what);
+
+            return false;
         }
 
-        pumpMessages ((int) juce::jlimit (1.0, 50.0, std::min (endMs, nextStatsMs) - now));
+        return true;
+    };
+
+    // Waits until every take this client began is complete on the host with its region (pending list empty).
+    const auto waitOwnTakes = [&] (double timeoutMs) -> bool
+    {
+        if (! waitUntil ([&] { return session.getClient()->transfers().pendingTakes == 0 && ! session.isImporting(); }, timeoutMs, isFailed))
+        {
+            if (! failed)
+                markFailed ("timed out flushing my takes (" + juce::String (session.getClient()->transfers().pendingUploads)
+                            + " segments still to upload)");
+
+            return false;
+        }
+
+        scanTakes();
+        return true;
+    };
+
+    bool ownTakes = false;
+
+    if (o.resume && ! failed)
+    {
+        ownTakes = true;
+        waitOwnTakes (o.durationGiven ? o.durationSeconds * 1000.0 : 120000.0);
+
+        for (const auto& take : session.getResumedTakes())
+        {
+            const auto* t = project() != nullptr ? project()->findTake (take) : nullptr;
+
+            if (t != nullptr && t->complete && completePrinted.insert (take).second)
+                headlessPrint ("take_complete " + take + " " + juce::String ((juce::int64) t->samples));
+        }
     }
 
-    engine.setTransport (nullptr);
-    client.leave();
-    pumpMessages (20);
+    for (const auto& track : o.addTracks)
+    {
+        if (failed)
+            break;
 
-    emitted.flush();
-    detected.flush();
+        sendAndWait (Ops::addTrack (newId(), track.name, track.kind), "add_track " + track.name);
+    }
+
+    if (o.importFile != juce::File() && ! failed)
+    {
+        ownTakes = true;
+
+        if (const auto started = session.importFile (o.importFile); started.failed())
+            markFailed (started.getErrorMessage());
+        else if (! waitUntil ([&] { return importResult.has_value(); }, 600000.0, isFailed))
+            markFailed ("timed out importing " + o.importFile.getFullPathName());
+        else if (importResult->failed())
+            markFailed (importResult->getErrorMessage());
+    }
+
+    if (o.recordTrack.isNotEmpty() && ! failed)
+    {
+        ownTakes = true;
+        const Id trackId = myTrack (o.recordTrack);
+
+        if (trackId.isEmpty())
+        {
+            markFailed ("no track of mine named " + o.recordTrack);
+        }
+        else
+        {
+            const auto target = (int64_t) std::llround (o.recordAt * sampleRate);
+            engine.setPosition (target);
+
+            if (! waitUntil ([&] { return engine.getPosition() == target; }, 3000.0, isFailed))
+                markFailed ("the transport did not move to " + juce::String ((juce::int64) target));
+            else if (const auto started = session.startTake (trackId); started.failed())
+                markFailed ("record: " + started.getErrorMessage());
+            else
+            {
+                // Device time: the take lasts recordFor seconds of audio callbacks, not of wall clock.
+                const auto endPosition = target + (int64_t) std::llround (o.recordFor * sampleRate);
+                waitUntil ([&] { return engine.getPosition() >= endPosition; }, o.recordFor * 1000.0 + 30000.0, isFailed);
+
+                if (! session.stopTake())
+                    markFailed ("the take was shorter than the recording offset");
+            }
+        }
+    }
+
+    if (o.opsFile != juce::File() && ! failed)
+    {
+        juce::StringArray lines;
+
+        if (! o.opsFile.existsAsFile())
+            markFailed ("ops file not found: " + o.opsFile.getFullPathName());
+        else
+            o.opsFile.readLines (lines);
+
+        for (const auto& raw : lines)
+        {
+            if (failed)
+                break;
+
+            const auto line = raw.trim();
+
+            if (line.isEmpty())
+                continue;
+
+            const auto op = juce::JSON::parse (line);
+
+            if (! op.isObject() || ! op.hasProperty ("op"))
+            {
+                markFailed ("invalid op line: " + line);
+                break;
+            }
+
+            sendAndWait (op, "op " + op["op"].toString());
+        }
+    }
+
+    if (ownTakes && ! failed && ! o.resume)
+        waitOwnTakes (120000.0);
+
+    if (! failed && ! o.resume)
+    {
+        if (o.waitTakes > 0)
+        {
+            const auto countReady = [&]
+            {
+                scanTakes();
+                return (int) cachedPrinted.size();
+            };
+
+            if (! waitUntil ([&] { return countReady() >= o.waitTakes; }, o.durationGiven ? o.durationSeconds * 1000.0 : 120000.0, isFailed)
+                 && ! failed)
+                markFailed ("timed out waiting for " + juce::String (o.waitTakes) + " complete takes (have "
+                            + juce::String ((int) cachedPrinted.size()) + ")");
+        }
+        else
+        {
+            const double endMs = welcomeMs + o.durationSeconds * 1000.0;
+            waitUntil ([&] { return juce::Time::getMillisecondCounterHiRes() >= endMs; }, o.durationSeconds * 1000.0 + 1000.0, isFailed);
+        }
+    }
+
+    const auto p = project();
+
+    if (o.exportFile != juce::File() && p != nullptr && ! failed)
+    {
+        auto* cache = session.getClient()->cache();
+
+        if (cache == nullptr)
+            markFailed ("no local cache to export from");
+        else if (const auto exported = exportMix (p, *cache, o.exportFile); exported.failed())
+            markFailed ("export: " + exported.getErrorMessage());
+        else
+            headlessPrint ("exported " + o.exportFile.getFullPathName());
+    }
+
+    if (o.dumpProject != juce::File() && p != nullptr)
+    {
+        o.dumpProject.getParentDirectory().createDirectory();
+
+        if (! o.dumpProject.replaceWithText (toJson (*p)))
+            markFailed ("could not write " + o.dumpProject.getFullPathName());
+    }
+
+    if (p != nullptr)
+        headlessPrint ("project_hash " + contentHash (*p));
 
     if (o.asioDevice.isNotEmpty())
-    {
         headlessPrint ("callbacks " + juce::String ((juce::int64) engine.getCallbackCount()));
 
-        if (const auto deviceError = engine.takeDeviceError(); deviceError.isNotEmpty())
-            return fail ("ASIO device: " + deviceError);
-    }
-
-    if (o.compareLog != juce::File())
-    {
-        const auto otherEmitted = readClickLog (o.compareLog);
-        headlessPrint (formatLatencyLine (pairClickLatencies (otherEmitted, detected.events())));
-    }
-
+    run = nullptr;
+    pumpMessages (20);
     return failed ? 1 : 0;
 }
 }

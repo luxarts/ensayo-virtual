@@ -1,0 +1,603 @@
+#include "client/SessionController.h"
+#include "client/Offline.h"
+#include "ui/Text.h"
+#include <juce_events/juce_events.h>
+#include <algorithm>
+#include <cmath>
+
+namespace ensayo
+{
+namespace
+{
+    juce::String translateEngineError (const juce::String& error)
+    {
+        if (error.startsWith ("No audio device"))
+            return ES ("No hay un dispositivo de audio funcionando: eleg\xC3\xAD uno en el lobby");
+
+        if (error.startsWith ("Already recording"))
+            return ES ("Ya se est\xC3\xA1 grabando");
+
+        if (error.startsWith ("Cannot record while calibrating"))
+            return ES ("No se puede grabar mientras se calibra la latencia");
+
+        if (error.startsWith ("Imported tracks"))
+            return ES ("En una pista importada no se graba");
+
+        return error;
+    }
+}
+
+SessionController::SessionController (StudioEngine& e)
+    : engine (e), generation (std::make_shared<std::atomic<int>> (0))
+{
+}
+
+SessionController::~SessionController()
+{
+    leave();
+    ++(*generation);
+}
+
+//==============================================================================
+void SessionController::post (std::function<void()> fn)
+{
+    juce::MessageManager::callAsync ([g = generation, gen = generation->load(), fn = std::move (fn)]
+    {
+        if (g->load() == gen)
+            fn();
+    });
+}
+
+juce::String SessionController::lanAddress()
+{
+    juce::String fallback;
+
+    for (const auto& address : juce::IPAddress::getAllAddresses (false))
+    {
+        if (address.isIPv6 || address == juce::IPAddress::local())
+            continue;
+
+        const auto text = address.toString();
+        const auto a = address.address[0], b = address.address[1];
+
+        // Link-local 169.254.x.x comes from adapters without a network and is never useful.
+        if (text == "0.0.0.0" || (a == 169 && b == 254))
+            continue;
+
+        if ((a == 10) || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31))
+            return text;
+
+        if (fallback.isEmpty())
+            fallback = text;
+    }
+
+    return fallback.isNotEmpty() ? fallback : "127.0.0.1";
+}
+
+bool SessionController::isConnected() const noexcept   { return client != nullptr && client->isConnected(); }
+
+std::shared_ptr<const Project> SessionController::project() const
+{
+    return client != nullptr ? client->project() : nullptr;
+}
+
+SessionLink SessionController::getShareLink() const
+{
+    if (projectHost != nullptr)
+        return { lanAddress(), link.port, link.sessionId };
+
+    return link;
+}
+
+void SessionController::setCalibration (int samples)
+{
+    calibration = samples;
+    engine.setCalibration (samples);
+}
+
+void SessionController::setMetronome (bool clickOn, bool countInOn)
+{
+    click = clickOn;
+    countIn = countInOn;
+    engine.setMetronome (clickOn, countInOn);
+}
+
+//==============================================================================
+void SessionController::createClient (const SessionIdentity& identity)
+{
+    cacheRoot = identity.cacheRoot;
+    client = std::make_unique<ProjectClient> (ClientConfig { identity.cacheRoot, identity.user, identity.name });
+    everConnected = false;
+
+    client->onConnected = [this]
+    {
+        everConnected = true;
+        refreshEngine();
+        finishUnfinishedTakes();
+
+        if (onConnected) onConnected();
+    };
+
+    client->onProjectChanged = [this]
+    {
+        refreshEngine();
+
+        if (onProjectChanged) onProjectChanged();
+    };
+
+    client->onTransfersChanged = [this] { if (onTransfersChanged) onTransfersChanged(); };
+    client->onPresenceChanged  = [this] { if (onPresenceChanged) onPresenceChanged(); };
+    client->onDisconnected     = [this] (const juce::String& reason) { if (onDisconnected) onDisconnected (reason); };
+    client->onError            = [this] (const juce::String& message) { if (onError) onError (message); };
+    client->onRejected         = [this] (const juce::String& reason) { if (onRejected) onRejected (reason); };
+}
+
+// The engine plays the replica from the client's cache. The cache is created at the first welcome and kept across
+// reconnects to the same project, so the (possibly blocking) source swap happens once per session.
+void SessionController::refreshEngine()
+{
+    if (client == nullptr)
+        return;
+
+    engine.setProject (client->project());
+
+    if (auto* cache = client->cache(); cache != engineSource && cache != nullptr)
+    {
+        engine.setSampleSource (cache);
+        engineSource = cache;
+    }
+}
+
+juce::Result SessionController::host (const juce::File& projectDir, int port, const SessionIdentity& identity,
+                                      const juce::String& newProjectName)
+{
+    leave();
+
+    HostConfig config;
+    config.port = port;
+    projectHost = std::make_unique<ProjectHost> (config);
+
+    if (const auto started = projectHost->start (projectDir, identity.user, identity.name, newProjectName); started.failed())
+    {
+        projectHost = nullptr;
+        return started;
+    }
+
+    link = SessionLink { "127.0.0.1", projectHost->getPort(), projectHost->getSessionId() };
+    createClient (identity);
+    client->connect (link);
+    return juce::Result::ok();
+}
+
+void SessionController::join (const SessionLink& target, const SessionIdentity& identity)
+{
+    leave();
+    link = target;
+    createClient (identity);
+    client->connect (link);
+}
+
+void SessionController::reconnect()
+{
+    if (client == nullptr || client->isConnected())
+        return;
+
+    client->disconnect();
+    client->connect (link);
+}
+
+void SessionController::leave()
+{
+    if (isRecording())
+        stopTake();
+
+    joinImportThread();
+
+    if (importFinish && importQueued)
+        completeImport();   // every segment is queued: the finish intent is persisted even if we disconnect now
+
+    importFinish.reset();
+    importBusy = false;
+
+    exportCancel = true;
+
+    if (exportThread.joinable())
+        exportThread.join();
+
+    exportBusy = false;
+    exportCancel = false;
+
+    ++(*generation);   // drops the posts of the threads just joined and of the client being destroyed
+
+    if (listening)
+    {
+        engine.setPreviewBuffer (nullptr);
+        listening = false;
+    }
+
+    if (client != nullptr || engineSource != nullptr)
+    {
+        engine.stop();
+        engine.setPosition (0);
+    }
+
+    if (engineSource != nullptr)
+    {
+        engine.setSampleSource (nullptr);
+        engineSource = nullptr;
+    }
+
+    engine.setProject (nullptr);
+    engine.onPreviewPacket = nullptr;
+
+    if (client != nullptr)
+    {
+        client->onConnected = nullptr;
+        client->onProjectChanged = nullptr;
+        client->onTransfersChanged = nullptr;
+        client->onPresenceChanged = nullptr;
+        client->onDisconnected = nullptr;
+        client->onError = nullptr;
+        client->onRejected = nullptr;
+        client->disconnect();
+        client = nullptr;
+    }
+
+    if (projectHost != nullptr)
+    {
+        projectHost->stop();
+        projectHost = nullptr;
+    }
+
+    everConnected = false;
+    resumedTakes.clear();
+    link = {};
+}
+
+//==============================================================================
+int64_t SessionController::countInSamples() const
+{
+    const auto p = project();
+
+    if (! countIn || p == nullptr || p->bpm <= 0.0)
+        return 0;
+
+    // Same formula as StudioEngine::startRecording: one bar of beatsPerBar beats.
+    return (int64_t) std::llround (p->beatsPerBar * 60.0 * sampleRate / p->bpm);
+}
+
+juce::Result SessionController::startTake (const Id& trackId)
+{
+    if (client == nullptr || ! client->isConnected())
+        return juce::Result::fail (ES ("Sin conexi\xC3\xB3n con el anfitri\xC3\xB3n: no se puede grabar"));
+
+    if (isRecording())
+        return juce::Result::fail (ES ("Ya se est\xC3\xA1 grabando"));
+
+    const auto p = client->project();
+    const auto* track = p != nullptr ? p->findTrack (trackId) : nullptr;
+
+    if (track == nullptr)
+        return juce::Result::fail (ES ("Arm\xC3\xA1 una pista propia (\xE2\x97\x8FR) para grabar"));
+
+    if (track->author != client->user())
+        return juce::Result::fail ("Solo se graba en pistas propias");
+
+    if (track->kind == TrackKind::imported)
+        return juce::Result::fail (ES ("En una pista importada no se graba"));
+
+    auto* device = engine.getDeviceManager().getCurrentAudioDevice();
+
+    if (device == nullptr || ! device->isPlaying())
+        return juce::Result::fail (ES ("No hay un dispositivo de audio funcionando: eleg\xC3\xAD uno en el lobby"));
+
+    const Id take = newId();
+    const int channels = track->kind == TrackKind::voice ? 1 : 2;
+    const int64_t point = engine.getPosition();
+    const int64_t offset = recordingOffset (countInSamples(), device->getInputLatencyInSamples(),
+                                            device->getOutputLatencyInSamples(), calibration);
+    const int64_t skipPeaks = offset / peakBlock;
+
+    const auto wav = cacheRoot.getChildFile (p->id).getChildFile ("recordings").getChildFile (take + ".wav");
+    wav.getParentDirectory().createDirectory();
+
+    {
+        const std::lock_guard<std::mutex> scoped (liveLock);
+        livePeaks.clear();
+    }
+
+    takeId = take;
+    takeTrack = trackId;
+    takePoint = point;
+    takeOffset = offset;
+    stopping = false;
+
+    auto* c = client.get();
+    auto& recorder = engine.getRecorder();
+    recorder.onSegment = [c, take] (int index, const juce::MemoryBlock& flac, int) { c->queueSegment (take, index, flac); };
+
+    // Peaks are re-based on the record point (the first `offset` samples are count-in and latency), so the growing
+    // region lines up with the timeline here and on the other machines.
+    recorder.onPeaks = [this, c, take, skipPeaks] (int64_t fromPeak, const std::vector<Peak>& peaks)
+    {
+        const int64_t skip = std::max<int64_t> (0, skipPeaks - fromPeak);
+
+        if (skip >= (int64_t) peaks.size())
+            return;
+
+        const std::vector<Peak> aligned (peaks.begin() + (std::ptrdiff_t) skip, peaks.end());
+        const int64_t from = fromPeak + skip - skipPeaks;
+        c->sendPeaks (take, from, aligned);
+
+        const std::lock_guard<std::mutex> scoped (liveLock);
+
+        if ((int64_t) livePeaks.size() < from + (int64_t) aligned.size())
+            livePeaks.resize ((size_t) (from + (int64_t) aligned.size()));
+
+        std::copy (aligned.begin(), aligned.end(), livePeaks.begin() + (std::ptrdiff_t) from);
+    };
+
+    recorder.onLiveAudio = nullptr;
+    recorder.onError = [this] (const juce::String& message)
+    {
+        post ([this, message] { if (onError) onError ("Error grabando: " + message); });
+    };
+
+    // Fires on the writer thread when the take ends, normally inside stopRecording; by itself only when a segment
+    // could not be encoded (the recorder stops) - then the take is stopped and finished from the message thread.
+    recorder.onFinished = [this] (int, int64_t)
+    {
+        if (! stopping.load())
+            post ([this]
+            {
+                if (isRecording())
+                {
+                    stopTake();
+
+                    if (onTakeAborted) onTakeAborted (ES ("La grabaci\xC3\xB3n se detuvo por un error de escritura; se conserva lo grabado"));
+                }
+            });
+    };
+
+    engine.onPreviewPacket = [c] (const uint8_t* packet, size_t len) { c->sendPreview (packet, len); };
+
+    const auto started = engine.startRecording (*track, take, wav);
+
+    if (started.failed())
+    {
+        takeId.clear();
+        takeTrack.clear();
+        return juce::Result::fail (translateEngineError (started.getErrorMessage()));
+    }
+
+    // Right after the start: the first segment comes a second later, and one queued earlier would be kept anyway.
+    client->beginTake (take, channels, trackId, point, offset);
+    return juce::Result::ok();
+}
+
+std::optional<RecordingResult> SessionController::stopTake()
+{
+    if (! engine.isRecording())
+        return std::nullopt;
+
+    stopping = true;
+    const auto result = engine.stopRecording();
+    const auto take = std::exchange (takeId, Id());
+    const auto track = std::exchange (takeTrack, Id());
+
+    {
+        const std::lock_guard<std::mutex> scoped (liveLock);
+        livePeaks.clear();
+    }
+
+    if (client != nullptr)
+    {
+        if (result)
+            client->finishTake (result->take, track, result->region);
+        else
+            client->discardTake (take);   // shorter than the count-in and latency: nothing to keep
+    }
+
+    return result;
+}
+
+bool SessionController::isRecording() const noexcept   { return engine.isRecording(); }
+
+std::optional<LiveRecording> SessionController::ownLiveRecording() const
+{
+    if (takeId.isEmpty() || client == nullptr)
+        return std::nullopt;
+
+    LiveRecording live;
+    live.user = client->user();
+    live.take = takeId;
+    live.track = takeTrack;
+    live.start = takePoint;
+
+    const std::lock_guard<std::mutex> scoped (liveLock);
+    live.peaks = livePeaks;
+    return live;
+}
+
+int SessionController::finishUnfinishedTakes()
+{
+    if (client == nullptr)
+        return 0;
+
+    int finished = 0;
+
+    for (const auto& u : client->unfinishedTakes())
+    {
+        if (u.take == takeId || (importFinish && importFinish->take == u.take))
+            continue;   // still being recorded or imported here
+
+        const int64_t length = u.samples - u.offset;
+
+        if (length < 1 || ! isValidId (u.track))
+        {
+            client->discardTake (u.take);
+            continue;
+        }
+
+        client->finishTake (u.take, u.track, Region { newId(), u.take, u.start, u.offset, length });
+        resumedTakes.push_back (u.take);
+        ++finished;
+    }
+
+    return finished;
+}
+
+void SessionController::setListening (bool enabled)
+{
+    if (client == nullptr)
+        return;
+
+    listening = enabled;
+    client->setListening (enabled);
+    engine.setPreviewBuffer (enabled ? client->previewBuffer() : nullptr);
+}
+
+//==============================================================================
+void SessionController::joinImportThread()
+{
+    if (importThread.joinable())
+        importThread.join();
+}
+
+void SessionController::completeImport()
+{
+    if (! importFinish || client == nullptr)
+        return;
+
+    const auto f = *importFinish;
+    importFinish.reset();
+    importQueued = false;
+    client->finishTake (f.take, f.track, Region { newId(), f.take, 0, 0, f.samples });
+}
+
+juce::Result SessionController::importFile (const juce::File& file, const juce::String& trackName)
+{
+    if (client == nullptr || ! client->isConnected() || client->project() == nullptr)
+        return juce::Result::fail (ES ("Sin conexi\xC3\xB3n con el anfitri\xC3\xB3n: no se puede importar"));
+
+    if (importBusy)
+        return juce::Result::fail (ES ("Ya hay una importaci\xC3\xB3n en curso"));
+
+    if (! file.existsAsFile())
+        return juce::Result::fail ("No existe el archivo " + file.getFullPathName());
+
+    joinImportThread();
+    importBusy = true;
+    importQueued = false;
+    const auto name = trackName.isNotEmpty() ? trackName : file.getFileNameWithoutExtension();
+
+    if (onImportProgress) onImportProgress (name, 0.0f);
+
+    // Phase 1 (thread): decode, resample and cut. Phase 2 (message thread): track + take. Phase 3 (thread): queue the
+    // segments. Phase 4 (message thread): finish the take with one region at 0. No thread ever waits for the message
+    // thread, so leave() can join them.
+    importThread = std::thread ([this, file, name]
+    {
+        auto audio = std::make_shared<juce::AudioBuffer<float>>();
+        const auto loaded = loadAndResample (file, *audio);
+        auto segments = std::make_shared<std::vector<juce::MemoryBlock>>();
+
+        if (loaded.wasOk())
+            *segments = makeSegments (*audio);
+
+        const int channels = audio->getNumChannels();
+        const int64_t samples = audio->getNumSamples();
+        audio.reset();
+
+        post ([this, loaded, segments, channels, samples, name]
+        {
+            joinImportThread();
+
+            if (loaded.failed() || segments->empty() || samples < 1 || client == nullptr)
+            {
+                importBusy = false;
+                const auto why = loaded.failed() ? loaded.getErrorMessage() : juce::String ("el archivo no tiene audio");
+
+                if (onImportFinished) onImportFinished (name, juce::Result::fail ("No se pudo importar " + name + ": " + why));
+
+                return;
+            }
+
+            const Id track = newId(), take = newId();
+            client->sendOp (Ops::addTrack (track, name, TrackKind::imported));
+            client->beginTake (take, channels, track, 0);
+            importFinish = ImportFinish { take, track, name, samples };
+
+            auto* c = client.get();
+            importThread = std::thread ([this, c, take, segments, name]
+            {
+                const auto total = (int) segments->size();
+
+                for (int i = 0; i < total; ++i)
+                {
+                    c->queueSegment (take, i, (*segments)[(size_t) i]);
+                    const float fraction = (float) (i + 1) / (float) total;
+                    post ([this, name, fraction] { if (onImportProgress) onImportProgress (name, fraction); });
+                }
+
+                importQueued = true;
+
+                post ([this, name]
+                {
+                    joinImportThread();
+                    completeImport();
+                    importBusy = false;
+
+                    if (onImportFinished) onImportFinished (name, juce::Result::ok());
+                });
+            });
+        });
+    });
+
+    return juce::Result::ok();
+}
+
+juce::Result SessionController::exportMix (const juce::File& wav)
+{
+    if (client == nullptr || client->project() == nullptr || client->cache() == nullptr)
+        return juce::Result::fail ("No hay un proyecto abierto para exportar");
+
+    if (exportBusy)
+        return juce::Result::fail (ES ("Ya hay una exportaci\xC3\xB3n en curso"));
+
+    if (exportThread.joinable())
+        exportThread.join();
+
+    exportBusy = true;
+    exportCancel = false;
+    auto snapshot = client->project();
+    const SampleSource* source = client->cache();
+
+    exportThread = std::thread ([this, snapshot, source, wav]
+    {
+        int lastPercent = -1;
+        const auto result = ensayo::exportMix (snapshot, *source, wav, [this, &lastPercent] (float fraction)
+        {
+            if (const int percent = (int) (fraction * 100.0f); percent != lastPercent)
+            {
+                lastPercent = percent;
+                post ([this, fraction] { if (onExportProgress) onExportProgress (fraction); });
+            }
+
+            return ! exportCancel.load();
+        });
+
+        post ([this, wav, result]
+        {
+            if (exportThread.joinable())
+                exportThread.join();
+
+            exportBusy = false;
+
+            if (onExportFinished) onExportFinished (wav, result);
+        });
+    });
+
+    return juce::Result::ok();
+}
+}
