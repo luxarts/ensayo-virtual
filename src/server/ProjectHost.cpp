@@ -110,26 +110,31 @@ namespace
     }
 
     // Cryptographically secure bytes (tokens and clientIds identify a peer on the data connection and over UDP).
-    void secureRandom (void* data, size_t size)
+    // False when the system RNG fails: callers fail closed (no weaker fallback).
+    bool secureRandom (void* data, size_t size) noexcept
     {
-        if (! BCRYPT_SUCCESS (BCryptGenRandom (nullptr, static_cast<PUCHAR> (data), (ULONG) size, BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
-            juce::Random::getSystemRandom().fillBitsRandomly (data, size);   // never expected; better than zeros
+        return BCRYPT_SUCCESS (BCryptGenRandom (nullptr, static_cast<PUCHAR> (data), (ULONG) size, BCRYPT_USE_SYSTEM_PREFERRED_RNG));
     }
 
-    juce::String randomToken()
+    std::optional<juce::String> randomToken()
     {
         uint8_t bytes[8];
-        secureRandom (bytes, sizeof (bytes));
+
+        if (! secureRandom (bytes, sizeof (bytes)))
+            return std::nullopt;
+
         return juce::String::toHexString (bytes, (int) sizeof (bytes), 0).toLowerCase();   // 16 hex chars
     }
 
-    uint32_t randomClientId()
+    std::optional<uint32_t> randomClientId()
     {
         uint32_t id = 0;
 
         while (id == 0)
         {
-            secureRandom (&id, sizeof (id));
+            if (! secureRandom (&id, sizeof (id)))
+                return std::nullopt;
+
             id &= 0x7fffffffu;
         }
 
@@ -1017,6 +1022,20 @@ struct ProjectHost::Impl
         if (self == nullptr)
             return false;   // the host is stopping
 
+        // Identity first, so a failing RNG refuses the join before anything is applied.
+        auto clientId = randomClientId();
+
+        while (clientId && std::any_of (controls.begin(), controls.end(), [&clientId] (const ConnectionPtr& o) { return o->clientId == *clientId; }))
+            clientId = randomClientId();
+
+        const auto token = randomToken();
+
+        if (! clientId || ! token)
+        {
+            log ("BCryptGenRandom fallo: se rechaza la conexion de " + name);
+            return refuse (c, "error interno");
+        }
+
         if (project.load()->userName (user) != name)
         {
             const auto result = applyLocked (Ops::addUser (user, name), hostUser);
@@ -1025,27 +1044,22 @@ struct ProjectHost::Impl
                 return refuse (c, juce::String (juce::CharPointer_UTF8 ("nombre inv\xc3\xa1lido")));
         }
 
-        uint32_t clientId = randomClientId();
-
-        while (std::any_of (controls.begin(), controls.end(), [clientId] (const ConnectionPtr& o) { return o->clientId == clientId; }))
-            clientId = randomClientId();
-
         c.kind = Connection::Kind::control;
         c.kindForReader = Connection::Kind::control;
         c.user = user;
         c.name = name;
-        c.clientId = clientId;
-        c.token = randomToken();
+        c.clientId = *clientId;
+        c.token = *token;
         c.identified.store (true, std::memory_order_release);
 
-        c.send (object ({ { "t", "welcome" }, { "clientId", (int) clientId }, { "token", c.token },
+        c.send (object ({ { "t", "welcome" }, { "clientId", (int) *clientId }, { "token", c.token },
                           { "udpPort", boundPort }, { "isHost", user == hostUser },
                           { "project", toVar (*project.load()) } }));
 
         controls.push_back (std::move (self));
         publishUdpPeers();
         broadcastPresence();
-        log (name + " se unio (clientId " + juce::String ((int) clientId) + ")");
+        log (name + " se unio (clientId " + juce::String ((int) *clientId) + ")");
         return true;
     }
 

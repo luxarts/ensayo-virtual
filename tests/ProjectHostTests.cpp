@@ -759,17 +759,14 @@ public:
     {
         beginTest ("the host user id is refused from a non-loopback address");
 
-        juce::String remote;
+        juce::StringArray candidates;
 
         for (const auto& ip : juce::IPAddress::getAllAddresses (false))
         {
             const auto text = ip.toString();
 
             if (! ip.isNull() && ! text.startsWith ("127.") && ! text.startsWith ("169.254.") && text != "0.0.0.0")
-            {
-                remote = text;
-                break;
-            }
+                candidates.addIfNotAlreadyThere (text);
         }
 
         const auto hostUser = newId();
@@ -779,13 +776,36 @@ public:
         Client local (22216);
         expect ((bool) local.join (host.getSessionId(), hostUser, "Lucas")["isHost"]);   // loopback host path
 
-        Client claim (22216, remote);
-
-        if (remote.isEmpty() || ! claim.connect())
+        if (candidates.isEmpty())
         {
-            logMessage ("no non-loopback IPv4 address reachable here: only mayClaimUser covers the remote case");
+            logMessage ("no non-loopback IPv4 address on this machine: only mayClaimUser covers the remote case");
             return;
         }
+
+        // The listener binds every interface: the first local address that connects is the non-loopback source.
+        juce::String remote;
+        std::unique_ptr<Client> claimHolder;
+
+        for (const auto& candidate : candidates)
+        {
+            auto attempt = std::make_unique<Client> (22216, candidate);
+
+            if (attempt->connect())
+            {
+                remote = candidate;
+                claimHolder = std::move (attempt);
+                break;
+            }
+        }
+
+        if (claimHolder == nullptr)
+        {
+            expect (false, "no local non-loopback address accepted a connection; tried: " + candidates.joinIntoString (", "));
+            return;
+        }
+
+        logMessage ("claiming the host id from " + remote);
+        auto& claim = *claimHolder;
 
         claim.send (object ({ { "t", "hello" }, { "protocol", 2 }, { "session", host.getSessionId() },
                               { "user", hostUser }, { "name", "Impostor" } }));
