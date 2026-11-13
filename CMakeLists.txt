@@ -58,6 +58,8 @@ set(ENSAYO_CORE_SOURCES
     src/client/YouTubeImporter.cpp
     # T8
     src/client/HeadlessClient.cpp
+    # T5
+    src/client/ProjectClient.cpp
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
@@ -115,6 +117,8 @@ set(ENSAYO_TEST_SOURCES
     tests/ScreenshotTests.cpp
     # T4
     tests/ProjectHostTests.cpp
+    # T5
+    tests/ProjectClientTests.cpp
 )
 
 set(ENSAYO_MODULES
