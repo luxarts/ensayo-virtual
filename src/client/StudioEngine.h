@@ -103,6 +103,13 @@ public:
     void clearParticipantGains() noexcept;                       // every sender back to 1.0; message thread only
     float participantGain (uint32_t clientId) const noexcept;    // any thread; 1.0 without an entry
 
+    // Voice chat, receive statistics: the real frames decoded per stream (sender clientId, kind) since the engine was
+    // created; concealed frames do not count. The first chatCountCapacity streams are counted, the rest are not. Any
+    // thread (the counts are atomics the callback only increments).
+    struct ChatReceived { uint32_t clientId = 0; StreamKind kind = StreamKind::voice; uint64_t frames = 0; };
+    std::vector<ChatReceived> chatReceivedFrames() const;
+    static constexpr int chatCountCapacity = 64;
+
     void startCalibration();
     bool isCalibrating() const noexcept;
     std::optional<int> calibrationRoundTrip() const;
@@ -252,6 +259,10 @@ private:
     std::array<std::unique_ptr<RemoteSlotMix>, RemoteStreamTable::capacity> remoteMix;
     std::vector<uint8_t> remotePacket;
     std::vector<float> remoteInterleaved;
+    // Receive statistics: keys (RemoteStreamTable::keyFor) claimed in order by the callback, 0 = free; frames per key.
+    std::array<std::atomic<uint32_t>, chatCountCapacity> chatCountKeys {};
+    std::array<std::atomic<uint64_t>, chatCountCapacity> chatCountFrames {};
+    int chatCountIndex (uint32_t key) noexcept;                // audio thread: the key's entry (claimed), -1 = full
     // Per-sender gains: clientId << 32 | the gain's float bits; 0 = free entry.
     static constexpr int participantCapacity = 64;
     std::array<std::atomic<uint64_t>, participantCapacity> participantGains {};

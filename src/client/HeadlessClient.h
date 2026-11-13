@@ -42,6 +42,9 @@ namespace ensayo
 //   --dump-project <file>            at the end, writes the replica's project.json
 //   --duration S                     seconds to stay connected after the welcome (default 10); ignored with --resume
 //
+// Voice chat: while connected the engine sends the mic input (with --fake-audio, the fake device's first input; with
+// sine, a 440 Hz tone) to the others as a voice stream, always, and mixes theirs into the output, as the app does.
+//
 // Order: calibrate, connect, (resume), add tracks, import, record, ops, wait for my own takes to be complete on the
 // host, wait-takes or the duration, export, dump, hash.
 //
@@ -52,7 +55,8 @@ namespace ensayo
 // complete yet, "cached <take> <k>" each time k, the number of its segments in the local cache, grows, so segments
 // that arrive while it is being recorded show up; the complete-take line is printed once more even when the same
 // count already appeared as a partial one; use take_complete to know a take is complete), "calibration <samples>", "exported <wav>", "project_hash <sha1>" (at exit),
-// "error <text>". Returns 0 on success, 1 on a runtime failure, 2 on bad arguments.
+// "chat_rx <clientId> voice|instrument <frames>" (at exit, one per stream of another participant received during the
+// run: the real 128-sample Opus frames decoded, concealed ones not counted, 375 a second), "error <text>". Returns 0 on success, 1 on a runtime failure, 2 on bad arguments.
 struct HeadlessOptions
 {
     struct NewTrack { TrackKind kind = TrackKind::voice; juce::String name; };

@@ -632,6 +632,22 @@ public:
         expect (peak >= 0.425f && peak <= 0.575f, "output peak " + juce::String (peak, 4));
         expect (step <= bound && stepR <= bound, "click in the received stream: step " + juce::String (std::max (step, stepR), 6));
         expect (out.L.back() == 0.0f && out.R.back() == 0.0f, "silent after the stream ended");
+
+        // The receive counter: only real frames, never the concealed ones (the end alone conceals 18).
+        if (scenario == RemoteEnd::stops || scenario == RemoteEnd::dropOne)
+        {
+            const auto counts = engine.chatReceivedFrames();
+            const int sent = blocks - (scenario == RemoteEnd::dropOne ? 1 : 0);
+            expectEquals ((int) counts.size(), 1, "one stream counted");
+
+            if (counts.size() == 1)
+            {
+                logMessage ("  counted " + juce::String ((juce::int64) counts[0].frames) + " of " + juce::String (sent) + " frames sent");
+                expect (counts[0].clientId == 7 && counts[0].kind == StreamKind::voice);
+                expect ((int) counts[0].frames <= sent, "concealed frames were counted");
+                expect ((int) counts[0].frames >= sent - 8, "frames missing from the count");
+            }
+        }
     }
 
     void runTest() override

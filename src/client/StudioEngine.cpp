@@ -161,6 +161,7 @@ struct StudioEngine::RemoteSlotMix
     float gain = 1.0f;                               // participant gain reached at the end of the last block
     int tailCount = 0;                               // [0, tailCount) of L/R is a previous sender's faded tail...
     float tailGain = 1.0f;                           // ...played at that sender's gain, not ramped to the new one
+    int counter = -1;                                // the stream's chatCountFrames entry, -1 = not counted
 };
 
 //==============================================================================
@@ -650,6 +651,44 @@ float StudioEngine::participantGain (uint32_t clientId) const noexcept
     return 1.0f;
 }
 
+int StudioEngine::chatCountIndex (uint32_t key) noexcept
+{
+    for (int i = 0; i < chatCountCapacity; ++i)
+    {
+        auto& entry = chatCountKeys[(size_t) i];
+        const auto k = entry.load (std::memory_order_relaxed);   // only this thread writes the keys
+
+        if (k == key)
+            return i;
+
+        if (k == RemoteStreamTable::freeKey)
+        {
+            entry.store (key, std::memory_order_release);
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+std::vector<StudioEngine::ChatReceived> StudioEngine::chatReceivedFrames() const
+{
+    std::vector<ChatReceived> result;
+
+    for (int i = 0; i < chatCountCapacity; ++i)
+    {
+        const auto key = chatCountKeys[(size_t) i].load (std::memory_order_acquire);
+
+        if (key == RemoteStreamTable::freeKey)   // claimed in order: nothing after a free entry
+            break;
+
+        result.push_back ({ RemoteStreamTable::clientOf (key), RemoteStreamTable::kindOf (key),
+                            chatCountFrames[(size_t) i].load (std::memory_order_relaxed) });
+    }
+
+    return result;
+}
+
 void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
 {
     inRemote.store (true);
@@ -739,6 +778,7 @@ void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
                     m.channels = RemoteStreamTable::kindOf (key) == StreamKind::voice ? 1 : 2;
                     m.mono.reset();
                     m.stereo.reset();
+                    m.counter = chatCountIndex (key);
 
                     // What is still decoded belongs to the previous sender: it keeps its gain while the new stream
                     // (faded in) starts at its own.
@@ -759,6 +799,9 @@ void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
                     if (slot.pop (state, remotePacket.data(), len) && len == expected)
                     {
                         decodeInto (m, remotePacket.data(), len, dl, dr);
+
+                        if (m.counter >= 0)
+                            chatCountFrames[(size_t) m.counter].fetch_add (1, std::memory_order_relaxed);
 
                         if (! m.primed)
                             ramp (dl, dr, true);

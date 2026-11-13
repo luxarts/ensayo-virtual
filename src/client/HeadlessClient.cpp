@@ -888,6 +888,11 @@ int runHeadless (const HeadlessOptions& o)
     if (p != nullptr)
         headlessPrint ("project_hash " + contentHash (*p));
 
+    // Voice chat received during the run: real (not concealed) frames per stream of another participant.
+    for (const auto& c : engine.chatReceivedFrames())
+        headlessPrint ("chat_rx " + juce::String ((juce::int64) c.clientId) + (c.kind == StreamKind::voice ? " voice " : " instrument ")
+                       + juce::String ((juce::int64) c.frames));
+
     if (o.asioDevice.isNotEmpty())
         headlessPrint ("callbacks " + juce::String ((juce::int64) engine.getCallbackCount()));
 

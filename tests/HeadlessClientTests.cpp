@@ -18,7 +18,7 @@ class HeadlessClientTests : public juce::UnitTest
 public:
     HeadlessClientTests() : juce::UnitTest ("HeadlessClient", "EnsayoVirtual") {}
 
-    static constexpr int recordPort = 22252, resumePort = 22253, hostPort = 22254, deadPort = 22255, growPort = 22260;
+    static constexpr int recordPort = 22252, resumePort = 22253, hostPort = 22254, deadPort = 22255, growPort = 22260, chatPort = 22234;
 
     static bool waitFor (const std::function<bool()>& predicate, int timeoutMs)
     {
@@ -652,6 +652,71 @@ public:
 
             expect (completeAt >= 0 && completeCached, "the complete take is reported as cached after take_complete: " + lines.joinIntoString (" | "));
             host.stop();
+        }
+
+        beginTest ("runHeadless sends and receives the voice chat and prints chat_rx per received stream at exit");
+        {
+            const auto dir = tempDir ("chat");
+            ProjectHost host ({ chatPort, 8 });
+            expect (host.start (dir.getChildFile ("project"), newId(), "Host", "Charla").wasOk());
+            const SessionLink link { "127.0.0.1", chatPort, host.getSessionId() };
+
+            // Another participant in this process: an engine with a sine on its fake mic, joined like the app does.
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::sine440);
+            auto session = std::make_unique<SessionController> (engine);
+            bool connected = false;
+            session->onConnected = [&] { connected = true; };
+            const Id otherUser = newId();
+            session->join (link, { otherUser, "Rita", dir.getChildFile ("rita-cache") });
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            juce::StringArray lines;
+            uint32_t otherClient = 0;
+            setHeadlessOutputCopyForTest ([&] (const juce::String& line)
+            {
+                lines.add (line);
+
+                if (line.startsWith ("welcome ") && session->getClient() != nullptr)
+                    for (const auto& pr : session->getClient()->presence())
+                        if (pr.user == otherUser)
+                            otherClient = pr.clientId;
+            });
+
+            const auto o = parse ({ "--join", link.toString(), "--cache", dir.getChildFile ("cache").getFullPathName(),
+                                    "--fake-audio", "sine", "--duration", "3" });
+
+            if (o)
+                expectEquals (runHeadless (*o), 0);
+
+            setHeadlessOutputCopyForTest (nullptr);
+            const auto received = engine.chatReceivedFrames();
+            session = nullptr;
+            engine.getDeviceManager().closeAudioDevice();
+            host.stop();
+
+            // 3 s at 375 frames a second; the first keepalive and the device start may cost a little.
+            juce::int64 frames = 0;
+
+            for (const auto& line : lines)
+                if (line.startsWith ("chat_rx " + juce::String ((juce::int64) otherClient) + " voice "))
+                    frames = line.fromLastOccurrenceOf (" ", false, false).getLargeIntValue();
+
+            logMessage ("headless received " + juce::String (frames) + " voice frames from Rita (client "
+                        + juce::String ((juce::int64) otherClient) + ")");
+            expect (otherClient != 0, "Rita's clientId is in the presence");
+            expect (frames >= 750, "chat_rx from Rita: " + lines.joinIntoString (" | "));
+            expect (frames <= 3 * 375 + 375, "more frames than were sent: " + juce::String (frames));
+
+            uint64_t back = 0;
+
+            for (const auto& c : received)
+                if (c.kind == StreamKind::voice)
+                    back += c.frames;
+
+            logMessage ("Rita received " + juce::String ((juce::int64) back) + " voice frames from the headless client");
+            expect (back >= 750, "the headless client's voice did not reach the other participant");
         }
 
         beginTest ("runHeadless --join to a dead host fails cleanly");
