@@ -901,6 +901,16 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         m->lost = 0;
     }
 
+    // Chat send: the frame being built when the device stopped is dropped (the clock moves on to the next frame) and
+    // both streams fade in again from a closed gate.
+    chatClock = (chatClock + chatFrame - 1) / chatFrame * chatFrame;
+
+    for (auto* sender : { chatVoice.get(), chatInstrument.get() })
+    {
+        sender->gate = 0;
+        sender->open = false;
+    }
+
     remoteInterleaved.assign ((size_t) chatFrame * 2, 0.0f);
     remotePacket.assign (maxPacketBytes, 0);
     lastRemoteTable = nullptr;

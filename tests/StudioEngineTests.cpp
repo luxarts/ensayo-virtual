@@ -1325,6 +1325,60 @@ public:
             expectEquals (sink.count (StreamKind::voice), atDisable, "nothing is sent once the chat is disabled");
         }
 
+        beginTest ("chat: after a device restart the partial frame is dropped and the voice fades in again");
+        {
+            StudioEngine engine;
+            ChatSink sink;
+            sink.attach (engine);
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (64, TestSignal::sine440);    // half frames: a restart may cut one
+            engine.setChatEnabled (true);
+            expect (waitFor ([&] { return sink.count (StreamKind::voice) >= 60; }, 3000), "voice packets flow");
+            engine.useFakeDevice (64, TestSignal::sine440);
+            const int atRestart = sink.count (StreamKind::voice);
+            expect (waitFor ([&] { return sink.count (StreamKind::voice) >= atRestart + 60; }, 3000), "voice packets after the restart");
+            engine.setChatEnabled (false);
+
+            std::lock_guard<std::mutex> g (sink.lock);
+            OpusMode mode (FrameSize::f128);
+            OpusDecoder decoder (mode, 1);
+            std::vector<float> pcm (128);
+            juce::String around;
+            int fadeIns = 0;
+            uint32_t lastTime = 0;
+            bool ordered = true;
+
+            for (size_t i = 0; i < sink.voice.size(); ++i)
+            {
+                AudioPacketView view;
+
+                if (! decodeAudioPacket (sink.voice[i].data(), sink.voice[i].size(), view))
+                    continue;
+
+                ordered = ordered && (i == 0 || view.sampleTime > lastTime) && view.sampleTime % 128 == 0;
+                lastTime = view.sampleTime;
+                decoder.decode (view.voice, view.voiceLen, pcm.data());
+                // Energy relative to a steady 0.5 sine frame: a frame that fades in over all its samples has 3/8 of it.
+                double energy = 0.0;
+
+                for (int k = 0; k < 128; ++k)
+                    energy += (double) pcm[(size_t) k] * pcm[(size_t) k];
+
+                const double relative = energy / (0.125 * 128.0);
+
+                if ((int) i >= atRestart - 5 && (int) i < atRestart + 20)
+                    around << juce::String (relative, 2) << " ";
+
+                if (relative > 0.1 && relative < 0.6 && (int) i >= atRestart - 5)   // around the restart (and after)
+                    ++fadeIns;
+            }
+
+            logMessage ("voice frames " + juce::String ((int) sink.voice.size()) + ", fade-ins " + juce::String (fadeIns)
+                        + "; relative energy around the restart: " + around);
+            expect (ordered, "frames stay on the 128-sample grid, in order");
+            expectEquals (fadeIns, 1, "the voice fades in once after the restart");
+        }
+
         beginTest ("chat: the instrument stream is sent only while recording an instrument track");
         {
             const auto dir = studioTestDir().getChildFile ("chat-instrument");
