@@ -557,6 +557,57 @@ public:
             r.render (empty, 0, 512, L.data(), R.data());
             expect (L == std::vector<float> (512, 0.0f) && R == std::vector<float> (512, 0.0f));
         }
+
+        beginTest ("Per-track peaks are post volume, pan and mute, and reset when taken");
+        {
+            Fixture f;
+            const Id muted = newId();
+            expect (f.apply (Ops::setMix (f.track, -6.0f, -1.0f, std::nullopt))
+                    && f.apply (Ops::addTrack (muted, "Muted", TrackKind::voice))
+                    && f.apply (Ops::addRegion (muted, { newId(), f.take, 0, 0, takeSamples }))
+                    && f.apply (Ops::setMix (muted, 0.0f, std::nullopt, true)));
+            Renderer r;
+            r.prepare (512);
+            r.setProject (f.snapshot());
+
+            // Only the first track sounds, so the output is exactly that track after its gain and pan.
+            const auto out = renderRange (r, f.source, 0, 48000, 256);
+            float outPeak = 0.0f;
+
+            for (size_t i = 0; i < out.L.size(); ++i)
+                outPeak = std::max ({ outPeak, std::abs (out.L[i]), std::abs (out.R[i]) });
+
+            std::map<Id, float> peaks;
+
+            for (const auto& [id, peak] : r.takeTrackPeaks())
+                peaks[id] = std::max (peaks[id], peak);
+
+            logMessage ("track peak " + juce::String (peaks[f.track], 6) + ", output peak " + juce::String (outPeak, 6)
+                        + ", expected " + juce::String (0.5f * dbToGain (-6.0f), 6));
+            expect (peaks.count (f.track) == 1 && peaks.count (muted) == 1, "both tracks reported");
+            expectEquals (peaks[f.track], outPeak, "the track's peak is what it put in the mix");
+            expect (std::abs (peaks[f.track] - 0.5f * dbToGain (-6.0f)) < 1.0e-3f, "peak = 0.5 x gain (hard left)");
+            expectEquals (peaks[muted], 0.0f, "a muted track has no level");
+
+            bool reset = true;
+
+            for (const auto& [id, peak] : r.takeTrackPeaks())
+                reset = reset && peak == 0.0f;
+
+            expect (reset, "peaks restart from 0 after being taken");
+
+            // A peak at or above full scale is reported as is (the meter shows clip at >= 1.0).
+            expect (f.apply (Ops::setMix (f.track, 12.0f, std::nullopt, std::nullopt)));
+            r.setProject (f.snapshot());
+            renderRange (r, f.source, 48000, 4800, 256);
+            float loud = 0.0f;
+
+            for (const auto& [id, peak] : r.takeTrackPeaks())
+                if (id == f.track)
+                    loud = std::max (loud, peak);
+
+            expect (loud >= 1.0f, "a +12 dB track peaks above full scale: " + juce::String (loud, 4));
+        }
     }
 };
 

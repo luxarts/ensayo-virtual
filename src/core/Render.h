@@ -3,6 +3,7 @@
 #include "client/TakeCache.h"
 #include <memory>
 #include <set>
+#include <utility>
 #include <vector>
 namespace ensayo
 {
@@ -28,6 +29,9 @@ public:
     void render (const SampleSource&, int64_t position, int n, float* outL, float* outR) noexcept;
     // Audio thread: jump all ramps to their targets (after a seek or at play start, where the transport fade hides it).
     void snapRamps() noexcept;
+    // Message thread. Per track of the latest project: the largest |sample| it put into the mix (post volume, pan and
+    // mute, pre master) since the last call, then reset.
+    std::vector<std::pair<Id, float>> takeTrackPeaks();
 private:
     struct Impl; std::unique_ptr<Impl> impl;
 };

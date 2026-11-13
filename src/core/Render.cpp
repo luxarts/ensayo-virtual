@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <map>
 #include <mutex>
 
 namespace ensayo
@@ -110,7 +111,16 @@ struct State
 {
     std::shared_ptr<const Project> project;
     std::vector<TrackState> tracks;
+    // Peak per track (same index as tracks): raised by the audio thread, taken (exchanged with 0) by the message thread.
+    std::unique_ptr<std::atomic<float>[]> peaks;
 };
+
+void raisePeak (std::atomic<float>& target, float value) noexcept
+{
+    float current = target.load (std::memory_order_relaxed);
+
+    while (value > current && ! target.compare_exchange_weak (current, value, std::memory_order_relaxed)) {}
+}
 
 std::shared_ptr<State> buildState (std::shared_ptr<const Project> project, const std::set<Id>& solo)
 {
@@ -156,6 +166,11 @@ std::shared_ptr<State> buildState (std::shared_ptr<const Project> project, const
         state->tracks.push_back (std::move (ts));
     }
 
+    state->peaks = std::make_unique<std::atomic<float>[]> (state->tracks.size());
+
+    for (size_t i = 0; i < state->tracks.size(); ++i)
+        state->peaks[i].store (0.0f);
+
     return state;
 }
 }
@@ -168,6 +183,7 @@ struct Renderer::Impl
     std::shared_ptr<const Project> project;
     std::set<Id> solo;
     std::vector<std::shared_ptr<State>> keepAlive;   // states are only ever freed here, never on the audio thread
+    std::map<Id, float> harvestedPeaks;              // peaks of states freed since the last takeTrackPeaks
 
     // Hand-over.
     std::atomic<std::shared_ptr<State>> pending;
@@ -189,11 +205,27 @@ struct Renderer::Impl
     {
         auto state = buildState (project, solo);
         keepAlive.erase (std::remove_if (keepAlive.begin(), keepAlive.end(),
-                                         [] (const std::shared_ptr<State>& s) { return s.use_count() == 1; }),
+                                         [this] (const std::shared_ptr<State>& s)
+                                         {
+                                             if (s.use_count() != 1)
+                                                 return false;
+
+                                             harvest (*s, harvestedPeaks);
+                                             return true;
+                                         }),
                          keepAlive.end());
         keepAlive.push_back (state);
         pending.store (std::move (state));
         pendingVersion.fetch_add (1, std::memory_order_release);
+    }
+
+    static void harvest (State& state, std::map<Id, float>& into)   // message thread
+    {
+        for (size_t i = 0; i < state.tracks.size(); ++i)
+        {
+            auto& peak = into[state.tracks[i].id];
+            peak = std::max (peak, state.peaks[i].exchange (0.0f));
+        }
     }
 
     // Audio thread. With `crossfade` false (snapRamps) any running crossfade ends and the new state is taken at once.
@@ -272,8 +304,10 @@ struct Renderer::Impl
 
     void renderState (State& state, const SampleSource& source, int64_t position, int n, float* outL, float* outR) noexcept
     {
-        for (auto& track : state.tracks)
+        for (size_t t = 0; t < state.tracks.size(); ++t)
         {
+            auto& track = state.tracks[t];
+
             if (track.gain.idleAt (0.0f))
                 continue;   // silent and not ramping: nothing to hear, nothing to advance
 
@@ -332,7 +366,7 @@ struct Renderer::Impl
                 }
             }
 
-            float panValue = track.pan.current, left = 0.0f, right = 0.0f;
+            float panValue = track.pan.current, left = 0.0f, right = 0.0f, peak = 0.0f;
             panGains (panValue, left, right);
 
             for (int i = 0; i < n; ++i)
@@ -352,11 +386,16 @@ struct Renderer::Impl
                     r += stereoR[(size_t) i] * std::min (1.0f, right / centreGain);
                 }
 
-                outL[i] += gain * l;
-                outR[i] += gain * r;
+                const float sl = gain * l, sr = gain * r;
+                outL[i] += sl;
+                outR[i] += sr;
+                peak = std::max ({ peak, std::abs (sl), std::abs (sr) });
                 track.gain.advance();
                 track.pan.advance();
             }
+
+            if (peak > 0.0f)
+                raisePeak (state.peaks[t], peak);
         }
     }
 };
@@ -407,6 +446,25 @@ void Renderer::render (const SampleSource& source, int64_t position, int n, floa
         d.renderChunk (source, position + done, chunk, outL + done, outR + done);
         done += chunk;
     }
+}
+
+std::vector<std::pair<Id, float>> Renderer::takeTrackPeaks()
+{
+    const std::lock_guard lock (impl->messageLock);
+    auto peaks = std::exchange (impl->harvestedPeaks, {});
+
+    for (auto& state : impl->keepAlive)
+        Impl::harvest (*state, peaks);
+
+    std::vector<std::pair<Id, float>> result;
+
+    if (impl->keepAlive.empty())
+        return result;
+
+    for (const auto& track : impl->keepAlive.back()->tracks)   // the latest project's tracks
+        result.emplace_back (track.id, peaks[track.id]);
+
+    return result;
 }
 
 void Renderer::snapRamps() noexcept
