@@ -47,8 +47,10 @@ public:
     std::function<void()> onConnected, onProjectChanged, onPresenceChanged, onTransfersChanged;
     std::function<void (const juce::String&)> onRejected, onError, onDisconnected;   // message thread
 
-    // Test hook (any thread): segment payload bytes received on the data connection since the last connect().
-    int64_t bytesDownloaded() const noexcept;
+    // Test hooks.
+    int64_t bytesDownloaded() const noexcept;      // any thread: segment payload bytes received since the last connect()
+    void dropConnectionForTest();                  // message thread: shuts both sockets down without the clean path
+    std::function<void()> onWelcomeForTest;        // message thread: inside `welcome`, before pending uploads reconcile
 
 private:
     struct Impl;

@@ -263,6 +263,7 @@ struct ProjectClient::Impl
     {
         ++(*generation);
         teardown();
+        ++(*generation);   // anything posted with the current generation while the threads were stopping is dropped
 
        #if JUCE_WINDOWS
         if (sendWake != nullptr)
@@ -290,11 +291,14 @@ struct ProjectClient::Impl
     std::atomic<int64_t> downloaded { 0 };
     std::atomic<bool> listening { false }, canSend { false }, dataReady { false };
     int connectionGeneration = 0;
+    int resyncAttempts = 0;
+    static constexpr int maxResyncAttempts = 3;
 
     // Uploads and the cache (any thread).
     mutable std::mutex lock;
     std::unique_ptr<TakeCache> takeCache;   // replaced only on the message thread, under `lock`
     Id projectId;
+    Id pendingsProject;          // the project whose pending list is in memory (loaded from disk once per project)
     std::vector<Pending> pendings;
     bool inFlight = false;
     juce::WaitableEvent uploadWake;
@@ -326,15 +330,19 @@ struct ProjectClient::Impl
 
     void post (std::function<void()> fn)    { post (generation->load(), std::move (fn)); }
 
-    void postError (const juce::String& message)
+    void postError (int gen, const juce::String& message)
     {
-        post ([this, message] { if (owner.onError != nullptr) owner.onError (message); });
+        post (gen, [this, message] { if (owner.onError != nullptr) owner.onError (message); });
     }
 
-    void postTransfers()
+    void postTransfers (int gen)
     {
-        post ([this] { if (owner.onTransfersChanged != nullptr) owner.onTransfersChanged(); });
+        post (gen, [this] { if (owner.onTransfersChanged != nullptr) owner.onTransfersChanged(); });
     }
+
+    // From API calls (message thread or the caller's own thread), not from connection threads.
+    void postError (const juce::String& message)   { postError (generation->load(), message); }
+    void postTransfers()                            { postTransfers (generation->load()); }
 
     // Any thread.
     void sendLine (const juce::var& message)
@@ -369,7 +377,8 @@ struct ProjectClient::Impl
     void writeMetaLocked (const Pending& p)
     {
         auto meta = object ({ { "take", p.take }, { "channels", p.channels }, { "track", p.recTrack },
-                              { "start", (juce::int64) p.recStart }, { "created", (juce::int64) p.created } });
+                              { "start", (juce::int64) p.recStart }, { "created", (juce::int64) p.created },
+                              { "queued", p.queued } });
 
         if (p.finish)
             meta.getDynamicObject()->setProperty ("finish", object ({ { "track", p.finish->track },
@@ -437,6 +446,7 @@ struct ProjectClient::Impl
                         p.finish = Finish { finish["track"].toString(), *region };
             }
 
+            const auto metaQueued = meta.isObject() ? readInteger (meta["queued"], 0, INT_MAX) : std::nullopt;
             int lowest = INT_MAX, highest = -1;
 
             for (const auto& f : dir.findChildFiles (juce::File::findFiles, false, "*.flac"))
@@ -451,14 +461,16 @@ struct ProjectClient::Impl
                 highest = std::max (highest, index);
             }
 
-            if (highest >= 0)
-            {
-                p.queued = highest + 1;
-                p.nextIndex = lowest;
-            }
+            // take.json records how many segments were queued; files above it were queued out of order and wait
+            // for the gap to be filled. Older metadata without the count falls back to the files.
+            p.queued = metaQueued ? (int) *metaQueued : highest + 1;
+            p.nextIndex = (highest >= 0 && lowest < p.queued) ? lowest : p.queued;
 
             if (p.channels == 0 && takeCache != nullptr)
                 p.channels = takeCache->channels (p.take);
+
+            if (meta.isObject() && highest >= p.queued)
+                absorbLocked (p, nullptr, 0);   // out-of-order files that now follow on
 
             if (! meta.isObject() && highest < 0)
             {
@@ -470,6 +482,39 @@ struct ProjectClient::Impl
         }
 
         std::stable_sort (pendings.begin(), pendings.end(), [] (const Pending& a, const Pending& b) { return a.created < b.created; });
+    }
+
+    // Caller holds `lock`. Advances `queued` over every segment file that continues the take (the one just written
+    // is passed in memory), appending each to the local cache. False when the cache refused one: the segment is
+    // still persisted and uploaded, but this machine will not hear it until the cache is rebuilt.
+    bool absorbLocked (Pending& p, const void* firstData, size_t firstSize)
+    {
+        bool cached = true;
+
+        for (;;)
+        {
+            const auto file = segmentFile (p.take, p.queued);
+            juce::MemoryBlock fromDisk;
+
+            if (firstData == nullptr)
+            {
+                if (! file.existsAsFile() || ! file.loadFileAsData (fromDisk) || fromDisk.isEmpty())
+                    break;
+            }
+
+            const void* bytes = firstData != nullptr ? firstData : fromDisk.getData();
+            const size_t size = firstData != nullptr ? firstSize : fromDisk.getSize();
+            firstData = nullptr;
+
+            if (takeCache != nullptr && ! takeCache->appendSegment (p.take, p.queued, bytes, size)
+                 && takeCache->segmentCount (p.take) <= p.queued)
+                cached = false;
+
+            ++p.queued;
+        }
+
+        writeMetaLocked (p);
+        return cached;
     }
 
     // Caller holds `lock`. After the last acknowledged segment of a finished take: take_complete (once per connection).
@@ -523,7 +568,12 @@ struct ProjectClient::Impl
                     p.hostReady = true;
                     deleteSegmentFilesLocked (p, 0, t->segments);   // already on the host
                     p.nextIndex = t->segments;
-                    p.queued = std::max (p.queued, t->segments);
+
+                    if (t->segments > p.queued)
+                    {
+                        p.queued = t->segments;
+                        absorbLocked (p, nullptr, 0);   // early segments already on disk follow on from the host's count
+                    }
                 }
 
                 if (t->complete)
@@ -697,7 +747,7 @@ struct ProjectClient::Impl
     // onLine returns how many raw payload bytes follow the line (0 for none, < 0 to drop the connection); the
     // payload goes to handleDownloaded. `lastRead` is the millisecond counter of the last bytes received.
     template <typename OnLine, typename OnTick>
-    ReadEnd readLines (juce::StreamingSocket& socket, FnThread& thread, juce::uint32& lastRead, OnLine onLine, OnTick onTick)
+    ReadEnd readLines (juce::StreamingSocket& socket, FnThread& thread, int gen, juce::uint32& lastRead, OnLine onLine, OnTick onTick)
     {
         lastRead = juce::Time::getMillisecondCounter();
         std::string pending;
@@ -737,7 +787,9 @@ struct ProjectClient::Impl
                     juce::MemoryBlock payload (pending.data() + consumed, payloadNeeded);
                     consumed += payloadNeeded;
                     payloadNeeded = 0;
-                    handleDownloaded (payloadHeader, payload);
+                    if (! handleDownloaded (gen, payloadHeader, payload))
+                        return ReadEnd::invalid;   // reconnecting repairs the gap through data_hello's `have`
+
                     payloadHeader = juce::var();
                     continue;
                 }
@@ -792,7 +844,7 @@ struct ProjectClient::Impl
         juce::uint32 lastRead = started;
         bool welcomeSeen = false;
 
-        const auto end = readLines (*controlSocket, t, lastRead,
+        const auto end = readLines (*controlSocket, t, gen, lastRead,
             [this, gen, &welcomeSeen] (const juce::var& m) -> int64_t
             {
                 welcomeSeen = welcomeSeen || m["t"].toString() == "welcome";
@@ -889,8 +941,15 @@ struct ProjectClient::Impl
         cachePtr->loadFromDisk();
 
         {
+            // Only the first welcome of a project reads the pending list from disk. Later welcomes keep the in-memory
+            // counts, so a segment queued while reconnecting is never measured against a stale `queued`.
             const std::lock_guard<std::mutex> scoped (lock);
-            loadPendingsLocked();
+
+            if (pendingsProject != projectId)
+            {
+                loadPendingsLocked();
+                pendingsProject = projectId;
+            }
         }
 
         auto* have = new juce::DynamicObject();
@@ -906,7 +965,7 @@ struct ProjectClient::Impl
 
         const auto gen = connectionGeneration;
         dataSocket = std::make_unique<juce::StreamingSocket>();
-        uploader = std::make_unique<FnThread> ("EnsayoProjectUpload", [this] (FnThread& t) { uploadLoop (t); });
+        uploader = std::make_unique<FnThread> ("EnsayoProjectUpload", [this, gen] (FnThread& t) { uploadLoop (t, gen); });
         uploader->startThread();
         data = std::make_unique<FnThread> ("EnsayoProjectData", [this, gen, dataHello] (FnThread& t) { dataLoop (t, gen, dataHello); });
         data->startThread();
@@ -914,6 +973,9 @@ struct ProjectClient::Impl
 
         if (listening.load())
             sendLine (object ({ { "t", "listen" }, { "enabled", true } }));
+
+        if (owner.onWelcomeForTest != nullptr)
+            owner.onWelcomeForTest();
 
         reconcile();
 
@@ -938,6 +1000,7 @@ struct ProjectClient::Impl
             return;
 
         resyncing = true;
+        resyncAttempts = 1;
         sendLine (makeMessage ("resync"));
     }
 
@@ -981,10 +1044,23 @@ struct ProjectClient::Impl
         auto parsed = projectFromVar (m["project"], error);
 
         if (! parsed)
-            return;   // keep resyncing: the next valid project replaces the replica
+        {
+            if (resyncAttempts++ < maxResyncAttempts)
+            {
+                resyncing = true;
+                sendLine (makeMessage ("resync"));
+            }
+            else
+            {
+                lost (utf8 ("El anfitri\xc3\xb3n envi\xc3\xb3 un proyecto inv\xc3\xa1lido"));
+            }
+
+            return;
+        }
 
         replica = std::make_shared<const Project> (std::move (*parsed));
         resyncing = false;
+        resyncAttempts = 0;
         reconcile();
 
         if (owner.onProjectChanged != nullptr)
@@ -1132,7 +1208,7 @@ struct ProjectClient::Impl
         post (gen, [this] { handleDataUp(); });
 
         juce::uint32 lastRead = 0;
-        const auto end = readLines (*dataSocket, t, lastRead,
+        const auto end = readLines (*dataSocket, t, gen, lastRead,
             [this, gen] (const juce::var& m) -> int64_t { return handleDataLine (gen, m); },
             [] { return true; });
 
@@ -1149,14 +1225,16 @@ struct ProjectClient::Impl
         if (type == "segment")
             return readInteger (m["bytes"], 1, maxSegmentBytes).value_or (-1);
 
-        if (type == "segment_ok")       handleSegmentOk (m["take"].toString(), (int) readInteger (m["index"], 0, INT_MAX).value_or (-1));
-        else if (type == "segment_bad") handleSegmentBad (m);
+        if (type == "segment_ok")       handleSegmentOk (gen, m["take"].toString(), (int) readInteger (m["index"], 0, INT_MAX).value_or (-1));
+        else if (type == "segment_bad") handleSegmentBad (gen, m);
         else if (type == "error")       post (gen, [this, m] { hostError = m["message"].toString(); });
 
         return 0;
     }
 
-    void handleDownloaded (const juce::var& header, const juce::MemoryBlock& payload)
+    // False drops the data connection: a corrupt segment, or one the cache cannot take (a gap), would otherwise
+    // leave the take short forever. The next data_hello's `have` resumes exactly at the cached count.
+    bool handleDownloaded (int gen, const juce::var& header, const juce::MemoryBlock& payload)
     {
         downloaded.fetch_add ((int64_t) payload.getSize());
 
@@ -1164,7 +1242,7 @@ struct ProjectClient::Impl
         const auto index = readInteger (header["index"], 0, INT_MAX);
 
         if (! isValidId (take) || ! index || Sha1::of (payload.getData(), payload.getSize()) != header["sha1"].toString().toLowerCase())
-            return;
+            return false;
 
         TakeCache* cachePtr = nullptr;
 
@@ -1173,13 +1251,15 @@ struct ProjectClient::Impl
             cachePtr = takeCache.get();
         }
 
-        if (cachePtr != nullptr)
-            cachePtr->appendSegment (take, (int) *index, payload.getData(), payload.getSize());
+        if (cachePtr != nullptr && ! cachePtr->appendSegment (take, (int) *index, payload.getData(), payload.getSize())
+             && cachePtr->segmentCount (take) <= (int) *index)
+            return false;   // refused and not already cached
 
-        postTransfers();
+        postTransfers (gen);
+        return true;
     }
 
-    void handleSegmentOk (const Id& take, int index)
+    void handleSegmentOk (int gen, const Id& take, int index)
     {
         {
             const std::lock_guard<std::mutex> scoped (lock);
@@ -1195,10 +1275,10 @@ struct ProjectClient::Impl
         }
 
         uploadWake.signal();
-        postTransfers();
+        postTransfers (gen);
     }
 
-    void handleSegmentBad (const juce::var& m)
+    void handleSegmentBad (int gen, const juce::var& m)
     {
         const auto take = m["take"].toString();
         const auto expected = (int) readInteger (m["expected"], 0, INT_MAX).value_or (0);
@@ -1248,17 +1328,17 @@ struct ProjectClient::Impl
         }
 
         if (failure.isNotEmpty())
-            postError (failure);
+            postError (gen, failure);
 
         if (reconcileAfter)
-            post ([this] { reconcile(); });
+            post (gen, [this] { reconcile(); });
 
         uploadWake.signal();
     }
 
     //==========================================================================
     // Uploader thread: the only writer of the data socket after data_hello.
-    void uploadLoop (FnThread& t)
+    void uploadLoop (FnThread& t, int gen)
     {
         while (! t.threadShouldExit())
         {
@@ -1311,7 +1391,7 @@ struct ProjectClient::Impl
                         p->failed = true;
                 }
 
-                postError ("No se pudo leer el segmento " + juce::String (index) + " de la toma " + take);
+                postError (gen, "No se pudo leer el segmento " + juce::String (index) + " de la toma " + take);
                 continue;
             }
 
@@ -1612,20 +1692,37 @@ void ProjectClient::queueSegment (const Id& take, int index, const juce::MemoryB
 
         created = impl->findPending (take) == nullptr;
         auto& p = impl->findOrCreateLocked (take);
+        const auto where = " (segmento " + juce::String (index) + " de la toma " + take + ")";
 
-        if (index != p.queued)
-            return;   // out of order or repeated: ignored
+        if (p.finish)
+        {
+            impl->postError (utf8 ("La toma ya est\xc3\xa1 terminada: se descarta un segmento") + where);
+            return;
+        }
+
+        if (index < p.queued)
+        {
+            impl->postError ("Segmento repetido: se ignora" + where);
+            return;
+        }
 
         impl->takeDir (take).createDirectory();
 
         if (! impl->segmentFile (take, index).replaceWithData (flac.getData(), flac.getSize()))
         {
-            impl->postError ("No se pudo guardar el segmento " + juce::String (index) + " de la toma " + take);
+            impl->postError ("No se pudo guardar el segmento" + where);
             return;
         }
 
-        impl->takeCache->appendSegment (take, index, flac.getData(), flac.getSize());
-        ++p.queued;
+        if (index > p.queued)
+        {
+            // Kept on disk; it joins the take once the missing segments arrive.
+            impl->postError ("Segmento fuera de orden: queda guardado hasta que lleguen los anteriores" + where);
+            return;
+        }
+
+        if (! impl->absorbLocked (p, flac.getData(), flac.getSize()))
+            impl->postError (utf8 ("No se pudo a\xc3\xb1" "adir a la cach\xc3\xa9 local; se sube igualmente") + where);
 
         if (p.channels == 0)
         {
@@ -1708,4 +1805,13 @@ Transfers ProjectClient::transfers() const
 
 int ProjectClient::pingMs() const noexcept             { return impl->ping.load(); }
 int64_t ProjectClient::bytesDownloaded() const noexcept { return impl->downloaded.load(); }
+
+void ProjectClient::dropConnectionForTest()
+{
+   #if JUCE_WINDOWS
+    for (auto* socket : { impl->controlSocket.get(), impl->dataSocket.get() })
+        if (socket != nullptr && socket->getRawSocketHandle() >= 0)
+            ::shutdown ((SOCKET) socket->getRawSocketHandle(), SD_BOTH);   // the readers see EOF: the unclean path
+   #endif
+}
 }

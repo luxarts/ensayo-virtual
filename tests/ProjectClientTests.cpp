@@ -118,6 +118,9 @@ public:
         testRecording();
         testLive();
         testResumeAfterDisconnect();
+        testQueueWhileReconnecting();
+        testDestroyWhileBusy();
+        testQueueMisuse();
         testRestartFinishesTake();
         testCacheReuse();
         testVersionGap();
@@ -302,7 +305,7 @@ public:
     //==========================================================================
     void testResumeAfterDisconnect()
     {
-        beginTest ("uploads resume after a disconnect from the host's segment count, without duplicates");
+        beginTest ("uploads resume after an abrupt drop mid-upload: the queued segments, in order, no duplicates");
 
         const auto root = testDir ("resume");
         const auto hostUser = newId(), userB = newId();
@@ -314,47 +317,272 @@ public:
         Peer b (cacheB, userB, "Ana");
         expect (b.connectTo (22224, host.getSessionId()));
 
-        const auto track = newId(), take = newId();
+        const auto track = newId();
         expect (addOwnTrack (b, track, "Voz"));
 
-        b->beginTake (take, 2, track, 0);
-        b->queueSegment (take, 0, makeSegment (48000, 2, 220.0f));
-        b->queueSegment (take, 1, makeSegment (48000, 2, 330.0f));
+        for (int round = 0; round < 3; ++round)
+        {
+            const auto take = newId();
+            const std::vector<juce::MemoryBlock> segs { makeSegment (48000, 2, 220.0f + (float) round), makeSegment (48000, 2, 330.0f),
+                                                        makeSegment (48000, 2, 440.0f), makeSegment (6000, 2, 550.0f) };
+            b->beginTake (take, 2, track, round * 200000);
+            b->queueSegment (take, 0, segs[0]);
+            b->queueSegment (take, 1, segs[1]);
 
-        // Both acknowledged (segment_ok received), so neither is pending any more.
-        expect (waitUntil ([&] { return b->transfers().pendingUploads == 0; }, 5000));
-        expectEquals (host.snapshot()->findTake (take)->segments, 2);
+            // Kill the sockets as soon as the host stored segment 0: segment 1 is in flight or its segment_ok is pending.
+            expect (waitUntil ([&] { const auto* t = host.snapshot()->findTake (take); return t != nullptr && t->segments >= 1; }, 5000));
+            const int dropsBefore = b.disconnected.size();
+            b->dropConnectionForTest();
+            expect (waitUntil ([&] { return b.disconnected.size() == dropsBefore + 1; }, 5000), "the abrupt drop is reported");
+            expect (! b->isConnected());
+
+            // Recording goes on while offline.
+            b->queueSegment (take, 2, segs[2]);
+            b->queueSegment (take, 3, segs[3]);
+
+            Region region;
+            region.id = newId();
+            region.take = take;
+            region.start = round * 200000;
+            region.length = 150000;
+            b->finishTake (take, track, region);
+            expect (b->transfers().pendingUploads >= 2);
+
+            expect (b.connectTo (22224, host.getSessionId()), "B reconnects");
+
+            expect (waitUntil ([&]
+            {
+                const auto p = host.snapshot();
+                const auto* t = p->findTake (take);
+                return t != nullptr && t->complete && hasRegion (*p, track, region.id);
+            }, 10000), "the host completes the take and gets the region");
+
+            const auto* t = host.snapshot()->findTake (take);
+            expect (t != nullptr && t->segments == 4 && t->samples == 150000);
+            const auto hostTake = hostDir.getChildFile ("takes").getChildFile (take);
+            expectEquals (hostTake.getNumberOfChildFiles (juce::File::findFiles, "*.flac"), 4);
+
+            for (int i = 0; i < 4; ++i)
+            {
+                juce::MemoryBlock stored;
+                expect (hostTake.getChildFile (juce::String (i) + ".flac").loadFileAsData (stored) && stored == segs[(size_t) i],
+                        "segment " + juce::String (i) + " stored in order");
+            }
+
+            expect (waitUntil ([&] { return countChildren (pendingDir (cacheB, *b->project())) == 0; }, 5000), "pending dir empty");
+        }
+
+        expect (b.errors.isEmpty(), b.errors.joinIntoString ("; "));
         b->disconnect();
+        host.stop();
+    }
 
-        // Recording goes on while offline.
-        b->queueSegment (take, 2, makeSegment (48000, 2, 440.0f));
-        b->queueSegment (take, 3, makeSegment (6000, 2, 550.0f));
+    //==========================================================================
+    // Host files of `take` equal `segs`, in order.
+    void expectHostSegments (const juce::File& hostDir, const Id& take, const std::vector<juce::MemoryBlock>& segs)
+    {
+        const auto hostTake = hostDir.getChildFile ("takes").getChildFile (take);
+        expectEquals (hostTake.getNumberOfChildFiles (juce::File::findFiles, "*.flac"), (int) segs.size());
+
+        for (size_t i = 0; i < segs.size(); ++i)
+        {
+            juce::MemoryBlock stored;
+            expect (hostTake.getChildFile (juce::String ((int) i) + ".flac").loadFileAsData (stored) && stored == segs[i],
+                    "segment " + juce::String ((int) i) + " stored in order");
+        }
+    }
+
+    bool waitForCompleteTake (ProjectHost& host, const Id& take, const Id& track, const Id& region)
+    {
+        return waitUntil ([&]
+        {
+            const auto p = host.snapshot();
+            const auto* t = p->findTake (take);
+            return t != nullptr && t->complete && hasRegion (*p, track, region);
+        }, 10000);
+    }
+
+    void testQueueWhileReconnecting()
+    {
+        beginTest ("a segment queued while reconnecting, before pending uploads reconcile, is kept (same client and after a restart)");
+
+        const auto root = testDir ("window");
+        const auto hostUser = newId(), userB = newId();
+        const auto hostDir = root.getChildFile ("host");
+        const auto cacheB = root.getChildFile ("cacheB");
+        ProjectHost host ({ 22230, 8 });
+        expect (host.start (hostDir, hostUser, "Lucas", "Tema").wasOk());
+
+        const auto track = newId();
+        const std::vector<juce::MemoryBlock> segs { makeSegment (48000, 1, 220.0f), makeSegment (48000, 1, 330.0f),
+                                                    makeSegment (48000, 1, 440.0f), makeSegment (1000, 1, 550.0f) };
+        Region region;
+        region.length = 145000;
+
+        const auto take2 = newId();
+
+        {
+            Peer b (cacheB, userB, "Ana");
+            expect (b.connectTo (22230, host.getSessionId()));
+            expect (addOwnTrack (b, track, "Voz"));
+
+            // Same client: 0 and 1 acknowledged, abrupt drop, segment 2 arrives in the middle of the next welcome.
+            const auto take = newId();
+            b->beginTake (take, 1, track, 0);
+            b->queueSegment (take, 0, segs[0]);
+            b->queueSegment (take, 1, segs[1]);
+            expect (waitUntil ([&] { return b->transfers().pendingUploads == 0; }, 5000), "0 and 1 acknowledged");
+            b->dropConnectionForTest();
+            expect (waitUntil ([&] { return b.disconnected.size() == 1; }, 5000));
+
+            bool hooked = false;
+            b->onWelcomeForTest = [&] { if (! hooked) { hooked = true; b->queueSegment (take, 2, segs[2]); } };
+            expect (b.connectTo (22230, host.getSessionId()));
+            expect (hooked);
+            b->queueSegment (take, 3, segs[3]);
+            region.id = newId();
+            region.take = take;
+            b->finishTake (take, track, region);
+
+            expect (waitForCompleteTake (host, take, track, region.id), "the take completes with every segment");
+            expectEquals (host.snapshot()->findTake (take)->segments, 4);
+            expectHostSegments (hostDir, take, segs);
+            expect (b.errors.isEmpty(), b.errors.joinIntoString ("; "));
+
+            // Restart variant: every queued segment acknowledged, only take.json left on disk.
+            b->onWelcomeForTest = nullptr;
+            b->beginTake (take2, 1, track, 200000);
+            b->queueSegment (take2, 0, segs[0]);
+            b->queueSegment (take2, 1, segs[1]);
+            expect (waitUntil ([&] { return b->transfers().pendingUploads == 0; }, 5000));
+            b->disconnect();
+        }
+
+        Peer b2 (cacheB, userB, "Ana");
+        bool hooked = false;
+        b2->onWelcomeForTest = [&] { if (! hooked) { hooked = true; b2->queueSegment (take2, 2, segs[2]); } };
+        expect (b2.connectTo (22230, host.getSessionId()));
+        expect (hooked);
+        b2->queueSegment (take2, 3, segs[3]);
+        region.id = newId();
+        region.take = take2;
+        region.start = 200000;
+        b2->finishTake (take2, track, region);
+
+        expect (waitForCompleteTake (host, take2, track, region.id), "the restarted client completes the take with every segment");
+        expectEquals (host.snapshot()->findTake (take2)->segments, 4);
+        expectHostSegments (hostDir, take2, segs);
+        expect (waitUntil ([&] { return countChildren (pendingDir (cacheB, *b2->project())) == 0; }, 5000), "pending dir empty");
+        expect (b2.errors.isEmpty(), b2.errors.joinIntoString ("; "));
+
+        b2->disconnect();
+        host.stop();
+    }
+
+    void testDestroyWhileBusy()
+    {
+        beginTest ("destroying connected clients in the middle of uploads and downloads is safe (20 rounds)");
+
+        const auto root = testDir ("destroy");
+        const auto hostUser = newId(), userB = newId();
+        ProjectHost host ({ 22231, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+
+        std::vector<juce::MemoryBlock> segs;
+
+        for (int i = 0; i < 4; ++i)
+            segs.push_back (makeSegment (48000, 1, 200.0f + 50.0f * (float) i));
+
+        for (int round = 0; round < 20; ++round)
+        {
+            const auto dir = root.getChildFile ("round" + juce::String (round));
+            auto a = std::make_unique<Peer> (dir.getChildFile ("a"), hostUser, "Lucas");
+            auto b = std::make_unique<Peer> (dir.getChildFile ("b"), userB, "Ana");
+            expect (a->connectTo (22231, host.getSessionId()));
+            expect (b->connectTo (22231, host.getSessionId()));
+
+            const auto take = newId();
+            (*a)->beginTake (take, 1, newId(), 0);
+
+            for (int i = 0; i < 4; ++i)
+                (*a)->queueSegment (take, i, segs[(size_t) i]);
+
+            pumpMessages ((round % 5) * 15);   // vary where the destruction lands
+
+            if (round % 2 == 0)
+            {
+                b = nullptr;
+                a = nullptr;
+            }
+            else
+            {
+                a = nullptr;
+                b = nullptr;
+            }
+
+            pumpMessages (60);   // stale callbacks of the destroyed clients run (and must be dropped) here
+        }
+
+        expect (true, "no crash");
+        host.stop();
+    }
+
+    void testQueueMisuse()
+    {
+        beginTest ("queueSegment misuse is reported, never silently dropped; an early segment waits for the gap");
+
+        const auto root = testDir ("misuse");
+        const auto hostUser = newId(), userB = newId();
+        const auto hostDir = root.getChildFile ("host");
+        const auto cacheB = root.getChildFile ("cacheB");
+        ProjectHost host ({ 22232, 8 });
+        expect (host.start (hostDir, hostUser, "Lucas", "Tema").wasOk());
+
+        Peer b (cacheB, userB, "Ana");
+        expect (b.connectTo (22232, host.getSessionId()));
+        const auto track = newId();
+        expect (addOwnTrack (b, track, "Voz"));
+
+        auto errorContaining = [&b] (const juce::String& text)
+        {
+            for (const auto& e : b.errors)
+                if (e.contains (text))
+                    return true;
+
+            return false;
+        };
+
+        // Bytes the local cache cannot decode: reported, still persisted (and refused later by the uploader).
+        const auto bad = newId();
+        b->beginTake (bad, 1, track, 0);
+        b->queueSegment (bad, 0, juce::MemoryBlock ("not a flac", 10));
+        expect (waitUntil ([&] { return errorContaining (juce::String (juce::CharPointer_UTF8 ("cach\xc3\xa9 local"))); }, 3000), "failed cache append reported");
+
+        const auto take = newId();
+        const std::vector<juce::MemoryBlock> segs { makeSegment (48000, 1, 220.0f), makeSegment (48000, 1, 330.0f),
+                                                    makeSegment (2000, 1, 440.0f) };
+        b->beginTake (take, 1, track, 0);
+        b->queueSegment (take, 0, segs[0]);
+        b->queueSegment (take, 0, segs[0]);
+        expect (waitUntil ([&] { return errorContaining ("repetido"); }, 3000), "a repeated index is reported");
+
+        b->queueSegment (take, 2, segs[2]);   // early: kept on disk until 1 arrives
+        expect (waitUntil ([&] { return errorContaining ("fuera de orden"); }, 3000), "an early index is reported");
+        expect (pendingDir (cacheB, *b->project()).getChildFile (take).getChildFile ("2.flac").existsAsFile());
+        b->queueSegment (take, 1, segs[1]);
+        expectEquals (b->cache()->segmentCount (take), 3);
 
         Region region;
         region.id = newId();
         region.take = take;
-        region.length = 150000;
+        region.length = 98000;
         b->finishTake (take, track, region);
+        b->queueSegment (take, 3, segs[2]);
+        expect (waitUntil ([&] { return errorContaining ("terminada"); }, 3000), "a segment after finishTake is reported");
 
-        const auto pending = pendingDir (cacheB, *b->project()).getChildFile (take);
-        expect (pending.getChildFile ("2.flac").existsAsFile() && pending.getChildFile ("3.flac").existsAsFile());
-        expect (! pending.getChildFile ("0.flac").exists(), "acknowledged segments are not kept as pending");
-        expectEquals (b->transfers().pendingUploads, 2);
-
-        expect (b.connectTo (22224, host.getSessionId()), "B reconnects");
-
-        expect (waitUntil ([&]
-        {
-            const auto p = host.snapshot();
-            const auto* t = p->findTake (take);
-            return t != nullptr && t->complete && hasRegion (*p, track, region.id);
-        }, 10000), "the host completes the take and gets the region");
-
-        const auto* t = host.snapshot()->findTake (take);
-        expect (t != nullptr && t->segments == 4 && t->samples == 150000);
-        expectEquals (hostDir.getChildFile ("takes").getChildFile (take).getNumberOfChildFiles (juce::File::findFiles, "*.flac"), 4);
-        expect (waitUntil ([&] { return countChildren (pendingDir (cacheB, *b->project())) == 0; }, 5000), "pending dir empty");
-        expect (b.errors.isEmpty(), b.errors.joinIntoString ("; "));
+        expect (waitForCompleteTake (host, take, track, region.id));
+        expectEquals (host.snapshot()->findTake (take)->segments, 3);
+        expectHostSegments (hostDir, take, segs);
 
         b->disconnect();
         host.stop();
@@ -534,7 +762,7 @@ public:
 
     void testVersionGap()
     {
-        beginTest ("a skipped version or an op that does not apply triggers resync; the replica ends equal to the host");
+        beginTest ("a skipped version, an op that does not apply or an unparsable project triggers resync; a corrupt segment drops the connection");
 
         const auto root = testDir ("gap");
         const auto user = newId(), hostUser = newId();
@@ -560,7 +788,7 @@ public:
 
         std::atomic<bool> stop { false };
         std::atomic<int> resyncs { 0 };
-        std::atomic<bool> scriptOk { false };
+        std::atomic<bool> scriptOk { false }, sendCorrupt { false };
 
         std::thread fake ([&]
         {
@@ -608,6 +836,12 @@ public:
                 return;
 
             ++resyncs;
+            control.send (object ({ { "t", "project" }, { "project", object ({ { "nonsense", 1 } }) } }));   // unparsable
+
+            if (! waitResync())
+                return;
+
+            ++resyncs;
             control.send (object ({ { "t", "project" }, { "project", toVar (truthAfterGap) } }));
             control.send (object ({ { "t", "applied" }, { "version", 4 }, { "by", hostUser }, { "op", validOp } }));
 
@@ -621,6 +855,14 @@ public:
             control.send (object ({ { "t", "project" }, { "project", toVar (finalTruth) } }));
             scriptOk = true;
 
+            while (! stop.load() && ! sendCorrupt.load())
+                juce::Thread::sleep (20);
+
+            // A segment whose bytes do not match its SHA-1: the client must drop the data connection.
+            data.send (object ({ { "t", "segment" }, { "take", newId() }, { "index", 0 }, { "samples", 1 }, { "channels", 1 },
+                                 { "bytes", 4 }, { "sha1", "0000000000000000000000000000000000000000" } }));
+            data.socket->write ("abcd", 4);
+
             while (! stop.load())
                 juce::Thread::sleep (20);
         });
@@ -630,9 +872,12 @@ public:
 
         expect (waitUntil ([&] { return scriptOk.load() && contentHash (*b->project()) == contentHash (finalTruth); }, 8000),
                 "the replica ends equal to the host");
-        expectEquals (resyncs.load(), 2);
+        expectEquals (resyncs.load(), 3);   // the unparsable project was answered with another resync
         expectEquals ((int) b->project()->version, 5);
         expect (b->project()->findTrack (hidden) != nullptr && b->project()->findTrack (visible) != nullptr);
+
+        sendCorrupt = true;
+        expect (waitUntil ([&] { return b.disconnected.size() == 1; }, 5000), "a corrupt download drops the connection");
 
         b->disconnect();
         stop = true;
