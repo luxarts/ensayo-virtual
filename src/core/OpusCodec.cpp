@@ -105,4 +105,10 @@ void OpusDecoder::decode (const uint8_t* data, int len, float* pcm) noexcept
     if (decoded != samples)
         std::memset (pcm, 0, sizeof (float) * (size_t) totalFloats);
 }
+
+void OpusDecoder::reset() noexcept
+{
+    if (decoder != nullptr)
+        opus_custom_decoder_ctl (decoder, OPUS_RESET_STATE);
+}
 }

@@ -1,15 +1,15 @@
 #include "client/HeadlessClient.h"
-#include "client/AudioEngine.h"
-#include "client/SessionClient.h"
-#include "server/ServerHost.h"
+#include "client/SessionController.h"
+#include "client/ProjectClient.h"
+#include "client/Offline.h"
+#include "server/ProjectHost.h"
+#include "core/Segments.h"
 #include "MessagePump.h"
 
-#include <juce_core/juce_core.h>
-#include <juce_events/juce_events.h>
-#include <algorithm>
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <cmath>
 #include <functional>
-#include <iostream>
-#include <vector>
+#include <set>
 
 namespace ensayo
 {
@@ -18,12 +18,7 @@ class HeadlessClientTests : public juce::UnitTest
 public:
     HeadlessClientTests() : juce::UnitTest ("HeadlessClient", "EnsayoVirtual") {}
 
-    static constexpr int smokePort = 22180, latencyPort = 22181;
-
-    static void say (const juce::String& message)
-    {
-        std::cout << message << std::endl;   // UnitTest::logMessage only reaches the debugger
-    }
+    static constexpr int recordPort = 22252, resumePort = 22253, hostPort = 22254, deadPort = 22255, growPort = 22260, chatPort = 22234;
 
     static bool waitFor (const std::function<bool()>& predicate, int timeoutMs)
     {
@@ -40,110 +35,122 @@ public:
         return predicate();
     }
 
-    static juce::File tempDir()
+    static juce::File tempDir (const juce::String& name)
     {
         const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                             .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("headless");
+                             .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("headless").getChildFile (name);
+        dir.deleteRecursively();
         dir.createDirectory();
         return dir;
     }
 
+    std::optional<HeadlessOptions> parse (const juce::StringArray& args)
+    {
+        juce::String error;
+        auto o = parseHeadlessOptions (args, error);
+        expect (o.has_value(), "parse failed: " + error);
+        return o;
+    }
+
+    void rejects (const juce::StringArray& args, const juce::String& why)
+    {
+        juce::String error;
+        const auto o = parseHeadlessOptions (args, error);
+        expect (! o.has_value(), "should reject: " + why);
+        expect (error.isNotEmpty(), "no error text for: " + why);
+    }
+
     void testParsing()
     {
-        beginTest ("parseHeadlessOptions: full argument set");
+        beginTest ("participant mixes map to the current clientIds; a reused clientId gets the new user's level");
         {
-            juce::String error;
-            const auto o = parseHeadlessOptions (juce::StringArray { "--headless", "--join", "ensayo://127.0.0.1:22150/NEW", "--name", "Ana",
-                                                                     "--role", "voice", "--fake-audio", "click", "--block", "64",
-                                                                     "--emit-log", "a.csv", "--probe", "b.csv", "--compare", "c.csv",
-                                                                     "--track", "t.wav", "--play", "--simulate-loss", "7",
-                                                                     "--duration", "2.5", "--stats", "s.json" }, error);
-            expect (o.has_value(), "parse failed: " + error);
+            const Id ana = newId(), beto = newId(), carla = newId();
+            std::map<Id, SessionController::ParticipantMix> mixes { { ana, { 0.5f, false } }, { beto, { 2.0f, true } } };
+            const std::vector<Presence> presence { { ana, "Ana", true, 7 }, { beto, "Beto", false, 0 }, { carla, "Carla", true, 9 },
+                                                  { newId(), "Sin UDP", true, 0 } };
+            const auto gains = SessionController::clientGains (presence, mixes);
+            expectEquals ((int) gains.size(), 2);
+            expect (gains[0].clientId == 7 && gains[0].gain == 0.5f && ! gains[0].muted);
+            expect (gains[1].clientId == 9 && gains[1].gain == 1.0f && ! gains[1].muted, "no entry: unity, so 9 forgets any older user");
+
+            // Beto reconnects with Ana's old clientId: the level follows the user, not the number.
+            const auto after = SessionController::clientGains ({ { beto, "Beto", true, 7 } }, mixes);
+            expect (after.size() == 1 && after[0].clientId == 7 && after[0].gain == 2.0f && after[0].muted);
+        }
+
+        beginTest ("parseHeadlessOptions: every v2 option");
+        {
+            const auto user = newId();
+            const auto o = parse ({ "--headless", "--join", "ensayo://127.0.0.1:22150/ABCDEF", "--name", "Ana", "--user", user,
+                                    "--cache", "cache-dir", "--fake-audio", "loopback", "--block", "512", "--latency-in", "200",
+                                    "--latency-out", "264", "--add-track", "voice", "Voz", "--add-track", "instrument", "Guitarra",
+                                    "--record", "Voz", "--at", "1.5", "--for", "2", "--import", "a.wav", "--ops", "ops.jsonl",
+                                    "--wait-takes", "3", "--export", "mix.wav", "--dump-project", "p.json", "--duration", "2.5",
+                                    "--calibrate", "--resume", "--mute-monitor" });
 
             if (o)
             {
-                expect (! o->host);
-                expectEquals (o->link, juce::String ("ensayo://127.0.0.1:22150/NEW"));
+                expect (o->hostProject == juce::File());
+                expectEquals (o->link, juce::String ("ensayo://127.0.0.1:22150/ABCDEF"));
                 expectEquals (o->name, juce::String ("Ana"));
-                expect (o->role == Role::voice);
-                expect (o->signal == TestSignal::click);
-                expectEquals (o->blockSize, 64);
-                expectEquals (o->emitLog.getFileName(), juce::String ("a.csv"));
-                expect (o->emitLog.isAbsolutePath (o->emitLog.getFullPathName()));
-                expectEquals (o->probeLog.getFileName(), juce::String ("b.csv"));
-                expectEquals (o->compareLog.getFileName(), juce::String ("c.csv"));
-                expectEquals (o->trackFile.getFileName(), juce::String ("t.wav"));
-                expect (o->playTrack);
-                expectEquals (o->lossPercent, 7);
+                expectEquals (o->user, user);
+                expectEquals (o->cacheDir.getFileName(), juce::String ("cache-dir"));
+                expect (o->cacheDir.isAbsolutePath (o->cacheDir.getFullPathName()));
+                expect (o->signal == TestSignal::loopback);
+                expectEquals (o->blockSize, 512);
+                expectEquals (o->latencyIn, 200);
+                expectEquals (o->latencyOut, 264);
+                expectEquals ((int) o->addTracks.size(), 2);
+
+                if (o->addTracks.size() == 2)
+                {
+                    expect (o->addTracks[0].kind == TrackKind::voice && o->addTracks[0].name == "Voz");
+                    expect (o->addTracks[1].kind == TrackKind::instrument && o->addTracks[1].name == "Guitarra");
+                }
+
+                expectEquals (o->recordTrack, juce::String ("Voz"));
+                expectEquals (o->recordAt, 1.5);
+                expectEquals (o->recordFor, 2.0);
+                expectEquals (o->importFile.getFileName(), juce::String ("a.wav"));
+                expectEquals (o->opsFile.getFileName(), juce::String ("ops.jsonl"));
+                expectEquals (o->waitTakes, 3);
+                expectEquals (o->exportFile.getFileName(), juce::String ("mix.wav"));
+                expectEquals (o->dumpProject.getFileName(), juce::String ("p.json"));
                 expectEquals (o->durationSeconds, 2.5);
-                expectEquals (o->statsLog.getFileName(), juce::String ("s.json"));
+                expect (o->durationGiven && o->calibrate && o->resume && o->muteMonitor);
             }
         }
 
         beginTest ("parseHeadlessOptions: host mode and defaults");
         {
-            juce::String error;
-            const auto o = parseHeadlessOptions (juce::StringArray { "--host", "--port", "22151" }, error);
-            expect (o.has_value(), error);
+            const auto o = parse ({ "--host", "proj", "--port", "22151" });
 
             if (o)
             {
-                expect (o->host);
+                expectEquals (o->hostProject.getFileName(), juce::String ("proj"));
                 expectEquals (o->hostPort, 22151);
                 expectEquals (o->name, juce::String ("Headless"));
-                expect (o->role == Role::both);
+                expect (o->user.isEmpty() && o->cacheDir == juce::File());
                 expect (o->signal == TestSignal::silence);
-                expectEquals (o->blockSize, 128);
+                expectEquals (o->blockSize, 256);
                 expectEquals (o->durationSeconds, 10.0);
-                expectEquals (o->lossPercent, 0);
-                expect (o->probeLog == juce::File());
-                expect (o->statsLog == juce::File());
-                expect (! o->playTrack);
+                expect (! o->durationGiven && ! o->calibrate && ! o->resume && o->waitTakes == 0 && o->addTracks.empty());
             }
 
-            const auto d = parseHeadlessOptions (juce::StringArray { "--host" }, error);
+            const auto d = parse ({ "--host", "proj" });
             expect (d.has_value() && d->hostPort == defaultPort);
+
+            const auto y = parse ({ "--host", "proj", "--import-url", "https://www.youtube.com/watch?v=jNQXAC9IVRw" });
+            expect (y.has_value() && y->importUrl == "https://www.youtube.com/watch?v=jNQXAC9IVRw" && y->importFile == juce::File());
+
+            const auto c = parse ({ "--calibrate", "--fake-audio", "loopback", "--latency-in", "200", "--latency-out", "264" });
+            expect (c.has_value() && c->calibrate && ! c->hasSession(), "--calibrate runs without a session");
         }
 
-        beginTest ("parseHeadlessOptions: errors");
+        beginTest ("parseHeadlessOptions: real ASIO device options are kept");
         {
-            const auto rejects = [&] (const juce::StringArray& args, const juce::String& why)
-            {
-                juce::String error;
-                const auto o = parseHeadlessOptions (args, error);
-                expect (! o.has_value(), "should reject: " + why);
-                expect (error.isNotEmpty(), "no error text for: " + why);
-            };
-
-            rejects ({ "--host", "--role", "x" }, "bad role");
-            rejects ({ "--host", "--block", "100" }, "bad block");
-            rejects ({ "--host", "--fake-audio", "noise" }, "bad signal");
-            rejects ({ "--host", "--port", "70000" }, "bad port");
-            rejects ({ "--host", "--port", "abc" }, "non-numeric port");
-            rejects ({ "--host", "--simulate-loss", "101" }, "loss out of range");
-            rejects ({ "--host", "--duration", "0" }, "zero duration");
-            rejects ({ "--host", "--duration" }, "missing value");
-            rejects ({ "--join", "not a link" }, "bad link");
-            rejects ({ "--join", "ensayo://127.0.0.1:22150/NEWER" }, "bad NEW link");
-
-            juce::String error;
-            const auto n = parseHeadlessOptions ({ "--join", "127.0.0.1:22150/new" }, error);
-            expect (n.has_value() && n->link == "127.0.0.1:22150/new", "NEW link without scheme: " + error);
-            rejects ({ "--join", "ensayo://1.2.3.4:22140/ABCDEF", "--host" }, "host and join together");
-            rejects ({ "--name", "Solo" }, "neither host nor join");
-            rejects ({ "--host", "--play" }, "play without track");
-            rejects ({ "--host", "--bogus" }, "unknown argument");
-            rejects ({ "--host", "--asio" }, "asio without driver name");
-            rejects ({ "--host", "--mic", "64" }, "mic channel out of range");
-            rejects ({ "--host", "--out", "-1" }, "negative output pair");
-        }
-
-        beginTest ("parseHeadlessOptions: real ASIO device options");
-        {
-            juce::String error;
-            const auto o = parseHeadlessOptions ({ "--host", "--asio", "MiniFuse ASIO Driver", "--out", "1", "--mic", "2",
-                                                  "--inst", "3", "--mute-monitor" }, error);
-            expect (o.has_value(), error);
+            const auto o = parse ({ "--host", "p", "--asio", "MiniFuse ASIO Driver", "--out", "1", "--mic", "2", "--inst", "3",
+                                    "--mute-monitor", "--block", "128" });
 
             if (o)
             {
@@ -153,249 +160,579 @@ public:
                 expectEquals (o->instrumentChannel, 3);
                 expect (o->muteMonitor);
             }
+        }
 
-            const auto d = parseHeadlessOptions ({ "--host" }, error);
-            expect (d.has_value() && d->asioDevice.isEmpty() && d->micChannel == 0 && d->instrumentChannel == 1
-                    && d->outputPair == 0 && ! d->muteMonitor);
+        beginTest ("parseHeadlessOptions: errors and removed live-mix flags");
+        {
+            rejects ({ "--host" }, "host without a project dir");
+            rejects ({ "--host", "p", "--block", "8" }, "block too small");
+            rejects ({ "--host", "p", "--fake-audio", "noise" }, "bad signal");
+            rejects ({ "--host", "p", "--port", "70000" }, "bad port");
+            rejects ({ "--host", "p", "--port", "abc" }, "non-numeric port");
+            rejects ({ "--host", "p", "--duration", "0" }, "zero duration");
+            rejects ({ "--host", "p", "--duration" }, "missing value");
+            rejects ({ "--join", "not a link" }, "bad link");
+            rejects ({ "--join", "ensayo://1.2.3.4:22140/ABCDEF", "--host", "p" }, "host and join together");
+            rejects ({ "--name", "Solo" }, "neither host nor join");
+            rejects ({ "--host", "p", "--user", "xyz" }, "bad user id");
+            rejects ({ "--host", "p", "--add-track", "drums", "x" }, "bad track kind");
+            rejects ({ "--host", "p", "--add-track", "imported", "x" }, "imported tracks come from --import");
+            rejects ({ "--host", "p", "--add-track", "voice" }, "track without a name");
+            rejects ({ "--host", "p", "--add-track", "voice", "--record" }, "a flag is not a track name");
+            rejects ({ "--host", "p", "--record", "Voz" }, "record without --for");
+            rejects ({ "--host", "p", "--record", "Voz", "--for", "0" }, "zero-length take");
+            rejects ({ "--host", "p", "--at", "2" }, "--at without --record");
+            rejects ({ "--host", "p", "--wait-takes", "0" }, "wait for zero takes");
+            rejects ({ "--host", "p", "--asio" }, "asio without driver name");
+            rejects ({ "--host", "p", "--asio", "X", "--fake-audio", "sine" }, "asio and fake audio together");
+            rejects ({ "--host", "p", "--mic", "64" }, "mic channel out of range");
+            rejects ({ "--host", "p", "--out", "-1" }, "negative output pair");
+            rejects ({ "--calibrate", "--resume" }, "resume needs a session");
+            rejects ({ "--host", "p", "--import-url", "https://example.com/v.m4a" }, "--import-url accepts only YouTube URLs");
+            rejects ({ "--host", "p", "--import-url" }, "--import-url without a URL");
+            rejects ({ "--calibrate", "--import-url", "https://youtu.be/jNQXAC9IVRw" }, "--import-url needs a session");
+
+            for (const auto* removed : { "--simulate-loss", "--role", "--probe", "--emit-log", "--compare", "--track", "--stats" })
+                rejects ({ "--host", "p", removed, "1" }, juce::String ("removed flag ") + removed);
+
+            rejects ({ "--host", "p", "--play" }, "removed flag --play");
         }
     }
 
-    void testLatencyHelpers()
+    static juce::MemoryBlock sineSegment (int samples, float freq)
     {
-        beginTest ("pairClickLatencies and formatLatencyLine");
-        {
-            const std::vector<ClickEvent> emitted { { 0, 1000.0 }, { 12000, 1250.0 }, { 24000, 1500.0 } };
-            const std::vector<ClickEvent> detected { { 100, 1030.0 }, { 300, 1280.0 }, { 500, 1900.0 }, { 700, 990.0 } };
+        juce::AudioBuffer<float> audio (1, samples);
 
-            const auto latencies = pairClickLatencies (emitted, detected);
-            expectEquals ((int) latencies.size(), 2);   // 1900 is > 250 ms after the last emit; 990 precedes every emit
+        for (int i = 0; i < samples; ++i)
+            audio.setSample (0, i, 0.4f * std::sin (juce::MathConstants<float>::twoPi * freq * (float) i / (float) sampleRate));
 
-            if (latencies.size() == 2)
-            {
-                expectWithinAbsoluteError (latencies[0], 30.0, 1e-9);
-                expectWithinAbsoluteError (latencies[1], 30.0, 1e-9);
-            }
-
-            expectEquals (formatLatencyLine ({}), juce::String ("latency n 0"));
-            expectEquals (formatLatencyLine ({ 30.0, 10.0, 20.0 }), juce::String ("latency median 20.00 p95 30.00 n 3"));
-        }
-
-        beginTest ("readClickLog");
-        {
-            const auto file = tempDir().getChildFile ("read-click-log.csv");
-            file.replaceWithText ("# comment\n1500.250,128\n\n1250.5,64\nbad line\n");
-            const auto events = readClickLog (file);
-            expectEquals ((int) events.size(), 2);
-
-            if (events.size() == 2)
-            {
-                expectWithinAbsoluteError (events[0].qpcMs, 1250.5, 1e-9);   // sorted by time
-                expectEquals ((juce::int64) events[0].sampleIndex, (juce::int64) 64);
-                expectWithinAbsoluteError (events[1].qpcMs, 1500.25, 1e-9);
-            }
-
-            file.deleteFile();
-        }
+        return encodeSegment (audio, samples);
     }
 
-    void testSmoke()
+    static juce::File writeWav (const juce::File& file, double rate, int seconds)
     {
-        beginTest ("runHeadless --host smoke");
-        {
-            juce::String error;
-            const auto stats = tempDir().getChildFile ("smoke-stats.jsonl");
-            stats.deleteFile();
+        juce::AudioBuffer<float> audio (2, (int) rate * seconds);
 
-            const auto o = parseHeadlessOptions (juce::StringArray { "--host", "--port", juce::String (smokePort), "--duration", "1.2",
-                                                                     "--fake-audio", "silence", "--stats", stats.getFullPathName() }, error);
-            expect (o.has_value(), error);
+        for (int i = 0; i < audio.getNumSamples(); ++i)
+            for (int c = 0; c < 2; ++c)
+                audio.setSample (c, i, 0.3f * std::sin (juce::MathConstants<float>::twoPi * 330.0f * (float) i / (float) rate));
+
+        file.deleteFile();
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::OutputStream> stream (file.createOutputStream());
+        const auto options = juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (16);
+
+        if (auto writer = stream != nullptr ? wav.createWriterFor (stream, options) : nullptr)
+            writer->writeFromAudioSampleBuffer (audio, 0, audio.getNumSamples());
+
+        return file;
+    }
+
+    void testRuns()
+    {
+        beginTest ("runHeadless --join records a take on its own track, aligned at --at, and waits until it is complete");
+        {
+            const auto dir = tempDir ("record");
+            ProjectHost host ({ recordPort, 8 });
+            expect (host.start (dir.getChildFile ("project"), newId(), "Host", "Grabar").wasOk());
+
+            const auto dump = dir.getChildFile ("dump.json");
+            const auto user = newId();
+            const auto o = parse ({ "--join", SessionLink { "127.0.0.1", recordPort, host.getSessionId() }.toString(), "--name", "Bea",
+                                    "--user", user, "--cache", dir.getChildFile ("cache").getFullPathName(), "--fake-audio", "sine",
+                                    "--add-track", "voice", "Voz", "--record", "Voz", "--at", "1", "--for", "2", "--duration", "0.1",
+                                    "--dump-project", dump.getFullPathName() });
+
+            if (o)
+            {
+                expectEquals (runHeadless (*o), 0);
+                const auto p = host.snapshot();
+                const auto* track = p->tracks.empty() ? nullptr : &p->tracks.front();
+                expect (track != nullptr && track->name == "Voz" && track->author == user && track->regions.size() == 1);
+
+                if (track != nullptr && track->regions.size() == 1)
+                {
+                    const auto& r = track->regions.front();
+                    const auto* take = p->findTake (r.take);
+                    expectEquals ((juce::int64) r.start, (juce::int64) 48000);
+                    expectEquals ((juce::int64) r.offset, (juce::int64) 0);   // no count-in, fake latencies 0
+                    expect (r.length >= 96000 && r.length <= 96000 + 2 * 256, "length " + juce::String ((juce::int64) r.length));
+                    expect (take != nullptr && take->complete && take->author == user && take->channels == 1);
+                }
+
+                juce::String error;
+                const auto dumped = projectFromJson (dump.loadFileAsString(), error);
+                expect (dumped.has_value(), "dump-project: " + error);
+                expect (dumped && contentHash (*dumped) == contentHash (*p), "the dump matches the host");
+                expect (dir.getChildFile ("cache").getChildFile (p->id).getChildFile ("recordings").findChildFiles (juce::File::findFiles, false, "*.wav").size() == 1,
+                        "local WAV copy of the take");
+            }
+
+            host.stop();
+        }
+
+        beginTest ("runHeadless --resume finishes a take left without a finish intent (aligned with its offset)");
+        {
+            const auto dir = tempDir ("resume");
+            const auto hostUser = newId(), user = newId();
+            ProjectHost host ({ resumePort, 8 });
+            expect (host.start (dir.getChildFile ("project"), hostUser, "Host", "Retomar").wasOk());
+            const auto cache = dir.getChildFile ("cache");
+            const auto track = newId(), take = newId();
+
+            {
+                // The "crashed" client: begins a take, queues 1.5 s and disappears without finishTake.
+                ProjectClient client ({ cache, user, "Ceci" });
+                bool connected = false;
+                client.onConnected = [&] { connected = true; };
+                client.connect ({ "127.0.0.1", resumePort, host.getSessionId() });
+                expect (waitFor ([&] { return connected; }, 8000));
+                client.sendOp (Ops::addTrack (track, "Voz", TrackKind::voice));
+                expect (waitFor ([&] { return client.project()->findTrack (track) != nullptr; }, 5000));
+                client.beginTake (take, 1, track, 96000, 1000);
+                client.queueSegment (take, 0, sineSegment (48000, 440.0f));
+                client.queueSegment (take, 1, sineSegment (24000, 440.0f));
+                waitFor ([&] { return client.transfers().pendingUploads == 0; }, 5000);
+                client.disconnect();
+            }
+
+            expect (! host.snapshot()->findTake (take)->complete);
+
+            const auto o = parse ({ "--join", SessionLink { "127.0.0.1", resumePort, host.getSessionId() }.toString(), "--user", user,
+                                    "--name", "Ceci", "--cache", cache.getFullPathName(), "--resume" });
 
             if (o)
             {
                 const auto t0 = juce::Time::getMillisecondCounter();
                 expectEquals (runHeadless (*o), 0);
-                const auto elapsed = juce::Time::getMillisecondCounter() - t0;
-                expect (elapsed >= 1000 && elapsed < 6000, "unexpected run time " + juce::String (elapsed) + " ms");
+                expect (juce::Time::getMillisecondCounter() - t0 < 9000, "--resume must exit once flushed, not wait --duration");
 
-                juce::StringArray lines;
-                stats.readLines (lines);
-                lines.removeEmptyStrings();
-                expect (lines.size() >= 1, "no stats line written");
+                const auto p = host.snapshot();
+                const auto* t = p->findTake (take);
+                expect (t != nullptr && t->complete && t->samples == 72000);
+                const auto* tr = p->findTrack (track);
+                expect (tr != nullptr && tr->regions.size() == 1);
 
-                if (lines.size() >= 1)
+                if (tr != nullptr && tr->regions.size() == 1)
                 {
-                    const auto parsed = juce::JSON::parse (lines[0]);
-                    expect (parsed.isObject(), "stats line is not JSON: " + lines[0]);
-                    expectEquals ((int) parsed["participants"], 1);
-                    expect (parsed.hasProperty ("pingMs") && parsed.hasProperty ("jitterBlocks") && parsed.hasProperty ("underruns")
-                             && parsed.hasProperty ("late") && parsed.hasProperty ("trackPlaying") && parsed.hasProperty ("trackPosition"));
+                    expectEquals ((juce::int64) tr->regions[0].start, (juce::int64) 96000);
+                    expectEquals ((juce::int64) tr->regions[0].offset, (juce::int64) 1000);
+                    expectEquals ((juce::int64) tr->regions[0].length, (juce::int64) 71000);
                 }
+
+                expect (cache.getChildFile (p->id).getChildFile ("pending").findChildFiles (juce::File::findDirectories, false).isEmpty(),
+                        "the pending take is gone");
             }
 
-            stats.deleteFile();
+            host.stop();
         }
 
-        // The probe and the click logs are fed from the device thread until the device is closed: the run has to shut
-        // down with both hooks installed (and with the device still open on the way out) without touching freed locals.
-        beginTest ("runHeadless --host with click, probe and emit log shuts down cleanly");
+        beginTest ("runHeadless --host imports a file, sends --ops in order, exports and dumps the project");
         {
-            juce::String error;
-            const auto emitLog = tempDir().getChildFile ("smoke-emit.csv");
-            const auto probeLog = tempDir().getChildFile ("smoke-probe.csv");
-            emitLog.deleteFile();
-            probeLog.deleteFile();
+            const auto dir = tempDir ("host");
+            const auto wav = writeWav (dir.getChildFile ("Bateria.wav"), 44100.0, 3);
+            const auto ops = dir.getChildFile ("ops.jsonl");
+            ops.replaceWithText ("{\"op\":\"rename_project\",\"name\":\"Renombrado\"}\n\n"
+                                 "{\"op\":\"delete_track\",\"track\":\"00000000000000000000000000000000\"}\n"
+                                 "{\"op\":\"set_tempo\",\"bpm\":100,\"beatsPerBar\":3}\n");
+            const auto mix = dir.getChildFile ("mix.wav");
+            const auto dump = dir.getChildFile ("dump.json");
+            const auto projectDir = dir.getChildFile ("project");
 
-            const auto o = parseHeadlessOptions (juce::StringArray { "--host", "--port", juce::String (smokePort), "--duration", "1.1",
-                                                                     "--fake-audio", "click", "--emit-log", emitLog.getFullPathName(),
-                                                                     "--probe", probeLog.getFullPathName() }, error);
-            expect (o.has_value(), error);
+            const auto o = parse ({ "--host", projectDir.getFullPathName(), "--port", juce::String (hostPort), "--user", newId(),
+                                    "--cache", dir.getChildFile ("cache").getFullPathName(), "--import", wav.getFullPathName(),
+                                    "--ops", ops.getFullPathName(), "--export", mix.getFullPathName(), "--dump-project",
+                                    dump.getFullPathName(), "--duration", "0.5" });
 
             if (o)
             {
                 expectEquals (runHeadless (*o), 0);
-                expect (emitLog.existsAsFile(), "emit log not written");
-                expect (readClickLog (emitLog).size() >= 3, "fewer than 3 clicks logged in 1.1 s");
-                expect (probeLog.existsAsFile(), "probe log not written");
-            }
+                juce::String error;
+                const auto p = projectFromJson (projectDir.getChildFile ("project.json").loadFileAsString(), error);
+                expect (p.has_value(), error);
 
-            emitLog.deleteFile();
-            probeLog.deleteFile();
+                if (p)
+                {
+                    expectEquals (p->name, juce::String ("Renombrado"));
+                    expectEquals (p->bpm, 100.0);
+                    expectEquals (p->beatsPerBar, 3);
+                    expect (p->tracks.size() == 1 && p->tracks[0].kind == TrackKind::imported && p->tracks[0].name == "Bateria");
+
+                    if (p->tracks.size() == 1 && p->tracks[0].regions.size() == 1)
+                    {
+                        const auto& r = p->tracks[0].regions[0];
+                        const auto* take = p->findTake (r.take);
+                        expect (r.start == 0 && r.offset == 0 && take != nullptr && take->complete && take->channels == 2);
+                        expectEquals ((juce::int64) r.length, (juce::int64) 144000);
+                        expect (take != nullptr && r.length == take->samples);
+                    }
+                    else
+                    {
+                        expect (false, "the imported track has no region");
+                    }
+
+                    const auto dumped = projectFromJson (dump.loadFileAsString(), error);
+                    expect (dumped && contentHash (*dumped) == contentHash (*p), "dump == saved project");
+                }
+
+                std::unique_ptr<juce::AudioFormatReader> reader (juce::WavAudioFormat().createReaderFor (mix.createInputStream().release(), true));
+                expect (reader != nullptr, "exported WAV missing");
+
+                if (reader != nullptr)
+                {
+                    expectEquals ((int) reader->bitsPerSample, 24);
+                    expectEquals ((juce::int64) reader->lengthInSamples, (juce::int64) 144000);
+                }
+            }
         }
 
-        beginTest ("runHeadless --join to a dead server fails cleanly");
+        beginTest ("leaving during an import cancels it: no track is created and leave() returns promptly");
         {
+            const auto dir = tempDir ("import-cancel");
+            const auto wav = writeWav (dir.getChildFile ("Larga.wav"), 44100.0, 120);
+            const auto projectDir = dir.getChildFile ("project");
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+
+            {
+                SessionController session (engine);
+                bool connected = false;
+                session.onConnected = [&] { connected = true; };
+                expect (session.host (projectDir, recordPort, { newId(), "Dani", dir.getChildFile ("cache") }, "Cancelar").wasOk());
+                expect (waitFor ([&] { return connected; }, 8000));
+                expect (session.importFile (wav).wasOk());
+                expect (session.isImporting());
+
+                const auto t0 = juce::Time::getMillisecondCounter();
+                session.leave();
+                const auto elapsed = juce::Time::getMillisecondCounter() - t0;
+                expect (elapsed < 15000, "leave took " + juce::String ((int) elapsed) + " ms");
+                expect (! session.isImporting() && ! session.isActive());
+                pumpMessages (200);   // stale import posts must be dropped
+            }
+
             juce::String error;
-            const auto o = parseHeadlessOptions (juce::StringArray { "--join", "ensayo://127.0.0.1:22189/ABCDEF", "--duration", "1" }, error);
-            expect (o.has_value(), error);
+            const auto p = projectFromJson (projectDir.getChildFile ("project.json").loadFileAsString(), error);
+            expect (p.has_value() && p->tracks.empty(), "a cancelled import left a track");
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
+        beginTest ("leaving once an import's track exists finishes it: the next connection completes the take and its region");
+        {
+            const auto dir = tempDir ("import-leave");
+            const auto wav = writeWav (dir.getChildFile ("Guia.wav"), 44100.0, 60);
+            const auto projectDir = dir.getChildFile ("project");
+            const SessionIdentity identity { newId(), "Eli", dir.getChildFile ("cache") };
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+
+            {
+                SessionController session (engine);
+                bool connected = false;
+                float progress = 0.0f;
+                session.onConnected = [&] { connected = true; };
+                session.onImportProgress = [&] (const juce::String&, float f) { progress = f; };
+                expect (session.host (projectDir, recordPort, identity, "Importar").wasOk());
+                expect (waitFor ([&] { return connected; }, 8000));
+                expect (session.importFile (wav).wasOk());
+                expect (waitFor ([&] { return progress > 0.0f; }, 30000), "no segment was queued");
+                logMessage ("left at " + juce::String (progress * 100.0f, 1) + " % queued");
+                session.leave();   // the host stops too: the uploads must wait for the next connection
+                expect (! session.isImporting());
+            }
+
+            {
+                SessionController session (engine);
+                expect (session.host (projectDir, recordPort, identity, "Importar").wasOk());
+                expect (waitFor ([&]
+                {
+                    const auto p = session.getHost() != nullptr ? session.getHost()->snapshot() : nullptr;
+
+                    if (p == nullptr || p->tracks.size() != 1 || p->tracks[0].regions.size() != 1)
+                        return false;
+
+                    const auto* take = p->findTake (p->tracks[0].regions[0].take);
+                    return take != nullptr && take->complete;
+                }, 60000), "the import never completed after reconnecting");
+
+                const auto p = session.getHost()->snapshot();
+                expect (p->tracks.size() == 1 && p->tracks[0].kind == TrackKind::imported && p->tracks[0].name == "Guia");
+
+                if (p->tracks.size() == 1 && p->tracks[0].regions.size() == 1)
+                {
+                    const auto& r = p->tracks[0].regions[0];
+                    expect (r.start == 0 && r.offset == 0 && r.length == 60 * 48000 && p->findTake (r.take)->samples == r.length);
+                }
+
+                session.leave();
+            }
+
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
+        beginTest ("no import while recording; an import is never shown as a live recording");
+        {
+            const auto dir = tempDir ("import-live");
+            const auto wav = writeWav (dir.getChildFile ("Corta.wav"), 48000.0, 3);
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::sine440);
+            SessionController session (engine);
+            bool connected = false;
+            session.onConnected = [&] { connected = true; };
+            session.setMetronome (false, false);
+            expect (session.host (dir.getChildFile ("project"), recordPort, { newId(), "Fede", dir.getChildFile ("cache") }, "Vivo").wasOk());
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            // A guest watches.
+            ProjectClient guest ({ dir.getChildFile ("guest"), newId(), "Gabi" });
+            bool guestConnected = false;
+            guest.onConnected = [&] { guestConnected = true; };
+            guest.connect (session.getConnectLink());
+            expect (waitFor ([&] { return guestConnected; }, 8000));
+
+            bool sawLive = false, finished = false;
+            session.onImportFinished = [&] (const juce::String&, const juce::Result& r) { expect (r.wasOk(), r.getErrorMessage()); finished = true; };
+            expect (session.importFile (wav).wasOk());
+            expect (waitFor ([&] { sawLive = sawLive || ! guest.liveRecordings().empty(); return finished; }, 15000));
+
+            for (int i = 0; i < 30; ++i)
+            {
+                pumpMessages (10);
+                sawLive = sawLive || ! guest.liveRecordings().empty();
+            }
+
+            expect (! sawLive, "the guest saw the import as a live recording");
+
+            const Id track = newId();
+            session.getClient()->sendOp (Ops::addTrack (track, "Voz", TrackKind::voice));
+            expect (waitFor ([&] { return session.project()->findTrack (track) != nullptr; }, 5000));
+            expect (session.startTake (track).wasOk());
+            expect (waitFor ([&] { return guest.liveRecordings().size() == 1; }, 5000), "the guest does not see the take");
+
+            const auto refused = session.importFile (wav);
+            expect (refused.failed() && refused.getErrorMessage().contains ("mientras grab"), refused.getErrorMessage());
+            expect (! session.isImporting());
+
+            expect (waitFor ([&] { const auto l = guest.liveRecordings(); return l.size() == 1 && l[0].peaks.size() > 50; }, 5000),
+                    "the take's live peaks stopped reaching the guest");
+            expect (session.stopTake().has_value());
+            expect (waitFor ([&] { return guest.liveRecordings().empty(); }, 8000));
+
+            guest.disconnect();
+            session.leave();
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
+        beginTest ("an import with a long name gets a 64-character track; a rejected track ends the import with no take");
+        {
+            const auto dir = tempDir ("import-name");
+            const auto wav = writeWav (dir.getChildFile ("Corta.wav"), 48000.0, 2);
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+            SessionController session (engine);
+            bool connected = false;
+            int finishedOk = 0, finishedFailed = 0;
+            juce::String failure;
+            session.onConnected = [&] { connected = true; };
+            session.onImportFinished = [&] (const juce::String&, const juce::Result& r)
+            {
+                if (r.wasOk()) ++finishedOk; else { ++finishedFailed; failure = r.getErrorMessage(); }
+            };
+            expect (session.host (dir.getChildFile ("project"), recordPort, { newId(), "Hana", dir.getChildFile ("cache") }, "Nombres").wasOk());
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            // A YouTube-like title well over 64 characters (with multibyte characters).
+            const auto longName = juce::String (juce::CharPointer_UTF8 ("  Canci\xc3\xb3n ")) + juce::String::repeatedString (juce::String (juce::CharPointer_UTF8 ("largu\xc3\xadsima ")), 12);
+            expect (session.importFile (wav, longName).wasOk());
+            expect (waitFor ([&] { return finishedOk + finishedFailed == 1; }, 15000));
+            expectEquals (finishedOk, 1, failure);
+            expect (waitFor ([&]
+            {
+                const auto p = session.getHost()->snapshot();
+                return p->tracks.size() == 1 && p->tracks[0].regions.size() == 1;
+            }, 15000), "the long-named import never got its region");
+            expectEquals (session.getHost()->snapshot()->tracks[0].name, clampName (longName));
+            expectEquals (session.getHost()->snapshot()->tracks[0].name.length(), 64);
+
+            // An add_track the host rejects (track id in use): an error, no take, nothing pending.
+            const auto existing = session.getHost()->snapshot()->tracks[0].id;
+            const auto takesBefore = session.getHost()->snapshot()->takes.size();
+            session.importTrackIdForTest = existing;
+            expect (session.importFile (wav, "Otra").wasOk());
+            expect (waitFor ([&] { return finishedOk + finishedFailed == 2; }, 15000));
+            expectEquals (finishedFailed, 1);
+            expect (failure.startsWith ("No se pudo crear la pista de Otra"), failure);
+            expect (! session.isImporting());
+            pumpMessages (300);
+            expectEquals (session.getHost()->snapshot()->takes.size(), takesBefore);
+            expectEquals (session.getClient()->transfers().pendingTakes, 0);
+            expectEquals ((int) session.getHost()->snapshot()->tracks.size(), 1);
+
+            // The session keeps importing normally afterwards.
+            expect (session.importFile (wav, "Tercera").wasOk());
+            expect (waitFor ([&] { return finishedOk == 2; }, 15000));
+
+            session.leave();
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
+        beginTest ("runHeadless --calibrate on a fake loopback finds the hidden latency and exits");
+        {
+            const auto o = parse ({ "--calibrate", "--fake-audio", "loopback", "--latency-in", "200", "--latency-out", "264" });
+
+            if (o)
+                expectEquals (runHeadless (*o), 0);
+        }
+
+        beginTest ("runHeadless prints cached <take> <k> while the segments of a take still being recorded arrive");
+        {
+            const auto dir = tempDir ("growing");
+            ProjectHost host ({ growPort, 8 });
+            expect (host.start (dir.getChildFile ("project"), newId(), "Host", "Crecer").wasOk());
+            const SessionLink link { "127.0.0.1", growPort, host.getSessionId() };
+
+            ProjectClient rec ({ dir.getChildFile ("rec-cache"), newId(), "Rita" });
+            bool connected = false;
+            rec.onConnected = [&] { connected = true; };
+            rec.connect (link);
+            expect (waitFor ([&] { return connected; }, 8000));
+            const auto track = newId(), take = newId();
+            rec.sendOp (Ops::addTrack (track, "Voz", TrackKind::voice));
+            expect (waitFor ([&] { return rec.project()->findTrack (track) != nullptr; }, 5000));
+            rec.beginTake (take, 1, track, 0);
+
+            // Once the observer is in, one 1 s segment every 400 ms, then the take is finished.
+            struct Feeder : juce::Timer { std::function<void()> tick; void timerCallback() override { tick(); } } feeder;
+            int next = 0;
+            feeder.tick = [&]
+            {
+                if (next < 4)
+                {
+                    rec.queueSegment (take, next, sineSegment (48000, 440.0f));
+                    ++next;
+                    return;
+                }
+
+                feeder.stopTimer();
+                rec.finishTake (take, track, { newId(), take, 0, 0, 4 * 48000 });
+            };
+
+            juce::StringArray lines;
+            setHeadlessOutputCopyForTest ([&] (const juce::String& line)
+            {
+                lines.add (line);
+
+                if (line.startsWith ("welcome "))
+                    feeder.startTimer (400);
+            });
+
+            const auto o = parse ({ "--join", link.toString(), "--cache", dir.getChildFile ("cache").getFullPathName(),
+                                    "--wait-takes", "1", "--duration", "30" });
+
+            if (o)
+                expectEquals (runHeadless (*o), 0);
+
+            setHeadlessOutputCopyForTest (nullptr);
+            feeder.stopTimer();
+
+            const int completeAt = lines.indexOf ("take_complete " + take + " " + juce::String (4 * 48000));
+            expect (completeAt >= 0, "no take_complete: " + lines.joinIntoString (" | "));
+            std::set<juce::String> partial;
+
+            for (int i = 0; i < completeAt; ++i)
+                if (lines[i].startsWith ("cached " + take + " "))
+                    partial.insert (lines[i].fromLastOccurrenceOf (" ", false, false));
+
+            expect (partial.size() >= 3, "segment counts seen before the take was complete: " + lines.joinIntoString (" | "));
+            // The complete take's own line comes after take_complete (a partial "cached <take> 4" may precede it).
+            bool completeCached = false;
+
+            for (int i = completeAt + 1; i < lines.size(); ++i)
+                completeCached = completeCached || lines[i] == "cached " + take + " 4";
+
+            expect (completeAt >= 0 && completeCached, "the complete take is reported as cached after take_complete: " + lines.joinIntoString (" | "));
+            host.stop();
+        }
+
+        beginTest ("runHeadless sends and receives the voice chat and prints chat_rx per received stream at exit");
+        {
+            const auto dir = tempDir ("chat");
+            ProjectHost host ({ chatPort, 8 });
+            expect (host.start (dir.getChildFile ("project"), newId(), "Host", "Charla").wasOk());
+            const SessionLink link { "127.0.0.1", chatPort, host.getSessionId() };
+
+            // Another participant in this process: an engine with a sine on its fake mic, joined like the app does.
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::sine440);
+            auto session = std::make_unique<SessionController> (engine);
+            bool connected = false;
+            session->onConnected = [&] { connected = true; };
+            const Id otherUser = newId();
+            session->join (link, { otherUser, "Rita", dir.getChildFile ("rita-cache") });
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            juce::StringArray lines;
+            uint32_t otherClient = 0;
+            setHeadlessOutputCopyForTest ([&] (const juce::String& line)
+            {
+                lines.add (line);
+
+                if (line.startsWith ("welcome ") && session->getClient() != nullptr)
+                    for (const auto& pr : session->getClient()->presence())
+                        if (pr.user == otherUser)
+                            otherClient = pr.clientId;
+            });
+
+            const auto o = parse ({ "--join", link.toString(), "--cache", dir.getChildFile ("cache").getFullPathName(),
+                                    "--fake-audio", "sine", "--duration", "3" });
+
+            if (o)
+                expectEquals (runHeadless (*o), 0);
+
+            setHeadlessOutputCopyForTest (nullptr);
+            const auto received = engine.chatReceivedFrames();
+            session = nullptr;
+            engine.getDeviceManager().closeAudioDevice();
+            host.stop();
+
+            // 3 s at 375 frames a second; the first keepalive and the device start may cost a little.
+            juce::int64 frames = 0;
+
+            for (const auto& line : lines)
+                if (line.startsWith ("chat_rx " + juce::String ((juce::int64) otherClient) + " voice "))
+                    frames = line.fromLastOccurrenceOf (" ", false, false).getLargeIntValue();
+
+            logMessage ("headless received " + juce::String (frames) + " voice frames from Rita (client "
+                        + juce::String ((juce::int64) otherClient) + ")");
+            expect (otherClient != 0, "Rita's clientId is in the presence");
+            expect (frames >= 750, "chat_rx from Rita: " + lines.joinIntoString (" | "));
+            expect (frames <= 3 * 375 + 375, "more frames than were sent: " + juce::String (frames));
+
+            uint64_t back = 0;
+
+            for (const auto& c : received)
+                if (c.kind == StreamKind::voice)
+                    back += c.frames;
+
+            logMessage ("Rita received " + juce::String ((juce::int64) back) + " voice frames from the headless client");
+            expect (back >= 750, "the headless client's voice did not reach the other participant");
+        }
+
+        beginTest ("runHeadless --join to a dead host fails cleanly");
+        {
+            const auto o = parse ({ "--join", SessionLink { "127.0.0.1", deadPort, "ABCDEF" }.toString(), "--duration", "1",
+                                    "--cache", tempDir ("dead").getFullPathName() });
 
             if (o)
                 expectEquals (runHeadless (*o), 1);
         }
     }
 
-    // The core measurement of the project: A emits clicks on its fake inputs, both are joined to one in-process
-    // server, and B's probe sees the clicks in its device output. Both devices stamp QPC time, so detection time
-    // minus emission time is the real one-way path: A block → UDP → server jitter buffer → mix → UDP → B jitter
-    // buffer → B output block.
-    void testTwoClientLatency()
-    {
-        beginTest ("two in-process clients: click latency through the server");
-
-        ServerConfig config;
-        config.tcpPort = latencyPort;
-        config.udpPort = latencyPort;
-        config.frameSize = FrameSize::f128;
-        config.uploadDirectory = tempDir().getChildFile ("uploads");
-
-        ServerHost host (config);
-        const auto started = host.start();
-        expect (started.wasOk(), "server did not start: " + started.getErrorMessage());
-
-        if (started.failed())
-            return;
-
-        host.startInternalClock();
-
-        AudioEngine engineA, engineB;
-        SessionClient a, b;
-
-        std::vector<ClickEvent> emitted, detected;
-        juce::CriticalSection lock;
-        ClickProbe probe;
-
-        engineA.setRole (Role::both);
-        engineB.setRole (Role::both);
-        engineB.setMonitor (ChannelGain { 0.0f, 0.0f, true });   // B's output must only contain the server mix
-
-        engineA.useFakeDevice (128, TestSignal::click);
-        engineB.useFakeDevice (128, TestSignal::silence);
-        expect (engineA.getFakeDevice() != nullptr && engineB.getFakeDevice() != nullptr);
-
-        if (engineA.getFakeDevice() == nullptr || engineB.getFakeDevice() == nullptr)
-            return;
-
-        engineA.getFakeDevice()->onClickEmitted = [&] (ClickEvent e) { const juce::ScopedLock sl (lock); emitted.push_back (e); };
-        probe.onClickDetected = [&] (ClickEvent e) { const juce::ScopedLock sl (lock); detected.push_back (e); };
-        engineB.getFakeDevice()->onOutputBlock = [&] (const float* L, const float* R, int n, int64_t first, double qpc)
-        {
-            probe.process (L, R, n, first, qpc);
-        };
-
-        bool aJoined = false, bJoined = false;
-        juce::String errors;
-        a.onJoined = [&] { aJoined = true; engineA.setTransport (&a); };
-        b.onJoined = [&] { bJoined = true; engineB.setTransport (&b); };
-        a.onError = [&] (const juce::String& e) { errors << "A: " << e << " "; };
-        b.onError = [&] (const juce::String& e) { errors << "B: " << e << " "; };
-
-        a.create ("127.0.0.1", latencyPort, "A", Role::both);
-        expect (waitFor ([&] { return aJoined; }, 5000), "A did not join: " + errors);
-
-        SessionLink link;
-        link.host = "127.0.0.1";
-        link.port = latencyPort;
-        link.sessionId = a.getState().sessionId;
-        b.join (link, "B", Role::both);
-        expect (waitFor ([&] { return bJoined; }, 5000), "B did not join: " + errors);
-        expect (waitFor ([&] { return a.getState().participants.size() == 2 && b.getState().participants.size() == 2; }, 5000));
-
-        // Let the clicks flow for 3 s.
-        const double runStart = juce::Time::getMillisecondCounterHiRes();
-
-        {
-            const juce::ScopedLock sl (lock);
-            emitted.clear();
-            detected.clear();
-        }
-
-        while (juce::Time::getMillisecondCounterHiRes() < runStart + 3000.0)
-            pumpMessages (20);
-
-        std::vector<ClickEvent> emittedCopy, detectedCopy;
-        {
-            const juce::ScopedLock sl (lock);
-            emittedCopy = emitted;
-            detectedCopy = detected;
-        }
-
-        engineA.setTransport (nullptr);
-        engineB.setTransport (nullptr);
-        engineA.getDeviceManager().closeAudioDevice();
-        engineB.getDeviceManager().closeAudioDevice();
-        a.leave();
-        b.leave();
-        pumpMessages (50);
-        host.stop();
-
-        const auto bufferStats = b.receiveBuffer().getStats();
-        expect (errors.isEmpty(), "session errors: " + errors);
-        expect (emittedCopy.size() >= 10, "A emitted only " + juce::String ((int) emittedCopy.size()) + " clicks");
-        expect (detectedCopy.size() >= 5, "B detected only " + juce::String ((int) detectedCopy.size()) + " clicks");
-
-        const auto latencies = pairClickLatencies (emittedCopy, detectedCopy);
-        const auto line = formatLatencyLine (latencies);
-        say ("  " + line + "  (emitted " + juce::String ((int) emittedCopy.size()) + ", detected " + juce::String ((int) detectedCopy.size())
-             + "; B buffer size " + juce::String (bufferStats.sizeBlocks) + " underruns " + juce::String ((juce::int64) bufferStats.underruns)
-             + " late " + juce::String ((juce::int64) bufferStats.late) + " resyncs " + juce::String ((juce::int64) bufferStats.resyncs) + ")");
-
-        expect (latencies.size() >= 5, "fewer than 5 clicks paired: " + line);
-
-        if (! latencies.empty())
-        {
-            auto sorted = latencies;
-            std::sort (sorted.begin(), sorted.end());
-            const double median = sorted[sorted.size() / 2];
-            expect (median < 60.0, "median one-way latency too high: " + line);
-            expect (median > 0.0, "non-positive latency: " + line);
-        }
-    }
-
     void runTest() override
     {
         testParsing();
-        testLatencyHelpers();
-        testSmoke();
-        testTwoClientLatency();
+        testRuns();
     }
 };
 

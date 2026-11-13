@@ -4,31 +4,36 @@ End-to-end checks that drive the real `EnsayoServer.exe` and `Ensayo Virtual.exe
 machine (Windows PowerShell 5.1). Build the Release targets first:
 
 ```powershell
-cmake --build build --config Release --target EnsayoVirtual EnsayoServer -- /m
+cmake --build build --config Release -- /m
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\integration\run-all.ps1
 ```
 
 Every script takes `-BuildDir` (default `build`, relative to the repo root) and `-Config` (default `Release`),
 prints `PASS <name>`, `FAIL <name>: <reason>` or `SKIP <name>: <reason>` as its last line and exits non-zero on
-failure. Process output, click logs (`*.csv`) and stats (`*.jsonl`) land in `tests/integration/out/<name>/`
-(ignored by git) so a failing run can be inspected.
+failure. A `  result: ...` line before it carries the measurements, which `run-all.ps1` shows in its summary.
+Process output (`<process>.out.txt` / `.err.txt`), project directories, caches and exported WAVs land in
+`tests/integration/out/<name>/` (ignored by git) so a failing run can be inspected. Every process a script starts is
+stopped at the end; nothing else is touched.
 
-| Script              | Port  | What it checks                                                                                   |
-|---------------------|-------|--------------------------------------------------------------------------------------------------|
-| `two-instances.ps1` | 22150 | Standalone server; A emits clicks, B probes them: `participants 2`, `n >= 10`, median `< 40 ms`. |
-| `embedded-host.ps1` | 22151 | Same, but A hosts the session in-process (`--host`) and B joins the printed link.               |
-| `backing-track.ps1` | 22152 | A creates, B probes, C uploads `tests/fixtures/click.wav` and plays it: B detects `>= 8` clicks and its stats show `"trackPlaying":true`. |
-| `packet-loss.ps1`   | 22153 | As two-instances with B `--simulate-loss 10`: B exits 0 and still pairs `n >= 5` clicks.        |
-| `asio-loopback.ps1` | 22154 | Real hardware: A opens `-Driver` (default `MiniFuse ASIO Driver`) with `--out 1 --mic 2 --inst 3` (its LOOPBACK outputs feed inputs 2/3); B (fake) emits clicks and probes them after the full round trip through the driver: driver opens at 48000/`-Block`, A runs the expected callback count with 0 underruns, `n >= 10`, median `< 80 ms`. SKIP when the driver is not in `HKLM\SOFTWARE\ASIO`. |
-| `youtube-track.ps1` | 22155 | Downloads a 19 s public video's audio with `tools\yt-dlp.exe` + `tools\deno.exe` (m4a, no ffmpeg; asserts deno solved the JS challenge), then C uploads it and plays it: B's stats show `trackPlaying:true` and `peakReceived > 0.02`. SKIP when the tools are missing or the download fails. |
-| `udp-blocked.ps1`   | 22156 | A participant joins over TCP and never sends UDP (the 2026-11-08 Tailscale report): the host must hear silence from him (`peakReceived < 0.001`, no PLC hiss) and the server's `stats` must report `packets 0` for him and `> 100` for the host. |
-| `screenshots.ps1`   | -     | `--screenshot`: `lobby.png`/`session.png` are 1100x760 and `controls.json` contains every name of `expected-controls.json`, visible with `w,h > 0` (SKIP when the build has no screenshot mode). Then captures the real `--demo` window to `out/screenshots/shots/demo-window.png`. |
-| `run-all.ps1`       | -     | Runs all of the above in separate PowerShell processes and prints a summary table.              |
+| Script                 | Port  | What it checks |
+|------------------------|-------|----------------|
+| `screenshots.ps1`      | -     | `--screenshot`: `lobby.png`/`session.png` are 1100x760 and `controls.json` contains every name of `expected-controls.json` (lobby; DAW demo with 4 tracks, one recording live, one downloading), visible with `w,h > 0`. Then captures the real `--demo` window to `out/screenshots/shots/demo-window.png`; that part is skipped with the reason when an Ensayo Virtual is already running (`--demo` would only forward to it). |
+| `record-sync.ps1`      | 22240 | A (host user, `--fake-audio silence`, so its always-on voice chat is silent in B's loopback) imports an 8 s click track; B records 6 s over it with `--fake-audio loopback --latency-in 200 --latency-out 264 --block 256`. A prints at least 3 distinct `cached <B's take> <k>` lines before B's `take_complete`; A and B end at the same version with the same `project_hash`; B's region starts at 48000 with offset 464; the mix exported with only B's track audible and with only the click track audible (mutes sent with `--ops`) have every click at the same sample (limit +-1). |
+| `edit-sync.ps1`        | 22241 | A, B, C: B records, then sends add_track, add_region on its take, split, move, trim, set_mix and a set_mix on A's track. B prints exactly one `rejected`; A, B and C print the same `project_hash`; A's dump holds the edited regions and mix. |
+| `reconnect.ps1`        | 22242 | B's process is killed about 3 s into a 6 s take, then restarted with the same `--user`/`--cache` and `--resume`. The take is incomplete until then; afterwards it is complete on the host with segment files exactly `0..n-1`, the same sample count on A and B, and one region covering it. |
+| `reopen.ps1`           | 22243 | The server is stopped (stdin EOF) and started again on the same project dir: same session id and host user; B reconnects with the old link and gets the same `project_hash`; a new client with an empty cache downloads the take and gets the same tracks and takes. |
+| `import-export.ps1`    | 22244 | Imports a 44.1 kHz stereo WAV (resampled to exactly 144000 samples, exported clicks at `k * 12000` +-1) and, when `yt-dlp.exe` and `deno.exe` are next to the built exe, a YouTube URL with `--import-url` (SKIP of that part only when the tools are missing or the download fails for a network reason; any other yt-dlp error FAILs). Each export is 24-bit PCM, 48 kHz, stereo, with length = the project's end. |
+| `voice-chat.ps1`       | 22246 | A hosts (`--host`) and B joins, both with `--fake-audio sine` and no recording; B stays 6 s. From the `chat_rx` lines printed at exit, A received exactly one voice stream (B's) and B one (A's), no instrument stream, each with at least 80 % of the 375 frames/s of the 6 s overlap (>= 1800 of 2250). |
+| `asio-calibration.ps1` | 22245 | Real hardware: `--asio "MiniFuse ASIO Driver" --out 1 --mic 2 --inst 3 --mute-monitor --calibrate`, then a recording of a click track through the MiniFuse LOOPBACK outputs; the recorded clicks align within +-48 samples (1 ms). SKIP only when the driver is not installed or step 1 cannot open it with one of JUCE's absent/busy-device errors (`No Driver`, `Driver failed to initialise`, `No such device`, `Can't start device`, `Device didn't start correctly`, or `ASIO device did not open`); any later failure FAILs. The busy path is untested here: the MiniFuse driver accepts several programs at once. |
+| `run-all.ps1`          | -     | Runs all of the above in separate PowerShell processes and prints a summary table. |
 
-`common.ps1` is dot-sourced by the others: binary resolution, `Start-Proc` (stdout/stderr redirected to files),
-`Start-ServerProc` (keeps the server's stdin open, since `EnsayoServer.exe` stops on stdin EOF), `Wait-ForLine`,
-`Wait-Proc`, `Stop-Procs`, `Assert`, latency-line parsing and the `click.wav` fixture generator (4 s, 44.1 kHz,
-16-bit stereo, a +0.9 click every 250 ms; written on demand, not committed).
+Ports 22240-22246 are used only by these scripts (the unit tests use 22200-22260 outside that range), so the two can
+run one after the other on the same machine; do not run two copies of a script at the same time.
 
-Latency is one-way: the QPC timestamp of each click emitted by A's fake input, paired by B with the detection
-of that click in its device output. Both processes run on the same machine, so they share the clock.
+`common.ps1` is dot-sourced by the others: binary resolution, `Start-Proc` / `Start-Headless` (stdout/stderr redirected
+to files), `Start-ServerProc` (`EnsayoServer.exe --project <dir> --port N`; keeps the server's stdin open, since it
+stops on stdin EOF, and returns the `session=` id and the `host_user` id), `Stop-ServerProc` (closes stdin and waits
+for a clean exit, so the project is saved), `Wait-ForLine`, `Wait-Proc`, `Stop-Procs`, `Assert`, `Write-OpsFile`
+(one JSON op per line for `--ops`), `New-ClickWav` (16-bit stereo WAV with a +0.9 click every N seconds) and the
+`EnsayoTest.Wav` C# helper (reads PCM/float WAVs, finds click onsets: the first sample at or above half the file's
+peak after 2000 quiet samples).

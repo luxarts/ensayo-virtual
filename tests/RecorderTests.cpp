@@ -1,0 +1,449 @@
+#include "client/Recorder.h"
+
+#include <juce_audio_formats/juce_audio_formats.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <mutex>
+#include <thread>
+
+namespace ensayo
+{
+class RecorderTests : public juce::UnitTest
+{
+public:
+    RecorderTests() : juce::UnitTest ("Recorder", "EnsayoVirtual") {}
+
+    static juce::File testDir()
+    {
+        return juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("EnsayoVirtual/tests/recorder");
+    }
+
+    // Everything the callbacks report, gathered on the writer thread.
+    struct Collected
+    {
+        std::mutex lock;
+        std::vector<juce::MemoryBlock> segments;
+        std::vector<int> segmentSamples;
+        std::vector<Peak> peaks;
+        int64_t liveSamples = 0;
+        int finishedSegments = -1;
+        int64_t finishedSamples = -1;
+        int finishedCalls = 0;
+        int errors = 0;
+        juce::StringArray warnings;
+    };
+
+    static void attach (Recorder& r, Collected& c)
+    {
+        r.onSegment = [&c] (int index, const juce::MemoryBlock& flac, int samples)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            if ((int) c.segments.size() != index) return;
+            c.segments.push_back (flac);
+            c.segmentSamples.push_back (samples);
+        };
+        r.onPeaks = [&c] (int64_t from, const std::vector<Peak>& peaks)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            c.peaks.resize (std::max<size_t> (c.peaks.size(), (size_t) from + peaks.size()));
+            std::copy (peaks.begin(), peaks.end(), c.peaks.begin() + (std::ptrdiff_t) from);
+        };
+        r.onLiveAudio = [&c] (const float* const*, int, int n)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            c.liveSamples += n;
+        };
+        r.onError = [&c] (const juce::String&)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            ++c.errors;
+        };
+        r.onWarning = [&c] (const juce::String& message)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            c.warnings.add (message);
+        };
+        r.onFinished = [&c] (int segments, int64_t samples)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            c.finishedSegments = segments;
+            c.finishedSamples = samples;
+            ++c.finishedCalls;
+        };
+    }
+
+    static float ramp (int64_t i, int64_t total) { return (float) ((double) i / (double) total * 1.8 - 0.9); }
+
+    // Pushes `total` samples of ramp (right channel inverted) in blocks of 256, from its own thread.
+    static void pushRamp (Recorder& r, int channels, int64_t total, bool throttle)
+    {
+        std::thread t ([&]
+        {
+            std::vector<float> l (256), rr (256);
+
+            for (int64_t i = 0; i < total; i += 256)
+            {
+                const int n = (int) std::min<int64_t> (256, total - i);
+
+                for (int k = 0; k < n; ++k)
+                {
+                    l[(size_t) k] = ramp (i + k, total);
+                    rr[(size_t) k] = -l[(size_t) k];
+                }
+
+                const float* ch[2] = { l.data(), rr.data() };
+                r.push (ch, n);
+
+                if (throttle && (i / 256) % 64 == 63)
+                    std::this_thread::sleep_for (std::chrono::milliseconds (1));
+            }
+        });
+        t.join();
+        juce::ignoreUnused (channels);
+    }
+
+    void runTest() override
+    {
+        testDir().deleteRecursively();
+        testDir().createDirectory();
+
+        beginTest ("mono take: 3.5 s becomes four exact segments, a full WAV and peaks");
+        {
+            constexpr int64_t total = 168000;
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            const auto wavFile = testDir().getChildFile ("mono.wav");
+            expect (rec.start (newId(), 1, wavFile).wasOk());
+            expect (rec.isRecording());
+            pushRamp (rec, 1, total, true);
+            rec.stop();
+            expect (! rec.isRecording());
+
+            expectEquals (rec.samplesCaptured(), total);
+            expectEquals (rec.overflows(), (uint32_t) 0);
+            expectEquals ((int) c.segments.size(), 4);
+            expectEquals (c.finishedSegments, 4);
+            expectEquals (c.finishedSamples, total);
+            expectEquals (c.finishedCalls, 1);
+            expectEquals (c.liveSamples, total);
+
+            if (c.segments.size() == 4)
+            {
+                expectEquals (c.segmentSamples[0], 48000);
+                expectEquals (c.segmentSamples[1], 48000);
+                expectEquals (c.segmentSamples[2], 48000);
+                expectEquals (c.segmentSamples[3], 24000);
+
+                int mismatches = 0;
+                int64_t at = 0;
+
+                for (auto& flac : c.segments)
+                {
+                    juce::AudioBuffer<float> decoded;
+                    expect (decodeSegment (flac.getData(), flac.getSize(), decoded));
+                    expectEquals (decoded.getNumChannels(), 1);
+
+                    for (int i = 0; i < decoded.getNumSamples(); ++i, ++at)
+                        if (decoded.getSample (0, i) != quantize24 (ramp (at, total)))
+                            ++mismatches;
+                }
+
+                expectEquals (at, total);
+                expectEquals (mismatches, 0);
+            }
+
+            juce::WavAudioFormat format;
+            std::unique_ptr<juce::AudioFormatReader> reader (format.createReaderFor (new juce::FileInputStream (wavFile), true));
+            expect (reader != nullptr);
+
+            if (reader != nullptr)
+            {
+                expectEquals ((int64_t) reader->lengthInSamples, total);
+                expect (reader->usesFloatingPointData);
+                juce::AudioBuffer<float> wav (1, (int) total);
+                reader->read (&wav, 0, (int) total, 0, true, true);
+                int mismatches = 0;
+
+                for (int i = 0; i < (int) total; ++i)
+                    if (wav.getSample (0, i) != ramp (i, total))
+                        ++mismatches;
+
+                expectEquals (mismatches, 0);
+            }
+
+            beginTest ("peaks cover the whole take, continuous across segment boundaries");
+            juce::AudioBuffer<float> all (1, (int) total);
+
+            for (int i = 0; i < (int) total; ++i)
+                all.setSample (0, i, ramp (i, total));
+
+            std::vector<Peak> expected;
+            appendPeaks (all, (int) total, expected);
+            expectEquals ((int) c.peaks.size(), (int) std::ceil ((double) total / 256.0));
+            expectEquals ((int) c.peaks.size(), (int) expected.size());
+
+            int bad = 0;
+
+            for (size_t i = 0; i < std::min (c.peaks.size(), expected.size()); ++i)
+                if (c.peaks[i].min != expected[i].min || c.peaks[i].max != expected[i].max)
+                    ++bad;
+
+            expectEquals (bad, 0);
+        }
+
+        beginTest ("stereo take keeps both channels");
+        {
+            constexpr int64_t total = 60000;
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 2, testDir().getChildFile ("stereo.wav")).wasOk());
+            pushRamp (rec, 2, total, true);
+            rec.stop();
+
+            expectEquals ((int) c.segments.size(), 2);
+            expectEquals (c.finishedSamples, total);
+            int mismatches = 0;
+            int64_t at = 0;
+
+            for (auto& flac : c.segments)
+            {
+                juce::AudioBuffer<float> decoded;
+                expect (decodeSegment (flac.getData(), flac.getSize(), decoded));
+                expectEquals (decoded.getNumChannels(), 2);
+
+                for (int i = 0; i < decoded.getNumSamples(); ++i, ++at)
+                    if (decoded.getSample (0, i) != quantize24 (ramp (at, total))
+                        || decoded.getSample (1, i) != quantize24 (-ramp (at, total)))
+                        ++mismatches;
+            }
+
+            expectEquals (mismatches, 0);
+        }
+
+        beginTest ("overflow drops whole blocks, fills them with silence in place, reports it and keeps the take aligned");
+        {
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("overflow.wav")).wasOk());
+            rec.setWriterPausedForTest (true);
+
+            // 10 s into an 8 s FIFO while the writer is paused, then 1 s more once it drains again: every sample k of
+            // the device stream carries ramp (k), so a shifted take shows at once.
+            constexpr int64_t first = 480000, second = 48000, total = first + second;
+            std::vector<float> block (256);
+
+            const auto pushRange = [&] (int64_t from, int64_t to)
+            {
+                std::thread t ([&]
+                {
+                    for (int64_t i = from; i < to; i += 256)
+                    {
+                        const int n = (int) std::min<int64_t> (256, to - i);
+
+                        for (int k = 0; k < n; ++k)
+                            block[(size_t) k] = ramp (i + k, total);
+
+                        const float* ch[1] = { block.data() };
+                        rec.push (ch, n);
+                    }
+                });
+                t.join();
+            };
+
+            pushRange (0, first);
+            expect (rec.overflows() > 0);
+            expect (rec.samplesCaptured() <= 8 * 48000);
+            const auto droppedFirst = rec.samplesDropped();
+            expectEquals (rec.samplesCaptured() + droppedFirst, first);
+
+            rec.setWriterPausedForTest (false);
+            std::this_thread::sleep_for (std::chrono::milliseconds (1500));   // the FIFO drains
+            pushRange (first, total);
+            rec.stop();
+
+            expectEquals (rec.samplesDropped(), droppedFirst);
+            expectEquals (c.finishedSamples, total);
+            expectEquals (c.liveSamples, total);
+            expectEquals (c.errors, 0);
+            expectEquals (c.warnings.size(), 1);
+            expect (c.warnings[0].contains (" " + juce::String ((juce::int64) std::llround ((double) droppedFirst * 1000.0 / 48000.0)) + " ms"), c.warnings.joinIntoString ("|"));
+
+            // Decode the segments back to back: ramp until the overflow, silence for the dropped samples, then the
+            // ramp again at its own device positions.
+            std::vector<float> decoded;
+
+            for (const auto& flac : c.segments)
+            {
+                juce::AudioBuffer<float> audio;
+                expect (decodeSegment (flac.getData(), flac.getSize(), audio));
+
+                for (int i = 0; i < audio.getNumSamples(); ++i)
+                    decoded.push_back (audio.getSample (0, i));
+            }
+
+            expectEquals ((int64_t) decoded.size(), total);
+            const int64_t gapStart = rec.samplesCaptured() - second, gapEnd = gapStart + droppedFirst;
+            expectEquals (gapEnd, first);
+            int64_t mismatches = 0;
+
+            for (int64_t k = 0; k < (int64_t) decoded.size(); ++k)
+            {
+                const float expected = (k >= gapStart && k < gapEnd) ? 0.0f : ramp (k, total);
+
+                if (std::abs (decoded[(size_t) k] - expected) > 1.0e-5f)
+                    ++mismatches;
+            }
+
+            expectEquals (mismatches, (int64_t) 0);
+        }
+
+        beginTest ("many overflow gaps in a burst are reported at most once a second, with the running total");
+        {
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("overflow-burst.wav")).wasOk());
+            rec.setWriterPausedForTest (true);
+
+            // Fill the paused FIFO until 1000 samples are free, then alternate a block that does not fit (dropped) with
+            // one sample that does (publishes the gap): 50 separate gaps, drained in one go.
+            std::vector<float> block (2048, 0.25f);
+            const float* ch[1] = { block.data() };
+            int64_t pushed = 0;
+
+            while (pushed + 256 <= 8 * 48000 - 1000)
+            {
+                rec.push (ch, 256);
+                pushed += 256;
+            }
+
+            const int free = (int) (8 * 48000 - pushed);
+            constexpr int gaps = 50;
+
+            for (int g = 0; g < gaps; ++g)
+            {
+                rec.push (ch, free - g + 1);   // one more than the space left: dropped
+                rec.push (ch, 1);
+            }
+
+            expectEquals ((int) rec.overflows(), gaps);
+            const auto lost = rec.samplesDropped();
+
+            rec.setWriterPausedForTest (false);
+            std::this_thread::sleep_for (std::chrono::milliseconds (300));   // the FIFO drains, every gap within a second
+            rec.stop();
+
+            std::lock_guard<std::mutex> g (c.lock);
+            expectEquals (c.errors, 0);
+            expect (c.warnings.size() >= 1 && c.warnings.size() <= 2, "reports: " + juce::String (c.warnings.size()));
+            expect (c.warnings[c.warnings.size() - 1].contains (" " + juce::String ((juce::int64) std::llround ((double) lost * 1000.0 / 48000.0)) + " ms"),
+                    "the last report has the total: " + c.warnings.joinIntoString ("|"));
+        }
+
+        beginTest ("recordingOffset adds the latencies and clamps at zero");
+        {
+            expectEquals (recordingOffset (96000, 200, 264, 12), (int64_t) 96476);
+            expectEquals (recordingOffset (0, 200, 264, -1000), (int64_t) 0);
+            expectEquals (recordingOffset (1000, 10, 10, -500), (int64_t) 520);
+        }
+
+        beginTest ("start refuses bad arguments and unwritable paths, and can be repeated");
+        {
+            Recorder rec;
+            expect (rec.start (newId(), 3, testDir().getChildFile ("x.wav")).failed());
+            expect (! rec.isRecording());
+
+            const auto blocker = testDir().getChildFile ("blocker");
+            blocker.replaceWithText ("a file, not a directory");
+            expect (rec.start (newId(), 1, blocker.getChildFile ("inner.wav")).failed());
+            expect (! rec.isRecording());
+
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("again.wav")).wasOk());
+            expect (rec.start (newId(), 1, testDir().getChildFile ("again2.wav")).failed());
+            rec.stop();
+            expectEquals (c.finishedSegments, 0);
+            expectEquals (c.finishedSamples, (int64_t) 0);
+
+            c.finishedCalls = 0;
+            expect (rec.start (newId(), 1, testDir().getChildFile ("again.wav")).wasOk());
+            pushRamp (rec, 1, 1000, false);
+            rec.stop();
+            expectEquals (c.finishedCalls, 1);
+            expectEquals (c.finishedSamples, (int64_t) 1000);
+        }
+
+        beginTest ("a failing local WAV is reported once and the take still reaches the segments");
+        {
+            constexpr int64_t total = 100000;
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("wavfail.wav")).wasOk());
+            rec.setFailWavWritesForTest (true);
+            pushRamp (rec, 1, total, true);
+            rec.stop();
+
+            expectEquals (c.errors, 1);
+            expectEquals (c.finishedCalls, 1);
+            expectEquals (c.finishedSamples, total);
+            expectEquals (c.liveSamples, total);
+            expectEquals ((int) c.peaks.size(), (int) std::ceil ((double) total / 256.0));
+            expectEquals ((int) c.segments.size(), 3);
+
+            int mismatches = 0;
+            int64_t at = 0;
+
+            for (auto& flac : c.segments)
+            {
+                juce::AudioBuffer<float> decoded;
+                expect (decodeSegment (flac.getData(), flac.getSize(), decoded));
+
+                for (int i = 0; i < decoded.getNumSamples(); ++i, ++at)
+                    if (decoded.getSample (0, i) != quantize24 (ramp (at, total)))
+                        ++mismatches;
+            }
+
+            expectEquals (at, total);
+            expectEquals (mismatches, 0);
+        }
+
+        beginTest ("a failing segment encode stops the recording, stop returns promptly and onFinished fires once");
+        {
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("encfail.wav")).wasOk());
+            pushRamp (rec, 1, 48000, true);
+
+            for (int i = 0; i < 200 && [&] { std::lock_guard<std::mutex> g (c.lock); return c.segments.size() < 1; }(); ++i)
+                juce::Thread::sleep (10);
+
+            rec.setFailEncodeForTest (true);
+            pushRamp (rec, 1, 120000, true);
+
+            for (int i = 0; i < 200 && rec.isRecording(); ++i)
+                juce::Thread::sleep (10);
+
+            expect (! rec.isRecording());
+            const auto before = juce::Time::getMillisecondCounter();
+            rec.stop();
+            expect (juce::Time::getMillisecondCounter() - before < 1000);
+
+            expectEquals (c.errors, 1);
+            expectEquals (c.finishedCalls, 1);
+            expectEquals (c.finishedSegments, 1);
+            expectEquals (c.finishedSamples, (int64_t) 48000);
+        }
+
+        testDir().deleteRecursively();
+    }
+};
+
+static RecorderTests recorderTests;
+}

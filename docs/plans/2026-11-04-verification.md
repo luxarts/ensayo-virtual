@@ -215,7 +215,19 @@ no manda UDP, flujo que se corta → silencio, datagramas de otro bloque contado
 `udp-blocked.ps1` (participante sólo-TCP: el servidor reporta `packets 0` para él y 5152 para el host, que
 escucha pico 0); suite completa 8/8 PASS; ventana real del host con un participante sólo-TCP: la barra de estado
 muestra "No llega el audio de Amigo: su UDP no alcanza al servidor (firewall/antivirus en su PC)" a los 7 s.
-Pendiente: repetir la prueba real con el amigo usando esta versión en las dos PCs.
+Segunda prueba real con 0.1.3: conectan y suena, pero con cortes, ~6 % de pérdida, "Jitter 20" y "Sin audio del
+servidor" intermitente (igual hosteando cualquiera de los dos). Medición desde el host durante la sesión:
+`tailscale ping` al amigo arranca por el relay DERP de San Pablo (66 ms) y pasa a directo (`181.2.104.184`)
+con 6–9 ms y **picos de 16 y 32 ms**; el host tenía buffer de **64 muestras**. El jitter buffer tenía un tope fijo
+de 20 bloques = 27 ms a 64 muestras (53 ms a 128): "Jitter 20" era el buffer clavado en el tope y cada pico de
+más de ~27 ms, un corte. Y "Sin audio del servidor" se mostraba cada vez que el buffer se vaciaba un instante.
+
+Cambios: tope del jitter buffer por duración (`maxBufferMs = 80`: 60 bloques a 64, 30 a 128; ring de 128 slots)
+y "Sin audio del servidor" sólo tras 2 s sin ninguna mezcla. Test nuevo `6e` que simula ese camino a 64
+muestras: con el tope viejo el buffer queda en 21 bloques (28 ms) y pierde 1.56 % tras el arranque; con el nuevo
+crece a 44 bloques (58.7 ms) y pierde 0.54 %. Unitarias **169 / 0**; integración headless 6/6 PASS con la
+misma latencia en loopback (13–14 ms). Recomendación para internet: buffer 128 (la mitad de paquetes por segundo
+por un túnel en espacio de usuario) y cable en las dos puntas.
 
 ## Pendiente de verificar con hardware
 

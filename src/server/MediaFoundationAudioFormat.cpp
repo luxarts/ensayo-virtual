@@ -19,8 +19,8 @@ const char* const mfFormatName = "Media Foundation";
 // Only the containers JUCE cannot read itself: wav/flac/ogg/mp3 keep their built-in (cross-platform) readers.
 const char* const mfExtensions[] = { ".m4a", ".mp4", ".aac", ".m4b", nullptr };
 
-// BackingTrack rejects anything over 30 minutes; decoding stops a little past that so a huge file cannot
-// exhaust memory (35 min of stereo 48 kHz float is ~800 MB).
+// Decoding stops at 35 minutes so a huge file cannot exhaust memory (35 min of stereo 48 kHz float is ~800 MB);
+// longer m4a/aac imports are cut there.
 constexpr double maxDecodedSeconds = 35.0 * 60.0;
 
 // Minimal owning COM pointer (juce::ComSmartPtr lives in a private JUCE header).

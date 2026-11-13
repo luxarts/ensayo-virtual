@@ -11,16 +11,17 @@ namespace
     constexpr double evaluationPeriodMs = 1000.0;
     constexpr double ewmaAlpha = 0.05;
     constexpr int downMovesRequired = 3;
+}
 
-    int clampBlocks (int blocks) noexcept
-    {
-        return std::clamp (blocks, JitterBuffer::minBlocks, JitterBuffer::maxBlocks);
-    }
+int JitterBuffer::clampBlocks (int blocks) const noexcept
+{
+    return std::clamp (blocks, minBlocks, maxBlocks);
 }
 
 JitterBuffer::JitterBuffer (int blockBytesToUse, double blockDurationMsToUse)
     : blockBytes (std::max (1, blockBytesToUse)),
       blockDurationMs (blockDurationMsToUse > 0.0 ? blockDurationMsToUse : 1.0),
+      maxBlocks (std::clamp ((int) std::ceil (maxBufferMs / blockDurationMs), minBlocks + 1, numSlots / 2)),
       storage ((size_t) blockBytes * (size_t) numSlots, 0)
 {
     for (auto& tag : tags)
@@ -69,6 +70,14 @@ void JitterBuffer::reset() noexcept
     late.store (0, std::memory_order_relaxed);
     resyncs.store (0, std::memory_order_relaxed);
     jitterMs.store (0.0, std::memory_order_relaxed);   // the producer restarts its estimator on the next push
+}
+
+void JitterBuffer::resetForNewStream() noexcept
+{
+    reset();
+
+    if (autoSize.load (std::memory_order_relaxed))
+        sizeBlocks.store (clampBlocks (initialBlocks), std::memory_order_relaxed);
 }
 
 void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arrivalMs) noexcept
@@ -124,7 +133,8 @@ void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arri
     }
 
     const size_t slot = slotOf (seq);
-    tags[slot].store (0, std::memory_order_release);
+    tags[slot].store (0, std::memory_order_relaxed);
+    std::atomic_thread_fence (std::memory_order_release);   // the invalidation is visible before any payload write
     std::memcpy (storage.data() + slot * (size_t) blockBytes, data, (size_t) len);
     lengths[slot].store (len, std::memory_order_relaxed);
     tags[slot].store (taggedSeq (seq), std::memory_order_release);
@@ -256,8 +266,11 @@ bool JitterBuffer::pop (uint8_t* out, int& len) noexcept
         const int length = std::clamp (lengths[slot].load (std::memory_order_relaxed), 0, blockBytes);
         std::memcpy (out, storage.data() + slot * (size_t) blockBytes, (size_t) length);
 
-        // The producer only rewrites this slot during a resync; a tag change means the copy may be torn.
-        if (tags[slot].load (std::memory_order_acquire) == expected)
+        // The producer only rewrites this slot during a resync; a tag change means the copy may be torn. The fence
+        // keeps the payload reads above from moving past the recheck (seqlock reader).
+        std::atomic_thread_fence (std::memory_order_acquire);
+
+        if (tags[slot].load (std::memory_order_relaxed) == expected)
         {
             tags[slot].store (0, std::memory_order_release);
             len = length;

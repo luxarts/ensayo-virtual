@@ -1,5 +1,6 @@
 #include "ui/MainComponent.h"
-#include "FakeControlServer.h"
+#include "ui/Text.h"
+#include "server/ProjectHost.h"
 #include "MessagePump.h"
 
 namespace ensayo
@@ -21,8 +22,6 @@ namespace
 
         return predicate();
     }
-
-    juce::String statusText (juce::Component& root);
 
     juce::Component* findByName (juce::Component& root, const juce::String& name)
     {
@@ -50,32 +49,52 @@ namespace
         return false;
     }
 
-    juce::String statusText (juce::Component& root)
+    juce::String labelText (juce::Component& root, const juce::String& name)
     {
-        if (auto* label = dynamic_cast<juce::Label*> (findByName (root, "status.text")))
+        if (auto* label = dynamic_cast<juce::Label*> (findByName (root, name)))
             return label->getText();
 
         return {};
     }
 
+    juce::String statusText (juce::Component& root)   { return labelText (root, "status.text"); }
+
+    juce::File testSettingsFile()
+    {
+        return juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("EnsayoVirtual-test-settings.json");
+    }
+
+    // Test-mode MainComponents read this file; writing it first sets the name, the host port and a fixed user id.
+    AppSettings writeTestSettings (const juce::String& name, int hostPort)
+    {
+        AppSettings s;
+        s.name = name;
+        s.hostPort = hostPort;
+        s.userId = newId();
+        saveSettings (s, testSettingsFile());
+        return s;
+    }
+
     const char* const lobbyNames[] = {
-        "lobby.name", "lobby.role", "lobby.create", "lobby.link", "lobby.join",
+        "lobby.name", "lobby.role", "lobby.create", "lobby.open", "lobby.link", "lobby.join",
         "audio.device", "audio.rate", "audio.buffer", "audio.panel", "audio.mic", "audio.instrument",
-        "audio.output", "audio.latency", "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
+        "audio.output", "audio.latency", "lobby.calibrate", "lobby.calibration",
+        "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
         "status.text", "status.retry" };
 
     const char* const sessionNames[] = {
-        "session.link", "session.copy", "session.leave", "session.editor",
-        "me.voice.fader", "me.voice.mute", "me.voice.meter", "me.instrument.fader", "me.instrument.mute", "me.instrument.meter",
-        "participant.1.name", "participant.1.role", "participant.1.voice.fader", "participant.1.voice.mute",
-        "participant.1.instrument.fader", "participant.1.instrument.mute", "participant.1.meter",
-        "participant.2.name", "participant.2.role", "participant.2.voice.fader", "participant.2.voice.mute",
-        "participant.2.instrument.fader", "participant.2.instrument.mute", "participant.2.meter",
-        "participant.3.name", "participant.3.role", "participant.3.voice.fader", "participant.3.voice.mute",
-        "participant.3.instrument.fader", "participant.3.instrument.mute", "participant.3.meter",
-        "track.load", "track.url", "track.download", "track.name", "track.play", "track.stop", "track.loop",
-        "track.position", "track.time", "track.fader", "track.mute", "track.progress",
-        "status.ping", "status.jitter", "status.latency", "status.loss", "status.cpu", "status.text", "status.retry" };
+        "daw.project", "daw.link", "daw.copy", "daw.users", "daw.editor", "daw.leave",
+        "transport.home", "transport.play", "transport.time",
+        "transport.bpm", "transport.meter", "transport.click", "transport.countin",
+        "edit.split", "edit.delete", "daw.export", "timeline",
+        "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
+        "track.1.name", "track.2.name", "track.3.name", "track.4.name",
+        "track.1.arm", "track.2.arm", "track.3.lock",
+        "track.1.mute", "track.1.solo", "track.1.volume", "track.1.pan",
+        "track.1.delete", "track.1.meter", "track.4.delete", "track.4.meter",
+        "mine.voiceMonitor", "mine.instrumentMonitor", "mine.voiceSend", "mine.instrumentSend", "mine.micMute",
+        "people.1.name", "people.1.gain", "people.1.mute", "people.2.name",
+        "status.text", "status.sync", "status.ping", "status.transfers", "status.device", "status.cpu", "status.retry" };
 }
 
 class UiTests : public juce::UnitTest
@@ -83,18 +102,18 @@ class UiTests : public juce::UnitTest
 public:
     UiTests() : juce::UnitTest ("Ui", "EnsayoVirtual") {}
 
-    void expectControls (MainComponent& main, const char* const* names, size_t count, const juce::String& view)
+    void expectControls (juce::Component& root, const char* const* names, size_t count, const juce::String& view)
     {
         for (size_t i = 0; i < count; ++i)
         {
             const juce::String controlName (names[i]);
-            auto* c = findByName (main, controlName);
+            auto* c = findByName (root, controlName);
             expect (c != nullptr, view + ": missing " + controlName);
 
             if (c == nullptr)
                 continue;
 
-            expect (isShowingWithinRoot (main, c), view + ": not visible " + controlName);
+            expect (isShowingWithinRoot (root, c), view + ": not visible " + controlName);
             expect (c->getWidth() > 0 && c->getHeight() > 0, view + ": empty bounds " + controlName);
         }
     }
@@ -102,26 +121,44 @@ public:
     void runTest() override
     {
         MainComponent::setTestMode (true);
+        MainComponent::projectsRoot().deleteRecursively();
 
-        beginTest ("lobby shows every named control");
+        beginTest ("lobby shows every named control, the calibration says sin calibrar");
         {
+            testSettingsFile().deleteFile();
             MainComponent main;
             main.setVisible (true);
             main.setSize (1100, 760);
             expect (! main.isInSession());
             expectControls (main, lobbyNames, std::size (lobbyNames), "lobby");
-            expect (findByName (main, "participant.1.name") == nullptr);
+            expect (findByName (main, "timeline") == nullptr || ! isShowingWithinRoot (main, findByName (main, "timeline")));
+            expect (labelText (main, "lobby.calibration").contains ("sin calibrar"), labelText (main, "lobby.calibration"));
+            expectEquals (dynamic_cast<juce::Button*> (findByName (main, "lobby.open"))->getButtonText(), ES ("Abrir proyecto\xE2\x80\xA6"));
+            expectEquals (dynamic_cast<juce::Button*> (findByName (main, "lobby.calibrate"))->getButtonText(), juce::String ("Calibrar latencia"));
+            expect (isValidId (main.getSettings().userId));
         }
 
-        beginTest ("demo session shows every named control and hides the lobby");
+        beginTest ("a stored calibration for the device and buffer shows in the lobby");
+        {
+            auto s = writeTestSettings ("Ana", 22233);
+            s.calibration[calibrationKey ("", 256)] = 37;
+            saveSettings (s, testSettingsFile());
+            MainComponent main;
+            main.setSize (1100, 760);
+            expect (labelText (main, "lobby.calibration").contains ("37 muestras"), labelText (main, "lobby.calibration"));
+        }
+
+        beginTest ("demo session is the DAW view with every named control and hides the lobby");
         {
             MainComponent main;
             main.setVisible (true);
             main.setSize (1100, 760);
             main.showDemoSession();
-            expect (main.isInSession());
+            expect (main.isInSession() && main.isDemo());
             expectControls (main, sessionNames, std::size (sessionNames), "session");
-            expect (findByName (main, "participant.4.name") == nullptr);
+            expect (findByName (main, "track.5.name") == nullptr);
+            expect (findByName (main, "track.4.arm") == nullptr || ! isShowingWithinRoot (main, findByName (main, "track.4.arm")),
+                    "imported tracks cannot be armed");
 
             for (auto* lobbyName : lobbyNames)
             {
@@ -131,95 +168,163 @@ public:
                     continue;
 
                 auto* c = findByName (main, n);
-                expect (c != nullptr, "lobby control gone: " + n);
                 expect (c == nullptr || ! isShowingWithinRoot (main, c), "lobby control still visible in session: " + n);
             }
 
-            auto& session = main.getSession();
-            expect (session.getState().sessionId == "DEMO42");
-            expect (findByName (main, "session.link")->getName() == "session.link");
+            const auto& state = main.getDaw().getState();
+            expect (state.project != nullptr && state.project->tracks.size() == 4);
+            expect (state.live.size() == 1, "the other user's live take");
+            expect (state.takeAvailability.size() == 1 && std::abs (state.takeAvailability.begin()->second - 0.64f) < 1e-6f);
+            expect (labelText (main, "status.sync").startsWith ("Sincronizado (v "), labelText (main, "status.sync"));
+            expect (labelText (main, "status.transfers").startsWith ("Subidas: "), labelText (main, "status.transfers"));
 
-            // Descargar validates the URL before anything is launched.
-            session.onDownload ("https://example.com/watch?v=abc");
+            // Demo edits go through the real op validation.
+            const auto before = state.project->version;
+            main.getDaw().onAddVoice();
+            expect (main.getDaw().getState().project->tracks.size() == 5);
+            expect (main.getDaw().getState().project->version == before + 1);
+
+            // YouTube URLs are validated before anything is launched.
+            main.getDaw().onImportYouTube ("https://example.com/watch?v=abc");
             expect (statusText (main).contains ("URL de YouTube no v"), "status: " + statusText (main));
-            session.onDownload ("");
-            expect (statusText (main).contains ("URL de YouTube primero"), "status: " + statusText (main));
+
+            main.getDaw().onLeave();
+            expect (! main.isInSession());
         }
 
-        beginTest ("a second Crear sesion while the first join is pending tears the first attempt down");
+        beginTest ("Crear sesion hosts a new project, connects as host and edits go through the host");
         {
+            const auto s = writeTestSettings ("Ana", 22247);
+            juce::File projectDir;
+
+            {
+                MainComponent main;
+                main.setVisible (true);
+                main.setSize (1100, 760);
+                main.getLobby().createButton.onClick();
+                expect (statusText (main).contains ("Conectando"), "status: " + statusText (main));
+                expect (! main.getLobby().createButton.isEnabled() && ! main.getLobby().joinButton.isEnabled(),
+                        "buttons stay enabled while connecting");
+                expect (waitFor ([&] { return main.isInSession(); }, 8000), "never joined: " + statusText (main));
+                expect (main.getLobby().createButton.isEnabled(), "buttons not re-enabled after joining");
+
+                main.refreshSessionView();
+                const auto& state = main.getDaw().getState();
+                expect (state.project != nullptr && state.isHost && ! state.readOnly);
+                expectEquals (state.me, s.userId);
+                expect (state.project != nullptr && state.project->name.startsWith ("Proyecto "));
+                expect (state.link.startsWith ("ensayo://") && state.link.contains (":22247/"), state.link);
+                expect (labelText (main, "status.sync").startsWith ("Sincronizado (v "), labelText (main, "status.sync"));
+                expectEquals (labelText (main, "status.transfers"), ES ("Subidas: 0 \xC2\xB7 Descargas: 0"));
+
+                main.getDaw().onAddVoice();
+                main.getDaw().onAddInstrument();
+                expect (waitFor ([&] { auto p = main.getSession().project(); return p != nullptr && p->tracks.size() == 2; }, 5000),
+                        "tracks never applied");
+                main.refreshSessionView();
+                expectEquals (main.getDaw().getState().project->tracks[0].name, juce::String ("Voz 1"));
+                expect (main.getDaw().getState().project->tracks[1].kind == TrackKind::instrument);
+                expect (findByName (main, "track.2.arm") != nullptr);
+
+                // Play without an armed track only plays; with my track armed it records (no device in test mode:
+                // it explains instead).
+                main.getDaw().onPlay();
+                expect (! main.getSession().isRecording());
+                main.getDaw().onPause();
+                main.getDaw().onArm (main.getDaw().getState().project->tracks[0].id);
+                main.getDaw().onPlay();
+                expect (statusText (main).contains ("dispositivo"), "status: " + statusText (main));
+                expect (! main.getSession().isRecording());
+
+                projectDir = juce::File (main.getSettings().lastProject);
+                expect (projectDir.getChildFile ("project.json").existsAsFile(), projectDir.getFullPathName());
+                expect (projectDir.isAChildOf (MainComponent::projectsRoot()));
+
+                main.getDaw().onLeave();
+                expect (! main.isInSession());
+                expect (! main.getSession().isActive());
+            }
+
+            beginTest ("reopening the project keeps its tracks");
+            {
+                MainComponent main;
+                main.setVisible (true);
+                main.setSize (1100, 760);
+                main.hostProject (projectDir);
+                expect (waitFor ([&] { return main.isInSession(); }, 8000), "never joined: " + statusText (main));
+                const auto p = main.getSession().project();
+                expect (p != nullptr && p->tracks.size() == 2);
+                main.getDaw().onLeave();
+            }
+        }
+
+        beginTest ("a guest joins a link; a lost connection is read-only (Play with an armed track only plays) until Reintentar reconnects");
+        {
+            const auto hostUser = newId();
+            const auto dir = MainComponent::projectsRoot().getChildFile ("guest-test");
+            dir.deleteRecursively();
+            ProjectHost host ({ 22248, 8 });
+            expect (host.start (dir, hostUser, "Host", "Proyecto invitado").wasOk());
+            const auto s = writeTestSettings ("Bruno", 22249);
+
             MainComponent main;
             main.setVisible (true);
             main.setSize (1100, 760);
-            auto& lobby = main.getLobby();
-            lobby.nameEditor.setText ("Ana", juce::dontSendNotification);
+            main.joinFromLink ({ "127.0.0.1", 22248, host.getSessionId() });
+            expect (waitFor ([&] { return main.isInSession(); }, 8000), "never joined: " + statusText (main));
+            main.refreshSessionView();
+            expect (! main.getDaw().getState().isHost && ! main.getDaw().getState().readOnly);
+            expect (main.getDaw().getState().link.contains (host.getSessionId()));
+            expect (main.getDaw().getState().online.count (hostUser) == 1, "the host is listed");
 
-            lobby.createButton.onClick();
-            expect (! main.isInSession());
-            expect (! lobby.createButton.isEnabled() && ! lobby.joinButton.isEnabled(), "buttons stay enabled while connecting");
-            expect (statusText (main).contains ("Conectando"), "status: " + statusText (main));
+            main.getDaw().onAddVoice();
+            expect (waitFor ([&] { auto p = main.getSession().project(); return p != nullptr && p->tracks.size() == 1; }, 5000),
+                    "track never applied");
+            main.getDaw().onArm (main.getSession().project()->tracks[0].id);
 
-            // What a queued click or an ensayo:// link arriving while the first join is pending does: the first host
-            // and client attempt must be torn down (not replaced underneath the frame hook) and the second must win.
-            lobby.createButton.onClick();
-            expect (waitFor ([&] { return main.isInSession(); }, 5000), "embedded session never joined: " + statusText (main));
-            expect (lobby.createButton.isEnabled() && lobby.joinButton.isEnabled(), "buttons not re-enabled after joined");
-            expect (main.getSession().getState().participants.size() == 1);
+            main.getSession().getClient()->dropConnectionForTest();
+            expect (waitFor ([&] { return ! main.getSession().isConnected(); }, 8000));
+            main.refreshSessionView();
+            expect (main.getDaw().getState().readOnly);
 
-            main.getSession().onLeave();
-            expect (! main.isInSession());
-            expect (lobby.createButton.isEnabled());
+            // Read-only with my track armed: Play only plays, it does not try to record.
+            const auto before = statusText (main);
+            main.getDaw().onPlay();
+            expect (! main.getSession().isRecording());
+            expectEquals (statusText (main), before);
+            main.getDaw().onPause();
+            expectEquals (labelText (main, "status.sync"), ES ("S\xC3\xB3lo lectura: host desconectado"));
+            expect (main.getStatus().retry.isEnabled());
+            expect (main.isInSession(), "a lost connection keeps the session view");
+
+            main.getStatus().retry.onClick();
+            expect (waitFor ([&] { return main.getSession().isConnected(); }, 8000), "Reintentar did not reconnect: " + statusText (main));
+            main.refreshSessionView();
+            expect (! main.getDaw().getState().readOnly);
+            expect (labelText (main, "status.sync").startsWith ("Sincronizado"));
+
+            main.getDaw().onLeave();
+            host.stop();
         }
 
-        beginTest ("joining a session with another frame size adjusts the buffer setting and says so");
+        beginTest ("joining a dead link goes back to the lobby with Reintentar");
         {
-            FakeControlServer server (22190, 22191, FrameSize::f64);
-            expect (server.start(), "could not start the fake server on ports 22190/22191");
-
+            writeTestSettings ("Caro", 22250);
             MainComponent main;
             main.setVisible (true);
             main.setSize (1100, 760);
-            auto& lobby = main.getLobby();
-            lobby.nameEditor.setText ("Bruno", juce::dontSendNotification);
-            lobby.bufferBox.setSelectedId (2, juce::sendNotificationSync);   // 128 in test mode (no device)
-            expect (lobby.bufferBox.getText() == "128");
-
-            main.joinFromLink ({ "127.0.0.1", 22190, server.getSessionId() });
-            expect (waitFor ([&] { return main.isInSession(); }, 5000), "never joined: " + statusText (main));
-            expect (main.getSession().getState().frameSize == FrameSize::f64);
-            expectEquals (lobby.bufferBox.getText(), juce::String ("64"));
-            expect (statusText (main).contains ("Buffer ajustado a 64"), "status: " + statusText (main));
-
-            main.getSession().onLeave();
+            main.joinFromLink ({ "127.0.0.1", 22251, "ABCDEF" });
+            // Connecting disables Unirse; the failure re-enables it and replaces the "Conectando" message.
+            expect (waitFor ([&] { return main.getLobby().joinButton.isEnabled() && statusText (main).isNotEmpty()
+                                          && ! statusText (main).startsWith ("Conectando"); }, 15000),
+                    "still connecting: " + statusText (main));
             expect (! main.isInSession());
+            expect (main.getStatus().retry.isEnabled());
+            expect (waitFor ([&] { return ! main.getSession().isActive(); }, 2000), "the failed client was not released");
         }
 
-        beginTest ("session view renders from a state alone");
-        {
-            SessionView view;
-            view.setSize (1100, 600);
-            SessionState s;
-            s.connected = true; s.sessionId = "ABC234"; s.clientId = 1;
-            s.participants = { { 1, "Yo", Role::both }, { 2, "Otro", Role::voice } };
-            s.stats = { { 1, 4, 0, 0, 0.1f, 0.2f }, { 2, 3, 1, 0, 0.5f, 0.0f } };
-            view.setState (s);
-            auto* strip = findByName (view, "participant.1.name");
-            expect (strip != nullptr && findByName (view, "participant.2.name") == nullptr);
-
-            if (auto* fader = dynamic_cast<juce::Slider*> (findByName (view, "participant.1.instrument.fader")))
-            {
-                expect (! fader->isEnabled());
-                expectEquals (fader->getMinimum(), -60.0);
-                expectEquals (fader->getMaximum(), 12.0);
-            }
-            else
-            {
-                expect (false, "participant.1.instrument.fader is not a Slider");
-            }
-
-            if (auto* fader = dynamic_cast<juce::Slider*> (findByName (view, "participant.1.voice.fader")))
-                expect (fader->isEnabled());
-        }
+        testSettingsFile().deleteFile();
+        MainComponent::projectsRoot().deleteRecursively();
     }
 };
 

@@ -33,73 +33,98 @@ FetchContent_MakeAvailable(opus)
 
 # Sources shared by the app, the server and the test runner. Each marker is owned by one task.
 set(ENSAYO_CORE_SOURCES
+    # T1
+    src/core/Project.cpp
     # T2
+    src/core/Segments.cpp
+    src/client/TakeCache.cpp
     src/core/Protocol.cpp
     src/core/MixMath.cpp
     # T3
+    src/core/Render.cpp
     src/core/OpusCodec.cpp
     src/core/JitterBuffer.cpp
-    # T4
-    src/server/BackingTrack.cpp
-    src/server/MixServer.cpp
+    src/core/RemoteStreams.cpp
     # T6
     src/client/PluginSlot.cpp
     src/client/FakeAudioDevice.cpp
-    src/client/AudioEngine.cpp
     src/client/Settings.cpp
     # T7
     src/client/SessionLink.cpp
-    src/client/SessionClient.cpp
     src/client/YouTubeImporter.cpp
     # T8
     src/client/HeadlessClient.cpp
+    # T5
+    src/client/ProjectClient.cpp
+    # T7
+    src/client/Recorder.cpp
+    src/client/LatencyCalibrator.cpp
+    # T6
+    src/client/Offline.cpp
+    # T8
+    src/client/StudioEngine.cpp
+    # T10
+    src/client/SessionController.cpp
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
-    src/server/ServerHost.cpp
-    src/server/HighResClock.cpp
     src/server/MediaFoundationAudioFormat.cpp
+    # T4
+    src/server/ProjectHost.cpp
 )
 set(ENSAYO_UI_SOURCES
     # T9
+    src/ui/DawView.cpp
     src/ui/LobbyView.cpp
-    src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
-    src/ui/AudioDiagnosis.cpp
     # T10
     src/ui/Screenshot.cpp
 )
 set(ENSAYO_TEST_SOURCES
     tests/TestMain.cpp
     tests/BuildConfigTests.cpp
+    # T1
+    tests/ProjectTests.cpp
+    # T2
+    tests/SegmentsTests.cpp
+    tests/TakeCacheTests.cpp
     # T2-tests
     tests/ProtocolTests.cpp
     tests/MixMathTests.cpp
     # T3-tests
+    tests/RenderTests.cpp
     tests/OpusCodecTests.cpp
     tests/JitterBufferTests.cpp
+    tests/RemoteStreamsTests.cpp
     tests/SpscQueueTests.cpp
     # T4-tests
-    tests/BackingTrackTests.cpp
     tests/MediaFoundationAudioFormatTests.cpp
-    tests/MixServerTests.cpp
     # T5-tests
-    tests/ServerHostTests.cpp
     # T6-tests
     tests/PluginSlotTests.cpp
     tests/FakeAudioDeviceTests.cpp
-    tests/AudioEngineTests.cpp
     tests/SettingsTests.cpp
     # T7-tests
     tests/SessionLinkTests.cpp
-    tests/SessionClientTests.cpp
     tests/YouTubeImporterTests.cpp
     # T8-tests
     tests/HeadlessClientTests.cpp
     tests/UiTests.cpp
-    tests/AudioDiagnosisTests.cpp
     # T10-tests
     tests/ScreenshotTests.cpp
+    # T4
+    tests/ProjectHostTests.cpp
+    # T5
+    tests/ProjectClientTests.cpp
+    # T7
+    tests/RecorderTests.cpp
+    tests/LatencyCalibratorTests.cpp
+    # T6
+    tests/OfflineTests.cpp
+    # T8
+    tests/StudioEngineTests.cpp
+    # T9
+    tests/DawViewTests.cpp
 )
 
 set(ENSAYO_MODULES
@@ -112,7 +137,7 @@ set(ENSAYO_DEFINITIONS
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_MP3AUDIOFORMAT=1 JUCE_USE_FLAC=1
     JUCE_USE_OGGVORBIS=1 CUSTOM_MODES=1 JUCE_DISPLAY_SPLASH_SCREEN=0)
 
-set(ENSAYO_SYSTEM_LIBS ws2_32 avrt winmm mf mfplat mfreadwrite mfuuid)
+set(ENSAYO_SYSTEM_LIBS ws2_32 avrt bcrypt winmm mf mfplat mfreadwrite mfuuid)
 
 juce_add_gui_app(EnsayoVirtual PRODUCT_NAME "Ensayo Virtual" COMPANY_NAME "EnsayoVirtual")
 target_sources(EnsayoVirtual PRIVATE src/Main.cpp ${ENSAYO_UI_SOURCES} ${ENSAYO_SERVER_SOURCES} ${ENSAYO_CORE_SOURCES})

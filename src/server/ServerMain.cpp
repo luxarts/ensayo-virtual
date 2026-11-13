@@ -1,4 +1,4 @@
-#include "server/ServerHost.h"
+#include "server/ProjectHost.h"
 
 #include <juce_events/juce_events.h>
 
@@ -32,51 +32,54 @@ BOOL WINAPI consoleHandler (DWORD type)
 
 void printUsage()
 {
-    std::cout << "EnsayoServer [--port N] [--udp-port N] [--frame 64|128] [--log]\n"
-              << "  --port N      puerto TCP de control (y UDP si no se indica --udp-port), por defecto "
-              << ensayo::defaultPort << "\n"
-              << "  --udp-port N  puerto UDP de audio\n"
-              << "  --frame N     tamano de bloque en muestras: 64 o 128 (por defecto 128)\n"
-              << "  --log         imprime eventos del servidor\n";
+    std::cout << "EnsayoServer --project <carpeta> [--port N] [--name <proyecto>] [--user <id>] [--user-name <nombre>] [--log]\n"
+              << "  --project D     carpeta del proyecto (project.json + takes); se crea si no existe\n"
+              << "  --port N        puerto TCP (control y datos) y UDP (escucha en vivo), por defecto " << ensayo::defaultPort << "\n"
+              << "  --name P        nombre de un proyecto nuevo (por defecto, el nombre de la carpeta)\n"
+              << "  --user ID       id del usuario anfitrion (32 hex); por defecto el del proyecto, o uno nuevo.\n"
+              << "                  Un cliente con ese id solo puede conectarse desde 127.0.0.1.\n"
+              << "  --user-name N   nombre del anfitrion (por defecto el guardado en el proyecto, o \"Anfitrion\")\n"
+              << "  --log           imprime eventos del servidor\n"
+              << "Imprime \"host_user ID\" y \"listening port=N session=ID\"; termina al cerrarse la entrada estandar (o con Ctrl+C).\n";
 }
+
+juce::String fromArg (const char* text)   { return juce::String (juce::CharPointer_UTF8 (text)); }
 }
 
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juceInitialiser;
 
-    ensayo::ServerConfig config;
+    ensayo::HostConfig config;
+    juce::File projectDir;
+    juce::String projectName, user, userName;
     bool log = false;
-    bool udpGiven = false;
 
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg (argv[i]);
         const bool hasValue = i + 1 < argc;
 
-        if (arg == "--port" && hasValue)
+        if (arg == "--project" && hasValue)
         {
-            config.tcpPort = std::atoi (argv[++i]);
-
-            if (! udpGiven)
-                config.udpPort = config.tcpPort;
+            const auto path = fromArg (argv[++i]).unquoted();
+            projectDir = juce::File::isAbsolutePath (path) ? juce::File (path) : juce::File::getCurrentWorkingDirectory().getChildFile (path);
         }
-        else if (arg == "--udp-port" && hasValue)
+        else if (arg == "--port" && hasValue)
         {
-            config.udpPort = std::atoi (argv[++i]);
-            udpGiven = true;
+            config.port = std::atoi (argv[++i]);
         }
-        else if (arg == "--frame" && hasValue)
+        else if (arg == "--name" && hasValue)
         {
-            const auto size = ensayo::frameSizeForSamples (std::atoi (argv[++i]));
-
-            if (! size)
-            {
-                std::cerr << "--frame debe ser 64 o 128\n";
-                return 2;
-            }
-
-            config.frameSize = *size;
+            projectName = fromArg (argv[++i]);
+        }
+        else if (arg == "--user" && hasValue)
+        {
+            user = fromArg (argv[++i]).trim().toLowerCase();
+        }
+        else if (arg == "--user-name" && hasValue)
+        {
+            userName = fromArg (argv[++i]).trim();
         }
         else if (arg == "--log")
         {
@@ -89,19 +92,56 @@ int main (int argc, char* argv[])
         }
         else
         {
-            std::cerr << "Argumento desconocido: " << arg << "\n";
+            std::cerr << "Argumento desconocido o sin valor: " << arg << "\n";
             printUsage();
             return 2;
         }
     }
 
-    if (config.tcpPort <= 0 || config.tcpPort > 65535 || config.udpPort < 0 || config.udpPort > 65535)
+    if (projectDir == juce::File())
+    {
+        std::cerr << "Falta --project <carpeta>\n";
+        printUsage();
+        return 2;
+    }
+
+    if (config.port <= 0 || config.port > 65535)
     {
         std::cerr << "Puerto invalido\n";
         return 2;
     }
 
-    ensayo::ServerHost host (config);
+    if (user.isNotEmpty() && ! ensayo::isValidId (user))
+    {
+        std::cerr << "--user debe ser un id de 32 caracteres hexadecimales\n";
+        return 2;
+    }
+
+    // Defaults come from an existing project: its host user (a different one would be refused) and that user's name.
+    if (const auto existing = projectDir.getChildFile ("project.json"); existing.existsAsFile())
+    {
+        juce::String error;
+
+        if (const auto project = ensayo::projectFromJson (existing.loadFileAsString(), error))
+        {
+            if (user.isEmpty())
+                user = project->hostUser;
+
+            if (userName.isEmpty())
+                userName = project->userName (project->hostUser);
+        }
+    }
+
+    if (user.isEmpty())
+        user = ensayo::newId();
+
+    if (userName.isEmpty())
+        userName = juce::String (juce::CharPointer_UTF8 ("Anfitri\xc3\xb3n"));
+
+    if (projectName.isEmpty())
+        projectName = projectDir.getFileName();
+
+    ensayo::ProjectHost host (config);
 
     if (log)
         host.onLog = [] (const juce::String& line)
@@ -109,7 +149,7 @@ int main (int argc, char* argv[])
             std::cout << line.toStdString() << std::endl;
         };
 
-    const auto result = host.start();
+    const auto result = host.start (projectDir, user, userName, projectName);
 
     if (result.failed())
     {
@@ -117,9 +157,9 @@ int main (int argc, char* argv[])
         return 1;
     }
 
-    host.startInternalClock();
-
-    std::cout << "listening tcp=" << config.tcpPort << " udp=" << host.getUdpPort() << std::endl;
+    // The host user's id comes first so a script can connect as host (from 127.0.0.1) even when it was generated here.
+    std::cout << "host_user " << user.toStdString() << std::endl;
+    std::cout << "listening port=" << host.getPort() << " session=" << host.getSessionId().toStdString() << std::endl;
     std::cout.flush();
 
     SetConsoleCtrlHandler (consoleHandler, TRUE);

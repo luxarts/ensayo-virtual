@@ -10,21 +10,28 @@ namespace ensayo
 class JitterBuffer
 {
 public:
-    static constexpr int minBlocks = 2, maxBlocks = 20, initialBlocks = 4;
-    // Ring slots. A power of two so `seq & (numSlots - 1)` stays contiguous across the 16-bit wrap (65536 % 20 = 16
-    // would alias seqs 16 apart near the wrap). Must exceed maxBlocks: the live window never spans more than that.
-    static constexpr int numSlots = 32;
-    static_assert ((numSlots & (numSlots - 1)) == 0 && numSlots > maxBlocks && 65536 % numSlots == 0);
+    static constexpr int minBlocks = 2, initialBlocks = 4;
+    // The cap is a duration, not a block count: 20 blocks were 53 ms at 128 samples but only 27 ms at 64, which a
+    // real internet path (Tailscale, 2026-11-08: 7 ms with 32 ms spikes) exceeds → constant dropouts at 64.
+    static constexpr double maxBufferMs = 80.0;
+    // Ring slots. A power of two so `seq & (numSlots - 1)` stays contiguous across the 16-bit wrap. Must exceed the
+    // largest per-instance cap (60 blocks at 64 samples): the live window never spans more than the cap.
+    static constexpr int numSlots = 128;
+    static_assert ((numSlots & (numSlots - 1)) == 0 && 65536 % numSlots == 0);
     static constexpr int lateResyncThreshold = 8;   // consecutive late packets that re-anchor the window on the stream
     JitterBuffer (int blockBytes, double blockDurationMs);
     void setAutoSize (bool enabled) noexcept;      // default true
     void setSizeBlocks (int blocks) noexcept;      // manual; clamps; resets window
     int getSizeBlocks() const noexcept;
+    int getMaxBlocks() const noexcept               { return maxBlocks; }   // ceil(maxBufferMs / block), ≤ numSlots / 2
     // Producer. Late (behind the read position) → counted as late and dropped. More than maxBlocks ahead → window resync.
     void push (uint16_t seq, const uint8_t* data, int len, double arrivalMs) noexcept;
     // Consumer. Copies one block into out and returns true; false → caller does PLC. Advances the read sequence.
     bool pop (uint8_t* out, int& len) noexcept;
     void reset() noexcept;                         // forgets everything; next push defines the window
+    // Producer side, for a buffer reused by another stream: reset(), and in auto mode the size goes back to
+    // initialBlocks (the previous stream's jitter says nothing about the new one).
+    void resetForNewStream() noexcept;
     struct Stats { int sizeBlocks = 0; uint32_t underruns = 0, late = 0, resyncs = 0; double jitterMs = 0.0; bool primed = false; };
     Stats getStats() const noexcept;
 private:
@@ -44,9 +51,11 @@ private:
     void evaluateTarget() noexcept;
     void clearSlots() noexcept;
     void resetEstimator() noexcept;
+    int clampBlocks (int blocks) const noexcept;
 
     const int blockBytes;
     const double blockDurationMs;
+    const int maxBlocks;
     std::vector<uint8_t> storage;                                  // numSlots * blockBytes, sized once
     std::array<std::atomic<uint32_t>, numSlots> tags;
     std::array<std::atomic<int>, numSlots> lengths;

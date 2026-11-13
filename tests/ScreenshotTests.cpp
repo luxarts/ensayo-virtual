@@ -7,28 +7,35 @@ namespace
 {
     // Mirrors tests/integration/expected-controls.json; used only when the repository file cannot be located.
     const char* const embeddedExpected = R"json({
-      "lobby": [
-        "lobby.name", "lobby.role", "lobby.create", "lobby.link", "lobby.join",
-        "audio.device", "audio.rate", "audio.buffer", "audio.panel", "audio.mic", "audio.instrument",
-        "audio.output", "audio.latency",
-        "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
-        "status.text", "status.retry"
-      ],
-      "session": [
-        "session.link", "session.copy", "session.leave",
-        "me.voice.fader", "me.voice.mute", "me.voice.meter",
-        "me.instrument.fader", "me.instrument.mute", "me.instrument.meter",
-        "participant.1.name", "participant.1.role", "participant.1.voice.fader", "participant.1.voice.mute",
-        "participant.1.instrument.fader", "participant.1.instrument.mute", "participant.1.meter",
-        "participant.2.name", "participant.2.role", "participant.2.voice.fader", "participant.2.voice.mute",
-        "participant.2.instrument.fader", "participant.2.instrument.mute", "participant.2.meter",
-        "participant.3.name", "participant.3.role", "participant.3.voice.fader", "participant.3.voice.mute",
-        "participant.3.instrument.fader", "participant.3.instrument.mute", "participant.3.meter",
-        "track.load", "track.url", "track.download", "track.name", "track.play", "track.stop", "track.loop",
-        "track.position", "track.time", "track.fader", "track.mute", "track.progress",
-        "status.ping", "status.jitter", "status.latency", "status.loss", "status.cpu", "status.text", "status.retry"
-      ]
-    })json";
+  "lobby": [
+    "lobby.name", "lobby.role", "lobby.create", "lobby.open", "lobby.link", "lobby.join",
+    "audio.device", "audio.rate", "audio.buffer", "audio.panel", "audio.mic", "audio.instrument",
+    "audio.output", "audio.latency", "lobby.calibrate", "lobby.calibration",
+    "vst.list", "vst.browse", "vst.editor", "vst.bypass", "vst.remove",
+    "status.text", "status.retry"
+  ],
+  "session": [
+    "daw.project", "daw.link", "daw.copy", "daw.users", "daw.editor", "daw.leave",
+    "transport.home", "transport.play", "transport.time",
+    "transport.bpm", "transport.meter", "transport.click", "transport.countin",
+    "edit.split", "edit.delete", "daw.export", "timeline", "timeline.ruler",
+    "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
+    "track.1", "track.2", "track.3", "track.4",
+    "track.1.color", "track.1.name", "track.1.author", "track.1.kind", "track.1.delete", "track.1.meter", "track.1.mute", "track.1.solo", "track.1.arm",
+    "track.1.volume", "track.1.volume.text", "track.1.pan", "track.1.pan.text",
+    "track.2.color", "track.2.name", "track.2.author", "track.2.kind", "track.2.delete", "track.2.meter", "track.2.mute", "track.2.solo", "track.2.arm",
+    "track.2.volume", "track.2.volume.text", "track.2.pan", "track.2.pan.text",
+    "track.3.color", "track.3.name", "track.3.author", "track.3.kind", "track.3.delete", "track.3.meter", "track.3.mute", "track.3.solo", "track.3.lock",
+    "track.3.volume", "track.3.volume.text", "track.3.pan", "track.3.pan.text",
+    "track.4.color", "track.4.name", "track.4.author", "track.4.kind", "track.4.delete", "track.4.meter", "track.4.mute", "track.4.solo",
+    "track.4.volume", "track.4.volume.text", "track.4.pan", "track.4.pan.text",
+    "mine", "mine.voiceMonitor", "mine.voiceMonitor.text", "mine.instrumentMonitor", "mine.instrumentMonitor.text",
+    "mine.voiceSend", "mine.voiceSend.text", "mine.instrumentSend", "mine.instrumentSend.text", "mine.micMute",
+    "people", "people.1", "people.1.name", "people.1.gain", "people.1.gain.text", "people.1.mute",
+    "people.2", "people.2.name", "people.2.gain", "people.2.gain.text", "people.2.mute",
+    "status.text", "status.sync", "status.ping", "status.transfers", "status.device", "status.cpu", "status.retry"
+  ]
+})json";
 
     juce::File findExpectedControlsFile()
     {
@@ -135,10 +142,17 @@ public:
         expectEquals (typeOf ("lobby.name", "lobby"), juce::String ("TextEditor"));
         expectEquals (typeOf ("lobby.role", "lobby"), juce::String ("ComboBox"));
         expectEquals (typeOf ("lobby.create", "lobby"), juce::String ("TextButton"));
-        expectEquals (typeOf ("me.voice.fader", "session"), juce::String ("Slider"));
-        expectEquals (typeOf ("me.voice.meter", "session"), juce::String ("LevelMeter"));
-        expectEquals (typeOf ("track.progress", "session"), juce::String ("ProgressBar"));
-        expectEquals (typeOf ("track.name", "session"), juce::String ("Label"));
+        expectEquals (typeOf ("lobby.open", "lobby"), juce::String ("TextButton"));
+        expectEquals (typeOf ("lobby.calibrate", "lobby"), juce::String ("TextButton"));
+        expectEquals (typeOf ("lobby.calibration", "lobby"), juce::String ("Label"));
+        expectEquals (typeOf ("transport.play", "session"), juce::String ("TextButton"));
+        expectEquals (typeOf ("track.1.delete", "session"), juce::String ("TextButton"));
+        expectEquals (typeOf ("mine.micMute", "session"), juce::String ("ToggleButton"));
+        expectEquals (typeOf ("people.1.gain", "session"), juce::String ("Slider"));
+        expectEquals (typeOf ("track.1.volume", "session"), juce::String ("Slider"));
+        expectEquals (typeOf ("track.1.name", "session"), juce::String ("Label"));
+        expectEquals (typeOf ("tracks.youtube", "session"), juce::String ("TextEditor"));
+        expectEquals (typeOf ("status.sync", "session"), juce::String ("Label"));
 
         outDir.deleteRecursively();
     }

@@ -1,5 +1,6 @@
 #include "FakeAudioDevice.h"
 
+#include <algorithm>
 #include <cmath>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -113,10 +114,11 @@ private:
 };
 
 //==============================================================================
-FakeAudioDevice::FakeAudioDevice (int blockSizeToUse, TestSignal signalToUse)
+FakeAudioDevice::FakeAudioDevice (int blockSizeToUse, TestSignal signalToUse, FakeLatency latencyToUse)
     : juce::AudioIODevice (FakeAudioDeviceType::deviceName(), FakeAudioDeviceType::typeName()),
       requestedBlockSize (blockSizeToUse > 0 ? blockSizeToUse : 128),
       signal (signalToUse),
+      latency { juce::jmax (0, latencyToUse.input), juce::jmax (0, latencyToUse.output), juce::jmax (0, latencyToUse.hidden) },
       blockSize (requestedBlockSize)
 {
 }
@@ -129,7 +131,7 @@ FakeAudioDevice::~FakeAudioDevice()
 juce::StringArray FakeAudioDevice::getOutputChannelNames()      { return { "Fake Out L", "Fake Out R" }; }
 juce::StringArray FakeAudioDevice::getInputChannelNames()       { return { "Fake In L", "Fake In R" }; }
 juce::Array<double> FakeAudioDevice::getAvailableSampleRates()  { return { fakeSampleRate }; }
-juce::Array<int> FakeAudioDevice::getAvailableBufferSizes()     { return { 64, 128, 256 }; }
+juce::Array<int> FakeAudioDevice::getAvailableBufferSizes()     { return { 64, 128, 256, 512, 1024 }; }
 int FakeAudioDevice::getDefaultBufferSize()                     { return requestedBlockSize; }
 
 juce::String FakeAudioDevice::open (const juce::BigInteger& inputChannels, const juce::BigInteger& outputChannels,
@@ -152,6 +154,12 @@ juce::String FakeAudioDevice::open (const juce::BigInteger& inputChannels, const
         return lastError;
     }
 
+    if (signal == TestSignal::loopback && latency.input + latency.output + latency.hidden < size)
+    {
+        lastError = "Loopback needs input + output latency >= the block size (" + juce::String (size) + ")";
+        return lastError;
+    }
+
     blockSize = size;
     activeInputs.clear();
     activeOutputs.clear();
@@ -166,6 +174,10 @@ juce::String FakeAudioDevice::open (const juce::BigInteger& inputChannels, const
     inR.assign ((size_t) blockSize, 0.0f);
     outL.assign ((size_t) blockSize, 0.0f);
     outR.assign ((size_t) blockSize, 0.0f);
+
+    const auto pastSize = signal == TestSignal::loopback ? (size_t) (latency.input + latency.output + latency.hidden + blockSize) : 0;
+    pastL.assign (pastSize, 0.0f);
+    pastR.assign (pastSize, 0.0f);
     sampleIndex = 0;
     sinePhase = 0.0;
     opened.store (true);
@@ -186,8 +198,8 @@ double FakeAudioDevice::getCurrentSampleRate()           { return fakeSampleRate
 int FakeAudioDevice::getCurrentBitDepth()                { return 32; }
 juce::BigInteger FakeAudioDevice::getActiveOutputChannels() const { return activeOutputs; }
 juce::BigInteger FakeAudioDevice::getActiveInputChannels() const  { return activeInputs; }
-int FakeAudioDevice::getOutputLatencyInSamples()         { return 0; }
-int FakeAudioDevice::getInputLatencyInSamples()          { return 0; }
+int FakeAudioDevice::getOutputLatencyInSamples()         { return latency.output; }
+int FakeAudioDevice::getInputLatencyInSamples()          { return latency.input; }
 
 void FakeAudioDevice::start (juce::AudioIODeviceCallback* newCallback)
 {
@@ -199,6 +211,8 @@ void FakeAudioDevice::start (juce::AudioIODeviceCallback* newCallback)
     callback = newCallback;
     sampleIndex = 0;
     sinePhase = 0.0;
+    std::fill (pastL.begin(), pastL.end(), 0.0f);
+    std::fill (pastR.begin(), pastR.end(), 0.0f);
 
     if (callback != nullptr)
         callback->audioDeviceAboutToStart (this);
@@ -270,6 +284,24 @@ void FakeAudioDevice::fillInputs (double qpcMs) noexcept
 
             break;
         }
+
+        case TestSignal::loopback:
+        {
+            // Output sample k comes back as input sample k + delay; open() guarantees delay >= n, so every source
+            // sample was produced by an earlier block.
+            const int64_t delay = latency.input + latency.output + latency.hidden;
+            const auto size = (int64_t) pastL.size();
+
+            for (int i = 0; i < n; ++i)
+            {
+                const int64_t source = sampleIndex + i - delay;
+                const auto slot = (size_t) (source % size);
+                inL[(size_t) i] = source >= 0 ? pastL[slot] : 0.0f;
+                inR[(size_t) i] = source >= 0 ? pastR[slot] : 0.0f;
+            }
+
+            break;
+        }
     }
 }
 
@@ -299,13 +331,25 @@ void FakeAudioDevice::renderBlock (juce::AudioIODeviceCallback* cb) noexcept
         cb->audioDeviceIOCallbackWithContext (activeIn, numIn, activeOut, numOut, blockSize, context);
     }
 
+    if (signal == TestSignal::loopback)
+    {
+        const auto size = (int64_t) pastL.size();
+
+        for (int i = 0; i < blockSize; ++i)
+        {
+            const auto slot = (size_t) ((sampleIndex + i) % size);
+            pastL[slot] = outL[(size_t) i];
+            pastR[slot] = outR[(size_t) i];
+        }
+    }
+
     onOutputBlock (outL.data(), outR.data(), blockSize, sampleIndex, qpcMs);
     sampleIndex += blockSize;
 }
 
 //==============================================================================
-FakeAudioDeviceType::FakeAudioDeviceType (int blockSizeToUse, TestSignal signalToUse)
-    : juce::AudioIODeviceType (typeName()), blockSize (blockSizeToUse), signal (signalToUse)
+FakeAudioDeviceType::FakeAudioDeviceType (int blockSizeToUse, TestSignal signalToUse, FakeLatency latencyToUse)
+    : juce::AudioIODeviceType (typeName()), blockSize (blockSizeToUse), signal (signalToUse), latency (latencyToUse)
 {
 }
 
@@ -322,7 +366,7 @@ int FakeAudioDeviceType::getIndexOfDevice (juce::AudioIODevice* device, bool) co
 juce::AudioIODevice* FakeAudioDeviceType::createDevice (const juce::String& outputDeviceName, const juce::String& inputDeviceName)
 {
     if (outputDeviceName == deviceName() || inputDeviceName == deviceName())
-        return new FakeAudioDevice (blockSize, signal);
+        return new FakeAudioDevice (blockSize, signal, latency);
 
     return nullptr;
 }

@@ -3,8 +3,9 @@
 param ([string] $BuildDir = 'build', [string] $Config = 'Release')
 
 $ErrorActionPreference = 'Stop'
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
-$scripts = @('two-instances', 'embedded-host', 'backing-track', 'packet-loss', 'screenshots', 'asio-loopback', 'youtube-track', 'udp-blocked')
+$scripts = @('screenshots', 'record-sync', 'edit-sync', 'reconnect', 'reopen', 'import-export', 'voice-chat', 'asio-calibration')
 $results = @()
 $anyFailed = $false
 
@@ -32,8 +33,8 @@ foreach ($script in $scripts)
     if ($exit -ne 0 -and $statusWord -ne 'FAIL') { $statusWord = 'FAIL'; $detail = "exit code $exit" }
     if ($statusWord -eq 'FAIL') { $anyFailed = $true }
 
-    $latency = @($output | Where-Object { $_ -match '^\s*latency ' }) | Select-Object -Last 1
-    if ($null -ne $latency -and $detail -eq '') { $detail = $latency.Trim() }
+    $summary = @($output | Where-Object { $_ -match '^\s*result: ' }) | Select-Object -Last 1
+    if ($null -ne $summary -and $detail -eq '') { $detail = ($summary.Trim() -replace '^result:\s*', '') }
 
     $results += [PSCustomObject] @{ Script = $script; Status = $statusWord; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Detail = $detail }
 }
