@@ -44,6 +44,7 @@ set(ENSAYO_CORE_SOURCES
     src/core/Render.cpp
     src/core/OpusCodec.cpp
     src/core/JitterBuffer.cpp
+    src/core/RemoteStreams.cpp
     # T6
     src/client/PluginSlot.cpp
     src/client/FakeAudioDevice.cpp
@@ -94,6 +95,7 @@ set(ENSAYO_TEST_SOURCES
     tests/RenderTests.cpp
     tests/OpusCodecTests.cpp
     tests/JitterBufferTests.cpp
+    tests/RemoteStreamsTests.cpp
     tests/SpscQueueTests.cpp
     # T4-tests
     tests/MediaFoundationAudioFormatTests.cpp

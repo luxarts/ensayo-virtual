@@ -30,6 +30,20 @@ namespace AudioFlags
     constexpr uint8_t voice = 1, instrument = 2, mix = 4;
 }
 
+// The live stream a packet belongs to. One sender has at most one stream of each kind; on the wire the kind is the
+// voice / instrument flag bit (instrument set = instrument, anything else = voice).
+enum class StreamKind : uint8_t { voice = 0, instrument = 1 };
+constexpr StreamKind streamKindOf (uint8_t flags) noexcept
+{
+    return (flags & AudioFlags::instrument) != 0 ? StreamKind::instrument : StreamKind::voice;
+}
+// `flags` with the voice / instrument bits replaced by the bit of `kind` (other bits kept).
+constexpr uint8_t withStreamKind (uint8_t flags, StreamKind kind) noexcept
+{
+    return (uint8_t) ((flags & ~(AudioFlags::voice | AudioFlags::instrument))
+                      | (kind == StreamKind::instrument ? AudioFlags::instrument : AudioFlags::voice));
+}
+
 // Wire layout (little-endian): magic u8, version u8, flags u8, frameCode u8, seq u16,
 // clientId u32, sampleTime u32, trackPosition u32, lenVoice u8, lenInstrument u8, payloads.
 // (Payload lengths are at most 255 so one byte each keeps the header at exactly 20 bytes.)

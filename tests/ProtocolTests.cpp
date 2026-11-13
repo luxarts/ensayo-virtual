@@ -137,6 +137,26 @@ public:
             expectEquals (encodeAudioPacket (in, wire.data(), wire.size()), (size_t) 0);
         }
 
+        beginTest ("stream kind: carried by the voice/instrument flag bits");
+        {
+            expect (streamKindOf (AudioFlags::voice) == StreamKind::voice);
+            expect (streamKindOf (AudioFlags::instrument) == StreamKind::instrument);
+            expect (streamKindOf (0) == StreamKind::voice);
+            expectEquals ((int) withStreamKind (AudioFlags::voice | AudioFlags::mix, StreamKind::instrument),
+                          (int) (AudioFlags::instrument | AudioFlags::mix));
+            expectEquals ((int) withStreamKind (AudioFlags::instrument, StreamKind::voice), (int) AudioFlags::voice);
+
+            std::array<uint8_t, 96> stereo {};
+            AudioPacketView in;
+            in.flags = withStreamKind (0, StreamKind::instrument);
+            in.instrument = stereo.data(); in.instrumentLen = (int) stereo.size();
+            std::array<uint8_t, maxPacketBytes> wire {};
+            const auto written = encodeAudioPacket (in, wire.data(), wire.size());
+            AudioPacketView out;
+            expect (decodeAudioPacket (wire.data(), written, out));
+            expect (streamKindOf (out.flags) == StreamKind::instrument);
+        }
+
         beginTest ("decode rejects malformed packets");
         {
             std::array<uint8_t, 24> voice {};
