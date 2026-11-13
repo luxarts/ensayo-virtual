@@ -1101,6 +1101,10 @@ struct DawView::Impl
         const bool can = track != nullptr && canEdit (*track);
         split.setEnabled (can);
         del.setEnabled (can);
+
+        // No imports while I am recording (an import would compete with the take for the upload queue).
+        importFile.setEnabled (! state.recording && ! state.readOnly);
+        youtube.setEnabled (! state.recording && ! state.readOnly);
     }
 
     void commitTempo()

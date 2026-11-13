@@ -23,7 +23,7 @@ public:
     ~ProjectClient();
     // Message thread. Async: onConnected after `welcome` and the data connection are up; onError otherwise.
     void connect (const SessionLink&);
-    void disconnect();
+    void disconnect();                                        // flushes queued control lines (at most 500 ms) first
     bool isConnected() const noexcept;
     bool isHost() const noexcept;
     const Id& user() const noexcept;
@@ -33,7 +33,10 @@ public:
     // Recording plumbing (message thread unless noted)
     // add_take op + rec_start. takeOffset (persisted, not sent) = take samples before the record point (count-in and
     // latency); used only to finish the take if the app stops before finishTake (see unfinishedTakes).
-    void beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset = 0);
+    // announce = false (imports): no rec_start/rec_stop, so nobody sees it as a live recording, and it never becomes
+    // the take re-announced after a reconnect.
+    void beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset = 0,
+                    bool announce = true);
     // Any thread. Peaks of the take begun here are also kept: a reconnect during the take re-sends rec_start and them.
     void sendPeaks (const Id& take, int64_t fromPeak, const std::vector<Peak>&);
     // Any thread: appends to the local cache right away, persists to <cacheRoot>/pending/<take>/<index>.flac,

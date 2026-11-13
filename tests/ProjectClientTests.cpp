@@ -120,6 +120,7 @@ public:
         testLive();
         testDiscardEndsLive();
         testReconnectMidTake();
+        testUnannouncedAndFlush();
         testResumeAfterDisconnect();
         testQueueWhileReconnecting();
         testDestroyWhileBusy();
@@ -390,6 +391,57 @@ public:
 
         a->disconnect();
         b->disconnect();
+        host.stop();
+    }
+
+    void testUnannouncedAndFlush()
+    {
+        beginTest ("an unannounced take (import) is not live and does not replace the active take; disconnect flushes ops");
+
+        const auto root = testDir ("unannounced");
+        const auto hostUser = newId(), userB = newId();
+        ProjectHost host ({ 22257, 8 });
+        expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
+
+        Peer a (root.getChildFile ("cacheA"), hostUser, "Lucas");
+        Peer b (root.getChildFile ("cacheB"), userB, "Ana");
+        expect (a.connectTo (22257, host.getSessionId()));
+        expect (b.connectTo (22257, host.getSessionId()));
+
+        const auto track = newId(), real = newId(), imported = newId();
+        expect (addOwnTrack (b, track, "Voz"));
+        b->beginTake (real, 1, track, 0);
+        b->sendPeaks (real, 0, std::vector<Peak> (4, Peak { -0.1f, 0.1f }));
+        expect (waitUntil ([&] { return a->liveRecordings().size() == 1 && a->liveRecordings()[0].peaks.size() == 4; }, 5000));
+
+        b->beginTake (imported, 1, track, 0, 0, false);
+        b->queueSegment (imported, 0, makeSegment (4800, 1, 330.0f));
+        b->finishTake (imported, track, Region { newId(), imported, 0, 0, 4800 });
+        expect (waitUntil ([&] { const auto* t = host.snapshot()->findTake (imported); return t != nullptr && t->complete; }, 8000));
+        pumpMessages (200);
+
+        auto live = a->liveRecordings();
+        expect (live.size() == 1 && live[0].take == real, "the unannounced take changed A's live view");
+
+        b->sendPeaks (real, 4, std::vector<Peak> (6, Peak { -0.2f, 0.2f }));
+        expect (waitUntil ([&] { const auto l = a->liveRecordings(); return l.size() == 1 && l[0].peaks.size() == 10; }, 5000),
+                "the real take is no longer relayed");
+
+        // A reconnect re-announces the real take, not the import.
+        b->dropConnectionForTest();
+        expect (waitUntil ([&] { return ! b.disconnected.isEmpty(); }, 8000));
+        b->disconnect();
+        expect (b.connectTo (22257, host.getSessionId()));
+        expect (waitUntil ([&] { const auto l = a->liveRecordings(); return l.size() == 1 && l[0].take == real && l[0].peaks.size() == 10; }, 5000));
+        b->discardTake (real);
+
+        // An op sent right before disconnect() reaches the host.
+        const auto last = newId();
+        b->sendOp (Ops::addTrack (last, "Ultima", TrackKind::voice));
+        b->disconnect();
+        expect (waitUntil ([&] { return host.snapshot()->findTrack (last) != nullptr; }, 3000), "the last op was lost");
+
+        a->disconnect();
         host.stop();
     }
 

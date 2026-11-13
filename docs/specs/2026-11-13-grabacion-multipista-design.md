@@ -77,7 +77,7 @@ Unidades (cada una con una responsabilidad y una interfaz que se prueba sola):
 Se **eliminan**: `server/MixServer`, `server/BackingTrack`, `ui/SessionView`, `ui/AudioDiagnosis` (todo
 específico de la mezcla en vivo) y sus pruebas. Se **reutilizan**: sesiones/links/registro del esquema
 `ensayo://`, `SessionLink`, `Settings`, `PluginSlot`, `FakeAudioDevice`, `YouTubeImporter`,
-`MediaFoundationAudioFormat`, `OpusCodec`, `JitterBuffer`, `SpscQueue`, `Sha1`, `HighResClock` (relé), lobby.
+`MediaFoundationAudioFormat`, `OpusCodec`, `JitterBuffer`, `SpscQueue`, `Sha1`, lobby.
 
 ## 4. Modelo del proyecto
 

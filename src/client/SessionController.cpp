@@ -188,22 +188,14 @@ void SessionController::leave()
     if (isRecording())
         stopTake();
 
-    // An import stops at its next checkpoint (after decoding, after cutting, between segments). One whose segments
-    // were all queued is finished (the intent persists); a partial one is discarded with its track.
+    // An import is cancelled only while it decodes or cuts (before its track exists). Once the track is created the
+    // queueing thread runs to the end (local appends, fast) and the take is finished: the finish intent persists and
+    // the upload completes on the next connection, like a recording.
     importCancel = true;
     joinImportThread();
 
     if (importFinish && importQueued)
-    {
         completeImport();
-    }
-    else if (importFinish && client != nullptr)
-    {
-        client->discardTake (importFinish->take);
-
-        if (client->isConnected())
-            client->sendOp (Ops::deleteTrack (importFinish->track));
-    }
 
     importFinish.reset();
     importBusy = false;
@@ -487,6 +479,9 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
     if (importBusy)
         return juce::Result::fail (ES ("Ya hay una importaci\xC3\xB3n en curso"));
 
+    if (isRecording())
+        return juce::Result::fail (ES ("No se puede importar mientras grab\xC3\xA1s"));
+
     if (! file.existsAsFile())
         return juce::Result::fail ("No existe el archivo " + file.getFullPathName());
 
@@ -538,7 +533,7 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
 
             const Id track = newId(), take = newId();
             client->sendOp (Ops::addTrack (track, name, TrackKind::imported));
-            client->beginTake (take, channels, track, 0);
+            client->beginTake (take, channels, track, 0, 0, false);   // not a live recording: nothing to announce
             importFinish = ImportFinish { take, track, name, samples };
 
             auto* c = client.get();
@@ -548,9 +543,6 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
 
                 for (int i = 0; i < total; ++i)
                 {
-                    if (importCancel)
-                        return;   // leave() discards the partial take and its track
-
                     c->queueSegment (take, i, (*segments)[(size_t) i]);
                     const float fraction = (float) (i + 1) / (float) total;
                     post ([this, name, fraction] { if (onImportProgress) onImportProgress (name, fraction); });

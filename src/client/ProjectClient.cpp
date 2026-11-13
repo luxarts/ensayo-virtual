@@ -147,9 +147,26 @@ namespace
             {
                 const std::lock_guard<std::mutex> scoped (lock);
                 queue.emplace_back (line.toRawUTF8(), line.getNumBytesAsUTF8());
+                ++unsent;
             }
 
             work.signal();
+        }
+
+        // Waits until every enqueued line was handed to the socket, or the timeout passes. True when drained.
+        bool drain (int timeoutMs)
+        {
+            const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+
+            while (unsent.load() > 0 && isThreadRunning())
+            {
+                if (juce::Time::getMillisecondCounter() >= deadline)
+                    return false;
+
+                juce::Thread::sleep (2);
+            }
+
+            return unsent.load() == 0;
         }
 
         void run() override
@@ -171,7 +188,10 @@ namespace
                 }
 
                 if (have)
+                {
                     writeAll (socket, next.data(), next.size(), this);   // a dead socket is reported by the reader
+                    --unsent;
+                }
                 else
                     work.wait (100);
             }
@@ -181,6 +201,7 @@ namespace
         juce::StreamingSocket& socket;
         std::mutex lock;
         std::deque<std::string> queue;
+        std::atomic<int> unsent { 0 };   // enqueued and not yet written
         juce::WaitableEvent work;
     };
 
@@ -1649,6 +1670,20 @@ void ProjectClient::connect (const SessionLink& link)   { impl->connect (link); 
 
 void ProjectClient::disconnect()
 {
+    // Ops sent just before leaving (a finish, a rename) must reach the host: give the writer a moment to flush.
+    if (impl->welcomed)
+    {
+        std::shared_ptr<LineWriter> w;
+
+        {
+            const std::lock_guard<std::mutex> scoped (impl->writerLock);
+            w = impl->writer;
+        }
+
+        if (w != nullptr)
+            w->drain (500);
+    }
+
     ++(*impl->generation);   // queued callbacks of this connection are dropped
     impl->teardown();
 }
@@ -1677,7 +1712,8 @@ void ProjectClient::sendOp (const juce::var& op)
     impl->sendOpInternal (op);
 }
 
-void ProjectClient::beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset)
+void ProjectClient::beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset,
+                               bool announce)
 {
     bool sendAddTake = false;
 
@@ -1706,6 +1742,9 @@ void ProjectClient::beginTake (const Id& take, int channels, const Id& track, in
 
     if (sendAddTake)
         impl->sendOpInternal (Ops::addTake (take, channels));
+
+    if (! announce)
+        return;
 
     const std::lock_guard<std::mutex> scoped (impl->activeLock);
     impl->activeTake = take;

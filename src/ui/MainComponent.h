@@ -140,7 +140,7 @@ private:
     juce::Array<juce::File> vst3Files;
 
     bool inSession = false, demoMode = false, deviceOpen = false, connecting = false, calibrating = false;
-    bool settingsDirty = false;
+    bool settingsDirty = false, settingsFileKept = false;
     juce::uint32 settingsDirtyAtMs = 0;
 
     // What Reintentar repeats in the lobby.

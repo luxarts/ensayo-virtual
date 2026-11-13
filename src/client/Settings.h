@@ -21,8 +21,9 @@ juce::String calibrationKey (const juce::String& deviceName, int bufferSize);   
 juce::String toJson (const AppSettings&);  AppSettings fromJson (const juce::String&);   // invalid JSON → defaults
 juce::File defaultSettingsFile();           // %APPDATA%\EnsayoVirtual\settings.json
 // Missing file or keys → defaults. A file without a valid userId gets a new one, written back to the file at once so
-// the id is stable across loads. A file that is not valid JSON is renamed to <name>.bad first (never overwritten);
-// `warning` then receives a Spanish message for the user.
-AppSettings loadSettings (const juce::File&, juce::String* warning = nullptr);
+// the id is stable across loads. A file that is not valid JSON is moved to <name>.bad (or .bad.N) first and `warning`
+// receives a Spanish message for the user. If it cannot be moved, it is left untouched, the defaults live in memory
+// only and *keepFile is set: the caller must not save over it.
+AppSettings loadSettings (const juce::File&, juce::String* warning = nullptr, bool* keepFile = nullptr);
 bool saveSettings (const AppSettings&, const juce::File&);
 }

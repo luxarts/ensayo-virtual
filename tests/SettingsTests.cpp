@@ -1,6 +1,14 @@
 #include "client/Settings.h"
 #include "core/Project.h"
 
+#ifndef NOMINMAX
+ #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 namespace ensayo
 {
 class SettingsTests : public juce::UnitTest
@@ -97,6 +105,32 @@ public:
             juce::String none;
             loadSettings (file, &none);
             expect (none.isEmpty(), "a valid file gives no warning");
+
+            // An older .bad is never deleted: the next one goes to .bad.1.
+            file.replaceWithText ("second broken file");
+            loadSettings (file);
+            expectEquals (dir.getChildFile ("settings.json.bad").loadFileAsString(), juce::String ("{ \"name\": \"Ana\", truncated"));
+            expectEquals (dir.getChildFile ("settings.json.bad.1").loadFileAsString(), juce::String ("second broken file"));
+
+            // A corrupt file that cannot be moved aside (held open) is left untouched; defaults stay in memory.
+            file.replaceWithText ("third broken file");
+            bool keepFile = false;
+            juce::String warning3;
+            {
+                // Held open without FILE_SHARE_DELETE: it can be read but not renamed.
+                const auto handle = CreateFileW (file.getFullPathName().toWideCharPointer(), GENERIC_READ, FILE_SHARE_READ,
+                                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                expect (handle != INVALID_HANDLE_VALUE);
+                const auto inMemory = loadSettings (file, &warning3, &keepFile);
+                expect (isValidId (inMemory.userId));
+                CloseHandle (handle);
+            }
+
+            expect (keepFile, "a corrupt file that cannot be moved must be kept");
+            expectEquals (file.loadFileAsString(), juce::String ("third broken file"));
+            expect (! dir.getChildFile ("settings.json.bad.2").exists());
+            expect (warning3.contains ("no se guardar"), warning3);
+
             dir.deleteRecursively();
         }
 

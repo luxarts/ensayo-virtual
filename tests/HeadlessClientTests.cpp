@@ -394,6 +394,112 @@ public:
             engine.getDeviceManager().closeAudioDevice();
         }
 
+        beginTest ("leaving once an import's track exists finishes it: the next connection completes the take and its region");
+        {
+            const auto dir = tempDir ("import-leave");
+            const auto wav = writeWav (dir.getChildFile ("Guia.wav"), 44100.0, 60);
+            const auto projectDir = dir.getChildFile ("project");
+            const SessionIdentity identity { newId(), "Eli", dir.getChildFile ("cache") };
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+
+            {
+                SessionController session (engine);
+                bool connected = false;
+                float progress = 0.0f;
+                session.onConnected = [&] { connected = true; };
+                session.onImportProgress = [&] (const juce::String&, float f) { progress = f; };
+                expect (session.host (projectDir, recordPort, identity, "Importar").wasOk());
+                expect (waitFor ([&] { return connected; }, 8000));
+                expect (session.importFile (wav).wasOk());
+                expect (waitFor ([&] { return progress > 0.0f; }, 30000), "no segment was queued");
+                logMessage ("left at " + juce::String (progress * 100.0f, 1) + " % queued");
+                session.leave();   // the host stops too: the uploads must wait for the next connection
+                expect (! session.isImporting());
+            }
+
+            {
+                SessionController session (engine);
+                expect (session.host (projectDir, recordPort, identity, "Importar").wasOk());
+                expect (waitFor ([&]
+                {
+                    const auto p = session.getHost() != nullptr ? session.getHost()->snapshot() : nullptr;
+
+                    if (p == nullptr || p->tracks.size() != 1 || p->tracks[0].regions.size() != 1)
+                        return false;
+
+                    const auto* take = p->findTake (p->tracks[0].regions[0].take);
+                    return take != nullptr && take->complete;
+                }, 60000), "the import never completed after reconnecting");
+
+                const auto p = session.getHost()->snapshot();
+                expect (p->tracks.size() == 1 && p->tracks[0].kind == TrackKind::imported && p->tracks[0].name == "Guia");
+
+                if (p->tracks.size() == 1 && p->tracks[0].regions.size() == 1)
+                {
+                    const auto& r = p->tracks[0].regions[0];
+                    expect (r.start == 0 && r.offset == 0 && r.length == 60 * 48000 && p->findTake (r.take)->samples == r.length);
+                }
+
+                session.leave();
+            }
+
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
+        beginTest ("no import while recording; an import is never shown as a live recording");
+        {
+            const auto dir = tempDir ("import-live");
+            const auto wav = writeWav (dir.getChildFile ("Corta.wav"), 48000.0, 3);
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::sine440);
+            SessionController session (engine);
+            bool connected = false;
+            session.onConnected = [&] { connected = true; };
+            session.setMetronome (false, false);
+            expect (session.host (dir.getChildFile ("project"), recordPort, { newId(), "Fede", dir.getChildFile ("cache") }, "Vivo").wasOk());
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            // A guest watches.
+            ProjectClient guest ({ dir.getChildFile ("guest"), newId(), "Gabi" });
+            bool guestConnected = false;
+            guest.onConnected = [&] { guestConnected = true; };
+            guest.connect (session.getConnectLink());
+            expect (waitFor ([&] { return guestConnected; }, 8000));
+
+            bool sawLive = false, finished = false;
+            session.onImportFinished = [&] (const juce::String&, const juce::Result& r) { expect (r.wasOk(), r.getErrorMessage()); finished = true; };
+            expect (session.importFile (wav).wasOk());
+            expect (waitFor ([&] { sawLive = sawLive || ! guest.liveRecordings().empty(); return finished; }, 15000));
+
+            for (int i = 0; i < 30; ++i)
+            {
+                pumpMessages (10);
+                sawLive = sawLive || ! guest.liveRecordings().empty();
+            }
+
+            expect (! sawLive, "the guest saw the import as a live recording");
+
+            const Id track = newId();
+            session.getClient()->sendOp (Ops::addTrack (track, "Voz", TrackKind::voice));
+            expect (waitFor ([&] { return session.project()->findTrack (track) != nullptr; }, 5000));
+            expect (session.startTake (track).wasOk());
+            expect (waitFor ([&] { return guest.liveRecordings().size() == 1; }, 5000), "the guest does not see the take");
+
+            const auto refused = session.importFile (wav);
+            expect (refused.failed() && refused.getErrorMessage().contains ("mientras grab"), refused.getErrorMessage());
+            expect (! session.isImporting());
+
+            expect (waitFor ([&] { const auto l = guest.liveRecordings(); return l.size() == 1 && l[0].peaks.size() > 50; }, 5000),
+                    "the take's live peaks stopped reaching the guest");
+            expect (session.stopTake().has_value());
+            expect (waitFor ([&] { return guest.liveRecordings().empty(); }, 8000));
+
+            guest.disconnect();
+            session.leave();
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
         beginTest ("runHeadless --calibrate on a fake loopback finds the hidden latency and exits");
         {
             const auto o = parse ({ "--calibrate", "--fake-audio", "loopback", "--latency-in", "200", "--latency-out", "264" });

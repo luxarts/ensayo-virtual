@@ -120,29 +120,47 @@ juce::File defaultSettingsFile()
                .getChildFile ("settings.json");
 }
 
-AppSettings loadSettings (const juce::File& file, juce::String* warning)
+AppSettings loadSettings (const juce::File& file, juce::String* warning, bool* keepFile)
 {
     if (warning != nullptr)
         warning->clear();
+
+    if (keepFile != nullptr)
+        *keepFile = false;
 
     if (file.existsAsFile())
     {
         juce::var parsed;
 
-        // A file that does not parse is kept as <name>.bad before any defaults are written over it.
+        // A file that does not parse is moved aside (<name>.bad, or .bad.N when that exists) before any defaults are
+        // written. If it cannot be moved it is never overwritten: the defaults stay in memory only.
         if (juce::JSON::parse (file.loadFileAsString(), parsed).failed() || ! parsed.isObject())
         {
-            const auto bad = file.getSiblingFile (file.getFileName() + ".bad");
-            bad.deleteFile();
-            const bool kept = file.moveFileTo (bad);
-            const auto message = "Settings file " + file.getFullPathName() + " is not valid JSON"
-                                 + (kept ? "; kept as " + bad.getFullPathName() : juce::String ("; it could not be renamed"))
-                                 + " and replaced with defaults";
-            juce::Logger::writeToLog (message);
+            auto bad = file.getSiblingFile (file.getFileName() + ".bad");
+
+            for (int n = 1; bad.exists() && n < 1000; ++n)
+                bad = file.getSiblingFile (file.getFileName() + ".bad." + juce::String (n));
+
+            const bool kept = ! bad.exists() && file.moveFileTo (bad);
+            juce::Logger::writeToLog ("Settings file " + file.getFullPathName() + " is not valid JSON; "
+                                      + (kept ? "kept as " + bad.getFullPathName() : juce::String ("could not be moved aside, left untouched")));
+
+            if (! kept)
+            {
+                if (keepFile != nullptr)
+                    *keepFile = true;
+
+                if (warning != nullptr)
+                    *warning = juce::String (juce::CharPointer_UTF8 ("La configuraci\xc3\xb3n est\xc3\xa1 da\xc3\xb1" "ada y no se pudo apartar: "
+                                                                     "se usan valores por defecto y no se guardar\xc3\xa1n cambios"));
+
+                AppSettings s;
+                s.userId = newId();
+                return s;
+            }
 
             if (warning != nullptr)
-                *warning = juce::String (juce::CharPointer_UTF8 ("La configuraci\xc3\xb3n estaba da\xc3\xb1" "ada: se guard\xc3\xb3 como "))
-                           + bad.getFileName() + " y se usan valores por defecto";
+                *warning = juce::String (juce::CharPointer_UTF8 ("La configuraci\xc3\xb3n estaba da\xc3\xb1" "ada: se guard\xc3\xb3 como ")) + bad.getFileName() + " y se usan valores por defecto";
         }
     }
 

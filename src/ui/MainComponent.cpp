@@ -170,7 +170,7 @@ MainComponent::MainComponent()
     settingsFile = testMode ? juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("EnsayoVirtual-test-settings.json")
                             : defaultSettingsFile();
     juce::String settingsWarning;
-    settings = loadSettings (settingsFile, &settingsWarning);
+    settings = loadSettings (settingsFile, &settingsWarning, &settingsFileKept);
 
     addAndMakeVisible (lobby);
     addChildComponent (daw);
@@ -256,6 +256,10 @@ void MainComponent::markSettingsDirty()
 void MainComponent::saveSettingsNow()
 {
     settingsDirty = false;
+
+    if (settingsFileKept)
+        return;   // a corrupt settings file that could not be moved aside is never overwritten
+
     settings.pluginState = engine.getPluginSlot().isLoaded() ? engine.getPluginSlot().getStateBase64() : juce::String();
     saveSettings (settings, settingsFile);
 }
