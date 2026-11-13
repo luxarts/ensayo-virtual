@@ -217,25 +217,80 @@ public:
             expectEquals (mismatches, 0);
         }
 
-        beginTest ("overflow drops whole blocks, counts them and never crashes");
+        beginTest ("overflow drops whole blocks, fills them with silence in place, reports it and keeps the take aligned");
         {
             Recorder rec;
             Collected c;
             attach (rec, c);
             expect (rec.start (newId(), 1, testDir().getChildFile ("overflow.wav")).wasOk());
             rec.setWriterPausedForTest (true);
-            constexpr int64_t total = 480000;      // 10 s into an 8 s FIFO
-            pushRamp (rec, 1, total, false);
 
+            // 10 s into an 8 s FIFO while the writer is paused, then 1 s more once it drains again: every sample k of
+            // the device stream carries ramp (k), so a shifted take shows at once.
+            constexpr int64_t first = 480000, second = 48000, total = first + second;
+            std::vector<float> block (256);
+
+            const auto pushRange = [&] (int64_t from, int64_t to)
+            {
+                std::thread t ([&]
+                {
+                    for (int64_t i = from; i < to; i += 256)
+                    {
+                        const int n = (int) std::min<int64_t> (256, to - i);
+
+                        for (int k = 0; k < n; ++k)
+                            block[(size_t) k] = ramp (i + k, total);
+
+                        const float* ch[1] = { block.data() };
+                        rec.push (ch, n);
+                    }
+                });
+                t.join();
+            };
+
+            pushRange (0, first);
             expect (rec.overflows() > 0);
-            expect (rec.samplesCaptured() > 0);
-            expect (rec.samplesCaptured() < total);
             expect (rec.samplesCaptured() <= 8 * 48000);
+            const auto droppedFirst = rec.samplesDropped();
+            expectEquals (rec.samplesCaptured() + droppedFirst, first);
 
             rec.setWriterPausedForTest (false);
+            std::this_thread::sleep_for (std::chrono::milliseconds (1500));   // the FIFO drains
+            pushRange (first, total);
             rec.stop();
-            expectEquals (c.finishedSamples, rec.samplesCaptured());
-            expectEquals (c.liveSamples, rec.samplesCaptured());
+
+            expectEquals (rec.samplesDropped(), droppedFirst);
+            expectEquals (c.finishedSamples, total);
+            expectEquals (c.liveSamples, total);
+            expectEquals (c.errors, 1);
+
+            // Decode the segments back to back: ramp until the overflow, silence for the dropped samples, then the
+            // ramp again at its own device positions.
+            std::vector<float> decoded;
+
+            for (const auto& flac : c.segments)
+            {
+                juce::AudioBuffer<float> audio;
+                expect (decodeSegment (flac.getData(), flac.getSize(), audio));
+
+                for (int i = 0; i < audio.getNumSamples(); ++i)
+                    decoded.push_back (audio.getSample (0, i));
+            }
+
+            expectEquals ((int64_t) decoded.size(), total);
+            const int64_t gapStart = rec.samplesCaptured() - second, gapEnd = gapStart + droppedFirst;
+            expectEquals (gapEnd, first);
+            int64_t mismatches = 0;
+
+            for (int64_t k = 0; k < (int64_t) decoded.size(); ++k)
+            {
+                const float expected = (k >= gapStart && k < gapEnd) ? 0.0f : ramp (k, total);
+
+                if (std::abs (decoded[(size_t) k] - expected) > 1.0e-5f)
+                    ++mismatches;
+            }
+
+            expectEquals (mismatches, (int64_t) 0);
         }
 
         beginTest ("recordingOffset adds the latencies and clamps at zero");

@@ -76,6 +76,12 @@ juce::Result Recorder::start (const Id&, int channels, const juce::File& localWa
     wavFile = localWav;
     overflowCount = 0;
     captured = 0;
+    dropped = 0;
+    gapFifo = std::make_unique<juce::AbstractFifo> (maxGaps + 1);
+    gapPosition.assign (maxGaps + 1, 0);
+    gapLength.assign (maxGaps + 1, 0);
+    fifoWritten = 0;
+    openGap = 0;
     stopRequested = false;
     wake.reset();
     thread = std::thread ([this] { writerLoop(); });
@@ -88,11 +94,18 @@ void Recorder::push (const float* const* channels, int n) noexcept
     if (! capturing.load (std::memory_order_acquire) || n <= 0)
         return;
 
-    if (fifo->getFreeSpace() < n)
+    // A full FIFO, or a gap that cannot be published (more than maxGaps pending): the block is dropped and becomes
+    // silence, never shifting what follows.
+    if (fifo->getFreeSpace() < n || (openGap > 0 && gapFifo->getFreeSpace() < 1))
     {
         overflowCount.fetch_add (1, std::memory_order_relaxed);
+        dropped.fetch_add (n, std::memory_order_relaxed);
+        openGap += n;
         return;
     }
+
+    if (openGap > 0)
+        publishGap();
 
     int s1, n1, s2, n2;
     fifo->prepareToWrite (n, s1, n1, s2, n2);
@@ -108,8 +121,24 @@ void Recorder::push (const float* const* channels, int n) noexcept
     }
 
     fifo->finishedWrite (n1 + n2);
+    fifoWritten += n;
     captured.fetch_add (n, std::memory_order_relaxed);
     wake.signal();
+}
+
+void Recorder::publishGap() noexcept
+{
+    int s1, n1, s2, n2;
+    gapFifo->prepareToWrite (1, s1, n1, s2, n2);
+
+    if (n1 + n2 < 1)
+        return;
+
+    const int slot = n1 > 0 ? s1 : s2;
+    gapPosition[(size_t) slot] = fifoWritten;
+    gapLength[(size_t) slot] = openGap;
+    gapFifo->finishedWrite (1);
+    openGap = 0;
 }
 
 void Recorder::stop()
@@ -118,6 +147,12 @@ void Recorder::stop()
         return;
 
     capturing.store (false, std::memory_order_release);
+
+    // Samples dropped at the very end: the push side is quiet now (caller contract), so publish them from here and
+    // the take still ends at the device's last sample.
+    if (openGap > 0 && gapFifo->getFreeSpace() > 0)
+        publishGap();
+
     stopRequested.store (true, std::memory_order_release);
     wake.signal();
     thread.join();
@@ -125,6 +160,7 @@ void Recorder::stop()
 
 bool Recorder::isRecording() const noexcept { return capturing.load (std::memory_order_acquire); }
 uint32_t Recorder::overflows() const noexcept { return overflowCount.load (std::memory_order_relaxed); }
+int64_t Recorder::samplesDropped() const noexcept { return dropped.load (std::memory_order_relaxed); }
 int64_t Recorder::samplesCaptured() const noexcept { return captured.load (std::memory_order_relaxed); }
 
 void Recorder::setWriterPausedForTest (bool p) noexcept
@@ -230,29 +266,9 @@ void Recorder::writerLoop()
         w.peaksSentFrom = w.samples / peakBlock;
     };
 
-    // Moves one chunk from the FIFO through the WAV, the segmenter, the peaks and the live preview.
-    auto drainChunk = [&] () -> bool
+    // Runs w.chunk[0, ready) through the WAV, the live preview, the peaks and the segmenter.
+    auto processChunk = [&] (int ready) -> bool
     {
-        const int ready = std::min (fifo->getNumReady(), chunkSamples);
-
-        if (ready <= 0)
-            return false;
-
-        int s1, n1, s2, n2;
-        fifo->prepareToRead (ready, s1, n1, s2, n2);
-
-        for (int ch = 0; ch < numChannels; ++ch)
-        {
-            const auto* src = ring.data() + (size_t) ch * (size_t) ringSize;
-            auto* dst = w.chunk.getWritePointer (ch);
-            std::copy (src + s1, src + s1 + n1, dst);
-
-            if (n2 > 0)
-                std::copy (src + s2, src + s2 + n2, dst + n1);
-        }
-
-        fifo->finishedRead (n1 + n2);
-
         if (w.wav != nullptr && (failWav.load() || ! w.wav->writeFromAudioSampleBuffer (w.chunk, 0, ready)))
             failWavCopy ("cannot write");
 
@@ -277,6 +293,73 @@ void Recorder::writerLoop()
 
         w.samples += ready;
         return ! encodeFailed;
+    };
+
+    int64_t fifoRead = 0;                 // samples read from the FIFO
+    int64_t nextGap = -1, nextGapLength = 0, silenceLeft = 0;
+
+    // Moves one chunk (from the FIFO, or silence for an overflow gap) through the WAV, the segmenter, the peaks and
+    // the live preview.
+    auto drainChunk = [&] () -> bool
+    {
+        // Read the FIFO count before the gaps: a gap is published before the samples that follow it, so every gap
+        // inside what is ready here is visible below.
+        const int available = fifo->getNumReady();
+
+        if (nextGap < 0 && silenceLeft == 0 && gapFifo->getNumReady() > 0)
+        {
+            int s1, n1, s2, n2;
+            gapFifo->prepareToRead (1, s1, n1, s2, n2);
+            const int slot = n1 > 0 ? s1 : s2;
+            nextGap = gapPosition[(size_t) slot];
+            nextGapLength = gapLength[(size_t) slot];
+            gapFifo->finishedRead (1);
+        }
+
+        if (nextGap >= 0 && nextGap == fifoRead)
+        {
+            silenceLeft = nextGapLength;
+            nextGap = -1;
+
+            if (onError)
+                onError (juce::String (juce::CharPointer_UTF8 ("Se perdieron "))
+                         + juce::String ((double) silenceLeft * 1000.0 / rate, 0)
+                         + juce::String (juce::CharPointer_UTF8 (" ms de audio porque la grabaci\xc3\xb3n no dio abasto; "
+                                                                 "se rellenaron con silencio y la toma sigue alineada")));
+        }
+
+        if (silenceLeft > 0)
+        {
+            const int n = (int) std::min<int64_t> (silenceLeft, chunkSamples);
+            w.chunk.clear();
+            silenceLeft -= n;
+            return processChunk (n);
+        }
+
+        int ready = std::min (available, chunkSamples);
+
+        if (nextGap >= 0)
+            ready = (int) std::min<int64_t> (ready, nextGap - fifoRead);
+
+        if (ready <= 0)
+            return false;
+
+        int s1, n1, s2, n2;
+        fifo->prepareToRead (ready, s1, n1, s2, n2);
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            const auto* src = ring.data() + (size_t) ch * (size_t) ringSize;
+            auto* dst = w.chunk.getWritePointer (ch);
+            std::copy (src + s1, src + s1 + n1, dst);
+
+            if (n2 > 0)
+                std::copy (src + s2, src + s2 + n2, dst + n1);
+        }
+
+        fifo->finishedRead (n1 + n2);
+        fifoRead += ready;
+        return processChunk (ready);
     };
 
     for (;;)
