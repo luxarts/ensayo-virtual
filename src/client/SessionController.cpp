@@ -207,13 +207,27 @@ std::vector<SessionController::ClientGain> SessionController::clientGains (const
     return out;
 }
 
+// The engine's table follows the presence exactly: every online sender gets its user's level, then the clientIds
+// that are gone (a user who left, an old clientId after a reconnect) are dropped. Setting before dropping never lets a
+// muted sender play at 1.0 in between.
 void SessionController::applyParticipantGains()
 {
     if (client == nullptr)
         return;
 
+    std::set<uint32_t> fresh;
+
     for (const auto& g : clientGains (client->presence(), participantMixes))
+    {
         engine.setParticipantGain (g.clientId, g.gain, g.muted);
+        fresh.insert (g.clientId);
+    }
+
+    for (const auto id : appliedClients)
+        if (fresh.count (id) == 0)
+            engine.removeParticipantGain (id);
+
+    appliedClients = std::move (fresh);
 }
 
 void SessionController::attachLiveAudio()
@@ -222,6 +236,9 @@ void SessionController::attachLiveAudio()
         return;
 
     auto* c = client.get();
+    engine.clearParticipantGains();     // levels are per session: clientIds restart with the host
+    appliedClients.clear();
+    applyParticipantGains();
     engine.onChatPacket = [c] (StreamKind kind, const uint8_t* packet, size_t len) { c->sendAudio (kind, packet, len); };
     engine.setRemoteStreams (&c->remoteStreams());
     engine.setChatEnabled (true);
@@ -232,6 +249,8 @@ void SessionController::detachLiveAudio()
     engine.setChatEnabled (false);     // returns once the sink is no longer running
     engine.setRemoteStreams (nullptr); // returns once the callback no longer reads the client's table
     engine.onChatPacket = nullptr;
+    engine.clearParticipantGains();
+    appliedClients.clear();
 }
 
 juce::Result SessionController::host (const juce::File& projectDir, int port, const SessionIdentity& identity,

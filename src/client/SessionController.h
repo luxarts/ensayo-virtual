@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -131,6 +132,7 @@ private:
     bool everConnected = false;
     Id armedTrack;
     std::map<Id, ParticipantMix> participantMixes;
+    std::set<uint32_t> appliedClients;           // clientIds given a level in the engine this session
     std::vector<Id> resumedTakes;
 
     // Take being recorded here.

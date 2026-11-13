@@ -96,8 +96,12 @@ public:
     // stream that was sounding fades out over one concealed frame.
     void setRemoteStreams (RemoteStreamTable*) noexcept;
     // Personal level of one sender's streams (voice and instrument), linear; muted = 0. Ramped per block. Senders
-    // without an entry play at 1.0 (64 entries; one at 1.0 is reused when full). Message thread only.
+    // without an entry play at 1.0 (64 entries; when full, one at 1.0 or one whose sender has no stream in the table
+    // is reused). Message thread only.
     void setParticipantGain (uint32_t clientId, float gain, bool muted) noexcept;
+    void removeParticipantGain (uint32_t clientId) noexcept;     // back to 1.0; message thread only
+    void clearParticipantGains() noexcept;                       // every sender back to 1.0; message thread only
+    float participantGain (uint32_t clientId) const noexcept;    // any thread; 1.0 without an entry
 
     void startCalibration();
     bool isCalibrating() const noexcept;
@@ -169,7 +173,6 @@ private:
     void addMetronome (int64_t position, int n, float* L, float* R) noexcept;        // audio thread
     void sendChat (const float* voice, const float* instrumentL, const float* instrumentR, int n) noexcept;   // audio
     void mixRemote (float* L, float* R, int n) noexcept;                              // audio thread
-    float participantGain (uint32_t clientId) const noexcept;                         // audio thread
     void chatLoop();                                                                  // chat thread
     void disableCapture() noexcept;                                                   // message thread
     void restoreRecorderCallbacks();                                                  // message thread

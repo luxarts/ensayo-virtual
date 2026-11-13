@@ -591,8 +591,48 @@ void StudioEngine::setParticipantGain (uint32_t clientId, float gain, bool muted
             unityIndex = i;              // an entry at the default level can be given away
     }
 
-    const int index = freeIndex >= 0 ? freeIndex : unityIndex >= 0 ? unityIndex : (int) (clientId % participantCapacity);
+    int index = freeIndex >= 0 ? freeIndex : unityIndex;
+
+    // Full: give away the entry of a sender that has no stream in the table now (there are more entries than slots),
+    // so a muted participant who is sounding is never unmuted by someone else's level.
+    if (index < 0)
+    {
+        std::array<uint32_t, RemoteStreamTable::capacity> live {};
+
+        if (auto* table = remoteTable.load())
+            for (size_t s = 0; s < live.size(); ++s)
+                if (const auto key = table->slots()[s].key(); key != RemoteStreamTable::freeKey)
+                    live[s] = RemoteStreamTable::clientOf (key);
+
+        for (int i = 0; i < participantCapacity && index < 0; ++i)
+        {
+            const auto id = (uint32_t) (participantGains[(size_t) i].load() >> 32);
+
+            if (std::find (live.begin(), live.end(), id) == live.end())
+                index = i;
+        }
+
+        if (index < 0)
+            index = (int) (clientId % participantCapacity);   // unreachable: 64 entries, at most 16 live senders
+    }
+
     participantGains[(size_t) index].store (value);
+}
+
+void StudioEngine::removeParticipantGain (uint32_t clientId) noexcept
+{
+    if (clientId == 0)
+        return;
+
+    for (auto& entry : participantGains)
+        if ((uint32_t) (entry.load() >> 32) == clientId)
+            entry.store (0);
+}
+
+void StudioEngine::clearParticipantGains() noexcept
+{
+    for (auto& entry : participantGains)
+        entry.store (0);
 }
 
 float StudioEngine::participantGain (uint32_t clientId) const noexcept

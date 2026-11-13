@@ -1237,6 +1237,35 @@ public:
             expect (step <= 1.5f * (0.5f + 0.125f * 1000.0f / 440.0f) * 0.0576f, "click: step " + juce::String (step, 6));
         }
 
+        beginTest ("participant gains: remove and clear go back to 1.0; a full table never evicts a sounding sender");
+        {
+            StudioEngine engine;
+            engine.setParticipantGain (5, 0.5f, false);
+            engine.setParticipantGain (6, 0.2f, true);
+            expectEquals (engine.participantGain (5), 0.5f);
+            expectEquals (engine.participantGain (6), 0.0f);
+            engine.removeParticipantGain (5);
+            expectEquals (engine.participantGain (5), 1.0f);
+            expectEquals (engine.participantGain (6), 0.0f);
+            engine.clearParticipantGains();
+            expectEquals (engine.participantGain (6), 1.0f);
+
+            // Sender 9 is muted and has a stream in the table; 200 other senders with their own levels come and go.
+            RemoteStreamTable table;
+            OpusMode mode (FrameSize::f128);
+            RemoteSender voice (mode, 9, StreamKind::voice, 440.0);
+            voice.send (table);
+            engine.setRemoteStreams (&table);
+            engine.setParticipantGain (9, 1.0f, true);
+
+            for (uint32_t id = 100; id < 300; ++id)
+                engine.setParticipantGain (id, 0.5f, false);
+
+            expectEquals (engine.participantGain (9), 0.0f, "the live muted sender lost its entry");
+            expectEquals (engine.participantGain (299), 0.5f);
+            engine.setRemoteStreams (nullptr);
+        }
+
         beginTest ("chat: the mic is sent while enabled; muting it stops the voice packets");
         {
             StudioEngine engine;
