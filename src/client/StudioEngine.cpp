@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <bit>
 #include <thread>
 
 namespace ensayo
@@ -10,7 +11,8 @@ namespace ensayo
 namespace
 {
 constexpr int maxChannels = 64;
-constexpr int previewFrame = 128;                    // frameSamples (FrameSize::f128)
+constexpr int chatFrame = 128;                       // frameSamples (FrameSize::f128)
+constexpr int chatQueueFrames = 64;                  // 170 ms of frames waiting for the chat thread
 
 void storeMax (std::atomic<float>& target, float value) noexcept
 {
@@ -28,19 +30,135 @@ void StudioDeviceManager::createAudioDeviceTypes (juce::OwnedArray<juce::AudioIO
 }
 
 //==============================================================================
-struct StudioEngine::PreviewEncoder
+// Frames are aligned to the engine's chatClock (frame k = samples [128 k, 128 k + 128)), so the sequence number and
+// sampleTime of a frame follow time even across the gaps where nothing is sent.
+struct StudioEngine::ChatSender
 {
-    PreviewEncoder (const OpusMode& mode, int numChannels)
-        : encoder (mode, numChannels), channels (numChannels), frame ((size_t) (previewFrame * numChannels), 0.0f) {}
+    ChatSender (const OpusMode& mode, int numChannels, StreamKind streamKind)
+        : kind (streamKind), channels (numChannels), frames ((size_t) chatQueueFrames), encoder (mode, numChannels)
+    {
+        for (int k = 0; k <= chatFrame; ++k)
+            gateTable[(size_t) k] = (float) (0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * k / chatFrame));
+    }
 
-    OpusEncoder encoder;
+    struct Frame { uint32_t index = 0; std::array<float, chatFrame * 2> pcm {}; };   // interleaved
+
+    // Audio thread: n samples starting at chatClock `clock`; b is the right channel (stereo only). While `wanted` the
+    // gate opens over one frame, otherwise it closes over one frame; a frame is queued when its gate was open at any
+    // of its samples, so the last one sent ends faded out. Returns true when a frame was queued.
+    bool process (const float* a, const float* b, int n, int64_t clock, bool wanted) noexcept
+    {
+        bool queued = false;
+
+        for (int i = 0; i < n; ++i)
+        {
+            const auto t = clock + i;
+            const int pos = (int) (t % chatFrame);
+            gate = juce::jlimit (0, chatFrame, gate + (wanted ? 1 : -1));
+            const float g = gateTable[(size_t) gate];
+            open = open || gate > 0;
+
+            if (channels == 1)
+            {
+                building.pcm[(size_t) pos] = g * a[i];
+            }
+            else
+            {
+                building.pcm[(size_t) (2 * pos)] = g * a[i];
+                building.pcm[(size_t) (2 * pos + 1)] = g * b[i];
+            }
+
+            if (pos != chatFrame - 1)
+                continue;
+
+            if (open)
+            {
+                building.index = (uint32_t) (t / chatFrame);
+                int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+                fifo.prepareToWrite (1, start1, size1, start2, size2);
+
+                if (size1 == 1)                      // else the chat thread is behind: the frame is dropped
+                {
+                    frames[(size_t) start1] = building;
+                    fifo.finishedWrite (1);
+                    queued = true;
+                }
+            }
+
+            open = gate > 0;
+        }
+
+        return queued;
+    }
+
+    // Chat thread: encodes the next queued frame into `packet`. Returns the datagram's size, 0 when nothing is queued.
+    size_t encodeNext() noexcept
+    {
+        int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
+        fifo.prepareToRead (1, start1, size1, start2, size2);
+
+        if (size1 != 1)
+            return 0;
+
+        const auto& frame = frames[(size_t) start1];
+        const int bytes = encoder.encode (frame.pcm.data(), coded.data(), (int) coded.size());
+        AudioPacketView view;
+        view.frameSize = FrameSize::f128;
+        view.seq = (uint16_t) frame.index;
+        view.clientId = 0;                           // the ProjectClient stamps its own id
+        view.sampleTime = frame.index * (uint32_t) chatFrame;
+        fifo.finishedRead (1);
+
+        if (bytes <= 0)
+            return encodeNext();
+
+        if (channels == 1)
+        {
+            view.flags = AudioFlags::voice;
+            view.voice = coded.data();
+            view.voiceLen = bytes;
+        }
+        else
+        {
+            view.flags = AudioFlags::instrument;
+            view.instrument = coded.data();
+            view.instrumentLen = bytes;
+        }
+
+        return encodeAudioPacket (view, packet.data(), packet.size());
+    }
+
+    const StreamKind kind;
     const int channels;
-    std::vector<float> frame;                        // interleaved, previewFrame frames
-    int fill = 0;
-    uint16_t seq = 0;
-    uint32_t sampleTime = 0;
-    std::array<uint8_t, 255> coded {};             // payloads are at most 255 bytes
+
+    // Audio thread.
+    std::array<float, chatFrame + 1> gateTable {};   // half-cosine 0 → 1
+    int gate = 0;                                    // 0..chatFrame
+    bool open = false;                               // the frame being built had its gate open at some sample
+    Frame building;
+
+    // Audio thread → chat thread (single producer, single consumer).
+    juce::AbstractFifo fifo { chatQueueFrames };
+    std::vector<Frame> frames;
+
+    // Chat thread.
+    OpusEncoder encoder;
+    std::array<uint8_t, 255> coded {};               // payloads are at most 255 bytes
     std::array<uint8_t, maxPacketBytes> packet {};
+};
+
+struct StudioEngine::RemoteSlotMix
+{
+    explicit RemoteSlotMix (const OpusMode& mode) : mono (mode, 1), stereo (mode, 2) {}
+
+    OpusDecoder mono, stereo;
+    uint64_t state = 0;                              // the stream instance being decoded (its slot state), 0 = none
+    int channels = 0;                                // of that stream
+    bool primed = false;                             // a real frame was decoded: concealment may follow
+    int lost = 0;                                    // consecutive concealed frames
+    std::vector<float> L, R;                         // decoded and not played yet: [0, fill)
+    int fill = 0;
+    float gain = 1.0f;                               // participant gain reached at the end of the last block
 };
 
 //==============================================================================
@@ -49,6 +167,13 @@ StudioEngine::StudioEngine()
     for (int k = 0; k <= transportFadeSamples; ++k)
         fadeTable[(size_t) k] = (float) (0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * k / transportFadeSamples));
 
+    chatVoice = std::make_unique<ChatSender> (mode128, 1, StreamKind::voice);
+    chatInstrument = std::make_unique<ChatSender> (mode128, 2, StreamKind::instrument);
+
+    for (auto& m : remoteMix)
+        m = std::make_unique<RemoteSlotMix> (mode128);
+
+    chatThread = std::thread ([this] { chatLoop(); });
     deviceManager.addAudioCallback (this);
 }
 
@@ -63,6 +188,12 @@ StudioEngine::~StudioEngine()
 
     deviceManager.removeAudioCallback (this);
     deviceManager.closeAudioDevice();
+
+    chatEnabled.store (false);
+    chatQuit.store (true);
+    chatSignal.fetch_add (1);
+    chatSignal.notify_one();
+    chatThread.join();
 }
 
 juce::AudioDeviceManager& StudioEngine::getDeviceManager() noexcept   { return deviceManager; }
@@ -153,6 +284,18 @@ void StudioEngine::setMonitor (float voiceGain, float instrumentGain) noexcept
 {
     monitorVoiceGain.store (voiceGain);
     monitorInstrumentGain.store (instrumentGain);
+}
+
+void StudioEngine::setSendGains (float voice, float instrument) noexcept
+{
+    const auto valid = [] (float g) { return std::isfinite (g) ? std::max (0.0f, g) : 0.0f; };
+    sendVoiceGain.store (valid (voice));
+    sendInstrumentGain.store (valid (instrument));
+}
+
+void StudioEngine::setArmed (std::optional<TrackKind> kind) noexcept
+{
+    armedKind.store (kind.has_value() && *kind != TrackKind::imported ? (int) *kind : -1);
 }
 
 void StudioEngine::setCalibration (int samples) noexcept     { calibrationSamples.store (samples); }
@@ -272,17 +415,7 @@ juce::Result StudioEngine::startRecording (const Track& track, const Id& take, c
                                     calibrationSamples.load());
     finishedSegments = 0;
     finishedSamples = 0;
-    previewEncoder = std::make_unique<PreviewEncoder> (mode128, channels);
-    userLiveAudio = recorder.onLiveAudio;
     userFinished = recorder.onFinished;
-
-    recorder.onLiveAudio = [this] (const float* const* ch, int numChannels, int n)
-    {
-        encodePreview (ch, numChannels, n);
-
-        if (userLiveAudio)
-            userLiveAudio (ch, numChannels, n);
-    };
 
     recorder.onFinished = [this] (int segments, int64_t samples)
     {
@@ -360,215 +493,278 @@ void StudioEngine::disableCapture() noexcept
 
 void StudioEngine::restoreRecorderCallbacks()
 {
-    recorder.onLiveAudio = std::exchange (userLiveAudio, nullptr);
     recorder.onFinished = std::exchange (userFinished, nullptr);
-    previewEncoder.reset();
 }
 
-void StudioEngine::encodePreview (const float* const* channels, int numChannels, int n)
+//==============================================================================
+void StudioEngine::setChatEnabled (bool enabled)
 {
-    auto* p = previewEncoder.get();
+    chatEnabled.store (enabled);
 
-    if (p == nullptr || ! onPreviewPacket || numChannels < 1)
-        return;
+    if (! enabled)
+        while (inChatSink.load())                    // the chat thread may be inside onChatPacket right now
+            std::this_thread::yield();
+}
 
-    for (int i = 0; i < n; ++i)
+void StudioEngine::setMicMuted (bool muted) noexcept    { micMuted.store (muted); }
+
+void StudioEngine::sendChat (const float* voice, const float* instrumentL, const float* instrumentR, int n) noexcept
+{
+    const bool enabled = chatEnabled.load (std::memory_order_relaxed);
+    const bool wantVoice = enabled && ! micMuted.load (std::memory_order_relaxed);
+    const bool wantInstrument = enabled && captureEnabled.load (std::memory_order_relaxed)
+                             && recordChannels.load (std::memory_order_relaxed) == 2;
+
+    bool queued = chatVoice->process (voice, nullptr, n, chatClock, wantVoice);
+    queued = chatInstrument->process (instrumentL, instrumentR, n, chatClock, wantInstrument) || queued;
+    chatClock += n;
+
+    if (queued)
     {
-        for (int c = 0; c < p->channels; ++c)
-            p->frame[(size_t) (p->fill * p->channels + c)] = channels[std::min (c, numChannels - 1)][i];
+        chatSignal.fetch_add (1, std::memory_order_release);
+        chatSignal.notify_one();                     // WakeByAddress: never blocks
+    }
+}
 
-        if (++p->fill < previewFrame)
-            continue;
+void StudioEngine::chatLoop()
+{
+    while (! chatQuit.load())
+    {
+        const auto seen = chatSignal.load (std::memory_order_acquire);
 
-        p->fill = 0;
-        const int bytes = p->encoder.encode (p->frame.data(), p->coded.data(), (int) p->coded.size());
-
-        AudioPacketView view;
-        view.frameSize = FrameSize::f128;
-        view.seq = p->seq++;
-        view.clientId = 0;                           // the ProjectClient stamps its own id
-        view.sampleTime = p->sampleTime;
-        p->sampleTime += (uint32_t) previewFrame;
-
-        if (bytes <= 0)
-            continue;
-
-        if (p->channels == 1)
+        for (auto* sender : { chatVoice.get(), chatInstrument.get() })
         {
-            view.flags = AudioFlags::voice;
-            view.voice = p->coded.data();
-            view.voiceLen = bytes;
-        }
-        else
-        {
-            view.flags = AudioFlags::instrument;
-            view.instrument = p->coded.data();
-            view.instrumentLen = bytes;
+            while (const auto len = sender->encodeNext())
+            {
+                inChatSink.store (true);
+
+                if (chatEnabled.load() && onChatPacket)
+                    onChatPacket (sender->kind, sender->packet.data(), len);
+
+                inChatSink.store (false);
+            }
         }
 
-        const auto written = encodeAudioPacket (view, p->packet.data(), p->packet.size());
-
-        if (written > 0)
-            onPreviewPacket (p->packet.data(), written);
+        chatSignal.wait (seen, std::memory_order_acquire);
     }
 }
 
 //==============================================================================
-void StudioEngine::setPreviewBuffer (JitterBuffer* buffer) noexcept
+void StudioEngine::setRemoteStreams (RemoteStreamTable* table) noexcept
 {
-    previewBuffer.store (buffer);
+    remoteTable.store (table);
 
-    while (inPreview.load())                         // the callback may still be popping from the previous one
+    while (inRemote.load())                          // the callback may still be popping from the previous table
         std::this_thread::yield();
 }
 
-void StudioEngine::addPreview (float* L, float* R, int n) noexcept
+void StudioEngine::setParticipantGain (uint32_t clientId, float gain, bool muted) noexcept
 {
-    inPreview.store (true);
-    auto* buffer = previewBuffer.load();
+    if (clientId == 0)
+        return;
 
-    // Half-cosine over one frame: the first frame after silence fades in, the last concealed frame fades out.
+    const float g = muted || ! std::isfinite (gain) ? 0.0f : std::max (0.0f, gain);
+    const auto value = ((uint64_t) clientId << 32) | std::bit_cast<uint32_t> (g);
+    const auto unity = std::bit_cast<uint32_t> (1.0f);
+    int freeIndex = -1, unityIndex = -1;
+
+    for (int i = 0; i < participantCapacity; ++i)
+    {
+        const auto current = participantGains[(size_t) i].load();
+        const auto id = (uint32_t) (current >> 32);
+
+        if (id == clientId)
+        {
+            participantGains[(size_t) i].store (value);
+            return;
+        }
+
+        if (current == 0 && freeIndex < 0)
+            freeIndex = i;
+
+        if (id != 0 && (uint32_t) current == unity && unityIndex < 0)
+            unityIndex = i;              // an entry at the default level can be given away
+    }
+
+    const int index = freeIndex >= 0 ? freeIndex : unityIndex >= 0 ? unityIndex : (int) (clientId % participantCapacity);
+    participantGains[(size_t) index].store (value);
+}
+
+float StudioEngine::participantGain (uint32_t clientId) const noexcept
+{
+    for (const auto& entry : participantGains)
+    {
+        const auto value = entry.load (std::memory_order_relaxed);
+
+        if ((uint32_t) (value >> 32) == clientId)
+            return std::bit_cast<float> ((uint32_t) value);
+    }
+
+    return 1.0f;
+}
+
+void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
+{
+    inRemote.store (true);
+    auto* table = remoteTable.load();
+
+    // Half-cosine over one frame: the first frame of a stream fades in, the last one (end of concealment, a stream
+    // that stops or changes) fades out.
     const auto ramp = [] (float* dl, float* dr, bool in) noexcept
     {
-        for (int i = 0; i < previewFrame; ++i)
+        for (int i = 0; i < chatFrame; ++i)
         {
-            const auto c = (float) std::cos (juce::MathConstants<double>::pi * (i + 1) / previewFrame);
+            const auto c = (float) std::cos (juce::MathConstants<double>::pi * (i + 1) / chatFrame);
             const auto g = in ? 0.5f - 0.5f * c : 0.5f + 0.5f * c;
             dl[i] *= g;
             dr[i] *= g;
         }
     };
 
-    if (buffer != lastPreviewBuffer)
+    // One frame of the slot's stream (data == nullptr: concealment) into dl / dr.
+    const auto decodeInto = [this] (RemoteSlotMix& m, const uint8_t* data, int len, float* dl, float* dr) noexcept
     {
-        // Listening turned off (or switched) while a stream sounds: after the samples already decoded, one more frame
-        // is concealed by our own decoder (the old buffer is never touched again) and faded out, so the cut never steps.
-        const auto& state = previewKind == 1 ? monoState : stereoState;
-        const bool sounding = lastPreviewBuffer != nullptr && previewKind != 0 && state.primed;
-        lastPreviewBuffer = buffer;
-
-        if (sounding && previewFill + previewFrame <= (int) previewL.size())
+        if (m.channels == 1)
         {
-            float* dl = previewL.data() + previewFill;
-            float* dr = previewR.data() + previewFill;
-
-            if (previewKind == 1)
-            {
-                previewMono.decode (nullptr, 0, dl);
-                std::copy (dl, dl + previewFrame, dr);
-            }
-            else
-            {
-                previewStereo.decode (nullptr, 0, previewInterleaved.data());
-                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
-            }
-
-            ramp (dl, dr, false);
-            previewFill += previewFrame;
+            m.mono.decode (data, len, dl);
+            std::copy (dl, dl + chatFrame, dr);
         }
-
-        // Otherwise previewFill is kept too: what is left is already faded out (the tail of a stream switched off,
-        // possibly being played out while the buffer was nullptr) or silence, so it plays to its end and anything
-        // new is decoded after it - cutting it short would step.
-
-        monoState = {};
-        stereoState = {};
-        previewKind = 0;
-    }
-
-    // One 128-sample frame: a real payload (48 B mono, 96 B stereo), else concealment, else silence.
-    const auto decodeFrame = [&] (JitterBuffer& jb, float* dl, float* dr) noexcept
-    {
-        int len = 0;
-        const bool popped = jb.pop (previewPacket.data(), len);
-        const int kind = ! popped ? 0
-                       : len == codedBytesMono (FrameSize::f128) ? 1
-                       : len == codedBytesStereo (FrameSize::f128) ? 2 : 0;
-
-        if (kind != 0)
+        else
         {
-            if (kind != previewKind)                 // another decoder: it starts unprimed
-            {
-                monoState = {};
-                stereoState = {};
-                previewKind = kind;
-            }
-
-            auto& state = kind == 1 ? monoState : stereoState;
-
-            if (kind == 1)
-            {
-                previewMono.decode (previewPacket.data(), len, dl);
-                std::copy (dl, dl + previewFrame, dr);
-            }
-            else
-            {
-                previewStereo.decode (previewPacket.data(), len, previewInterleaved.data());
-                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
-            }
-
-            if (! state.primed)
-                ramp (dl, dr, true);
-
-            state.primed = true;
-            state.lost = 0;
-            return;
+            m.stereo.decode (data, len, remoteInterleaved.data());
+            deinterleave (remoteInterleaved.data(), dl, dr, chatFrame);
         }
-
-        auto& state = previewKind == 1 ? monoState : stereoState;
-
-        if (previewKind != 0 && state.primed && state.lost < maxConcealedFrames)
-        {
-            if (previewKind == 1)
-            {
-                previewMono.decode (nullptr, 0, dl);
-                std::copy (dl, dl + previewFrame, dr);
-            }
-            else
-            {
-                previewStereo.decode (nullptr, 0, previewInterleaved.data());
-                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
-            }
-
-            if (++state.lost == maxConcealedFrames)  // a dead stream: fade the last concealed frame out
-            {
-                ramp (dl, dr, false);
-                state = {};
-                previewKind = 0;
-            }
-
-            return;
-        }
-
-        std::fill (dl, dl + previewFrame, 0.0f);
-        std::fill (dr, dr + previewFrame, 0.0f);
     };
 
-    if (buffer != nullptr && previewFill + n <= (int) previewL.size())   // always true: sized block + 2 frames
+    const auto fits = [] (const RemoteSlotMix& m) noexcept { return m.fill + chatFrame <= (int) m.L.size(); };
+
+    // The stream stops (released, replaced, table gone): a sounding one gets one more concealed frame, faded out,
+    // after what is already decoded; the slot's own state is never touched again.
+    const auto stopStream = [&] (RemoteSlotMix& m) noexcept
     {
-        // Whole 128-sample frames are decoded until the block can be served; the remainder (< 128) waits.
-        while (previewFill < n)
+        if (m.state != 0 && m.primed && fits (m))
         {
-            decodeFrame (*buffer, previewL.data() + previewFill, previewR.data() + previewFill);
-            previewFill += previewFrame;
+            float* dl = m.L.data() + m.fill;
+            float* dr = m.R.data() + m.fill;
+            decodeInto (m, nullptr, 0, dl, dr);
+            ramp (dl, dr, false);
+            m.fill += chatFrame;
         }
 
-        addStereo (L, R, previewL.data(), previewR.data(), 1.0f, n);
-        previewFill -= n;
-        std::copy (previewL.begin() + n, previewL.begin() + n + previewFill, previewL.begin());
-        std::copy (previewR.begin() + n, previewR.begin() + n + previewFill, previewR.begin());
-    }
-    else if (buffer == nullptr && previewFill > 0)
+        m.state = 0;
+        m.channels = 0;
+        m.primed = false;
+        m.lost = 0;
+    };
+
+    if (table != lastRemoteTable)
     {
-        // The faded tail of a stream that was switched off.
-        const int m = std::min (n, previewFill);
-        addStereo (L, R, previewL.data(), previewR.data(), 1.0f, m);
-        previewFill -= m;
-        std::copy (previewL.begin() + m, previewL.begin() + m + previewFill, previewL.begin());
-        std::copy (previewR.begin() + m, previewR.begin() + m + previewFill, previewR.begin());
+        for (auto& m : remoteMix)
+            stopStream (*m);
+
+        lastRemoteTable = table;
     }
 
-    inPreview.store (false);
+    for (int index = 0; index < RemoteStreamTable::capacity; ++index)
+    {
+        auto& m = *remoteMix[(size_t) index];
+        float target = m.gain;
+
+        if (table != nullptr)
+        {
+            auto& slot = table->slots()[(size_t) index];
+            const auto state = slot.state.load (std::memory_order_acquire);
+            const auto key = RemoteStreamTable::Slot::keyOf (state);
+
+            if (key == RemoteStreamTable::freeKey)
+            {
+                if (m.state != 0)
+                    stopStream (m);
+            }
+            else
+            {
+                target = participantGain (RemoteStreamTable::clientOf (key));
+
+                if (state != m.state)
+                {
+                    stopStream (m);
+                    m.state = state;
+                    m.channels = RemoteStreamTable::kindOf (key) == StreamKind::voice ? 1 : 2;
+                    m.mono.reset();
+                    m.stereo.reset();
+
+                    if (m.fill == 0)
+                        m.gain = target;
+                }
+
+                const int expected = m.channels == 1 ? codedBytesMono (FrameSize::f128) : codedBytesStereo (FrameSize::f128);
+
+                // Whole frames until the block can be served; the remainder (< 128) waits for the next block.
+                while (m.fill < n && fits (m))
+                {
+                    float* dl = m.L.data() + m.fill;
+                    float* dr = m.R.data() + m.fill;
+                    int len = 0;
+
+                    if (slot.pop (state, remotePacket.data(), len) && len == expected)
+                    {
+                        decodeInto (m, remotePacket.data(), len, dl, dr);
+
+                        if (! m.primed)
+                            ramp (dl, dr, true);
+
+                        m.primed = true;
+                        m.lost = 0;
+                    }
+                    else if (m.primed && m.lost < maxConcealedFrames)
+                    {
+                        decodeInto (m, nullptr, 0, dl, dr);
+
+                        if (++m.lost == maxConcealedFrames)   // a dead stream: the last concealed frame fades out
+                        {
+                            ramp (dl, dr, false);
+                            m.primed = false;
+                        }
+                    }
+                    else
+                    {
+                        std::fill (dl, dl + chatFrame, 0.0f);
+                        std::fill (dr, dr + chatFrame, 0.0f);
+                    }
+
+                    m.fill += chatFrame;
+                }
+            }
+        }
+
+        // What is decoded plays (a stopped stream's faded tail too), with the participant gain ramped across the block:
+        // a full-scale change takes rampSamples.
+        const int count = std::min (n, m.fill);
+
+        if (count <= 0)
+        {
+            m.gain = target;
+            continue;
+        }
+
+        const float g0 = m.gain;
+        const float limit = (float) n / (float) rampSamples * std::max ({ 1.0f, g0, target });
+        const float g1 = g0 + juce::jlimit (-limit, limit, target - g0);
+
+        for (int i = 0; i < count; ++i)
+        {
+            const float g = g0 + (g1 - g0) * (float) (i + 1) / (float) n;
+            L[i] += g * m.L[(size_t) i];
+            R[i] += g * m.R[(size_t) i];
+        }
+
+        m.gain = g1;
+        m.fill -= count;
+        std::copy (m.L.begin() + count, m.L.begin() + count + m.fill, m.L.begin());
+        std::copy (m.R.begin() + count, m.R.begin() + count + m.fill, m.R.begin());
+    }
+
+    inRemote.store (false);
 }
 
 //==============================================================================
@@ -604,6 +800,9 @@ EngineMeters StudioEngine::takeMeters() noexcept
     return m;
 }
 
+std::vector<std::pair<Id, float>> StudioEngine::takeTrackMeters()    { return renderer.takeTrackPeaks(); }
+float StudioEngine::takeArmedInputPeak() noexcept                    { return peakArmed.exchange (0.0f); }
+
 uint32_t StudioEngine::getCallbackCount() const noexcept    { return callbackCount.load (std::memory_order_relaxed); }
 
 //==============================================================================
@@ -635,14 +834,31 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     instrumentBuffer.setSize (2, blockSize);
     instrumentBuffer.clear();
 
-    for (auto* v : { &silence, &mixL, &mixR, &scratchL, &scratchR })
+    for (auto* v : { &silence, &mixL, &mixR, &scratchL, &scratchR, &voiceSent, &instrumentSentL, &instrumentSentR })
         v->assign ((size_t) blockSize, 0.0f);
 
-    previewL.assign ((size_t) (blockSize + 2 * previewFrame), 0.0f);
-    previewR.assign ((size_t) (blockSize + 2 * previewFrame), 0.0f);
-    previewInterleaved.assign ((size_t) previewFrame * 2, 0.0f);
-    previewPacket.assign (maxPacketBytes, 0);
-    previewFill = 0;
+    // No callback runs here: the gains start where they are asked to be, the monitor fades in from silence.
+    sendVoiceRamp = GainRamp { sendVoiceGain.load(), sendVoiceGain.load() };
+    sendInstrumentRamp = GainRamp { sendInstrumentGain.load(), sendInstrumentGain.load() };
+    monitorVoiceRamp = GainRamp { monitorVoiceGain.load(), monitorVoiceGain.load() };
+    monitorInstrumentRamp = GainRamp { monitorInstrumentGain.load(), monitorInstrumentGain.load() };
+    monitorVoiceFade = monitorInstrumentFade = 0;
+
+    // Received streams: a block of decoded audio plus a frame being played out, a concealed fade-out frame and one more.
+    for (auto& m : remoteMix)
+    {
+        m->L.assign ((size_t) (blockSize + 3 * chatFrame), 0.0f);
+        m->R.assign ((size_t) (blockSize + 3 * chatFrame), 0.0f);
+        m->fill = 0;
+        m->state = 0;
+        m->channels = 0;
+        m->primed = false;
+        m->lost = 0;
+    }
+
+    remoteInterleaved.assign ((size_t) chatFrame * 2, 0.0f);
+    remotePacket.assign (maxPacketBytes, 0);
+    lastRemoteTable = nullptr;
 
     renderer.prepare (blockSize);
     plugin.prepare (rate, blockSize);
@@ -883,13 +1099,39 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
     const float* instrumentL = instrumentBuffer.getReadPointer (0);
     const float* instrumentR = instrumentBuffer.getReadPointer (1);
 
-    // 3. Own monitor, 0 ms.
+    // 3. Send gains: what the take, the chat, the meters and the monitor get. A gain of 1 keeps the samples exact.
+    float* sentVoice = voiceSent.data();
+    float* sentL = instrumentSentL.data();
+    float* sentR = instrumentSentR.data();
+    sendVoiceRamp.setTarget (sendVoiceGain.load (std::memory_order_relaxed), rampSamples);
+    sendInstrumentRamp.setTarget (sendInstrumentGain.load (std::memory_order_relaxed), rampSamples);
+
+    for (int i = 0; i < n; ++i)
+    {
+        sentVoice[i] = sendVoiceRamp.next() * voice[i];
+        const float g = sendInstrumentRamp.next();
+        sentL[i] = g * instrumentL[i];
+        sentR[i] = g * instrumentR[i];
+    }
+
+    // 4. Own monitor, 0 ms: only the input of the armed kind (crossfaded when the armed kind changes).
     float* L = mixL.data();
     float* R = mixR.data();
-    std::fill (L, L + n, 0.0f);
-    std::fill (R, R + n, 0.0f);
-    addMonoCentred (L, R, voice, monitorVoiceGain.load (std::memory_order_relaxed), n);
-    addStereo (L, R, instrumentL, instrumentR, monitorInstrumentGain.load (std::memory_order_relaxed), n);
+    const int armed = armedKind.load (std::memory_order_relaxed);
+    const int voiceDirection = armed == (int) TrackKind::voice ? 1 : -1;
+    const int instrumentDirection = armed == (int) TrackKind::instrument ? 1 : -1;
+    monitorVoiceRamp.setTarget (monitorVoiceGain.load (std::memory_order_relaxed), rampSamples);
+    monitorInstrumentRamp.setTarget (monitorInstrumentGain.load (std::memory_order_relaxed), rampSamples);
+
+    for (int i = 0; i < n; ++i)
+    {
+        monitorVoiceFade = juce::jlimit (0, transportFadeSamples, monitorVoiceFade + voiceDirection);
+        monitorInstrumentFade = juce::jlimit (0, transportFadeSamples, monitorInstrumentFade + instrumentDirection);
+        const float gv = monitorVoiceRamp.next() * fadeTable[(size_t) monitorVoiceFade];
+        const float gi = monitorInstrumentRamp.next() * fadeTable[(size_t) monitorInstrumentFade];
+        L[i] = gv * sentVoice[i] + gi * sentL[i];
+        R[i] = gv * sentVoice[i] + gi * sentR[i];
+    }
 
     int captureFrom = -1;
 
@@ -905,12 +1147,12 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
 
     if (calibrator.isRunning())
     {
-        // 4. Calibration owns the output: the click train only (transport requests wait).
+        // 5. Calibration owns the output: the click train only (transport requests wait).
         calibrator.process (voice, L, R, n);
     }
     else
     {
-        // 5. Transport: playback + metronome under the master fade.
+        // 6. Transport: playback + metronome under the master fade.
         applyRequests();
         captureFrom = runTransport (L, R, n);
     }
@@ -918,7 +1160,7 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
     holdReached.store (blockHold && (! running || fadeIndex == 0));   // silent under a hold this block saw
     inRender.store (false);
 
-    // 6. Recording: the selected inputs, from the first sample of playback (count-in included).
+    // 7. Recording: the selected inputs (post send gain), from the first sample of playback (count-in included).
     inPush.store (true);
 
     if (! captureEnabled.load())
@@ -930,25 +1172,33 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
     {
         if (recordChannels.load (std::memory_order_relaxed) == 1)
         {
-            const float* channels[1] = { voice + captureFrom };
+            const float* channels[1] = { sentVoice + captureFrom };
             recorder.push (channels, n - captureFrom);
         }
         else
         {
-            const float* channels[2] = { instrumentL + captureFrom, instrumentR + captureFrom };
+            const float* channels[2] = { sentL + captureFrom, sentR + captureFrom };
             recorder.push (channels, n - captureFrom);
         }
     }
 
     inPush.store (false);
 
-    // 7. Live listening: added to the output only.
-    addPreview (L, R, n);
+    // 8. Voice chat: the own inputs out, the other participants' streams in (output only, never recorded).
+    sendChat (sentVoice, sentL, sentR, n);
+    mixRemote (L, R, n);
 
-    // 8. Meters.
-    storeMax (peakVoice, peakOf (voice, n));
-    storeMax (peakInstrument, juce::jmax (peakOf (instrumentL, n), peakOf (instrumentR, n)));
+    // 9. Meters.
+    const float voicePeak = peakOf (sentVoice, n);
+    const float instrumentPeak = juce::jmax (peakOf (sentL, n), peakOf (sentR, n));
+    storeMax (peakVoice, voicePeak);
+    storeMax (peakInstrument, instrumentPeak);
     storeMax (peakOutput, juce::jmax (peakOf (L, n), peakOf (R, n)));
+
+    if (armed == (int) TrackKind::voice)
+        storeMax (peakArmed, voicePeak);
+    else if (armed == (int) TrackKind::instrument)
+        storeMax (peakArmed, instrumentPeak);
 
     const int pair = outputPair.load (std::memory_order_relaxed);
 
@@ -958,7 +1208,7 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
         std::copy (R, R + n, outputs[pair * 2 + 1]);
     }
 
-    // 9. Position (advanced by runTransport) and state for the message thread.
+    // 10. Position (advanced by runTransport) and state for the message thread.
     publishedPosition.store (position);
     audioPlaying.store (running);
 }

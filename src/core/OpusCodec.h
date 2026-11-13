@@ -40,6 +40,7 @@ public:
     ~OpusDecoder();
     // data == nullptr → packet-loss concealment. Writes frameSamples*channels interleaved floats. Real-time safe.
     void decode (const uint8_t* data, int len, float* pcm) noexcept;
+    void reset() noexcept;                         // forgets the stream decoded so far (a new one follows). Real-time safe.
 private:
     OpusCustomDecoder* decoder = nullptr; int channels, samples;
 

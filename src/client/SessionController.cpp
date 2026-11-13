@@ -156,6 +156,44 @@ void SessionController::refreshEngine()
         engine.setSampleSource (cache);
         engineSource = cache;
     }
+
+    applyArmed();
+}
+
+void SessionController::setArmedTrack (const Id& track)
+{
+    armedTrack = track;
+    applyArmed();
+}
+
+void SessionController::applyArmed()
+{
+    std::optional<TrackKind> kind;
+    const auto p = project();
+
+    if (const auto* track = p != nullptr && client != nullptr ? p->findTrack (armedTrack) : nullptr;
+        track != nullptr && track->author == client->user() && track->kind != TrackKind::imported)
+        kind = track->kind;
+
+    engine.setArmed (kind);
+}
+
+void SessionController::attachLiveAudio()
+{
+    if (client == nullptr)
+        return;
+
+    auto* c = client.get();
+    engine.onChatPacket = [c] (StreamKind kind, const uint8_t* packet, size_t len) { c->sendAudio (kind, packet, len); };
+    engine.setRemoteStreams (&c->remoteStreams());
+    engine.setChatEnabled (true);
+}
+
+void SessionController::detachLiveAudio()
+{
+    engine.setChatEnabled (false);     // returns once the sink is no longer running
+    engine.setRemoteStreams (nullptr); // returns once the callback no longer reads the client's table
+    engine.onChatPacket = nullptr;
 }
 
 juce::Result SessionController::host (const juce::File& projectDir, int port, const SessionIdentity& identity,
@@ -176,6 +214,7 @@ juce::Result SessionController::host (const juce::File& projectDir, int port, co
     link = SessionLink { "127.0.0.1", projectHost->getPort(), projectHost->getSessionId() };
     createClient (identity);
     client->connect (link);
+    attachLiveAudio();
     return juce::Result::ok();
 }
 
@@ -185,6 +224,7 @@ void SessionController::join (const SessionLink& target, const SessionIdentity& 
     link = target;
     createClient (identity);
     client->connect (link);
+    attachLiveAudio();
 }
 
 void SessionController::reconnect()
@@ -192,8 +232,10 @@ void SessionController::reconnect()
     if (client == nullptr || client->isConnected())
         return;
 
+    detachLiveAudio();
     client->disconnect();
     client->connect (link);
+    attachLiveAudio();
 }
 
 void SessionController::leave()
@@ -231,11 +273,9 @@ void SessionController::leave()
 
     ++(*generation);   // drops the posts of the threads just joined and of the client being destroyed
 
-    if (listening)
-    {
-        engine.setPreviewBuffer (nullptr);
-        listening = false;
-    }
+    detachLiveAudio();
+    armedTrack.clear();
+    engine.setArmed (std::nullopt);
 
     if (client != nullptr || engineSource != nullptr)
     {
@@ -250,7 +290,6 @@ void SessionController::leave()
     }
 
     engine.setProject (nullptr);
-    engine.onPreviewPacket = nullptr;
 
     if (client != nullptr)
     {
@@ -376,16 +415,6 @@ juce::Result SessionController::startTake (const Id& trackId)
             });
     };
 
-    engine.onPreviewPacket = [c] (const uint8_t* packet, size_t len)
-    {
-        // Transitional: the take's live preview goes out as the stream of its kind (mono = voice, stereo =
-        // instrument) until the engine sends the always-on voice chat itself.
-        AudioPacketView view;
-
-        if (decodeAudioPacket (packet, len, view))
-            c->sendAudio (streamKindOf (view.flags), packet, len);
-    };
-
     const auto started = engine.startRecording (*track, take, wav);
 
     if (started.failed())
@@ -471,17 +500,6 @@ int SessionController::finishUnfinishedTakes()
     }
 
     return finished;
-}
-
-void SessionController::setListening (bool enabled)
-{
-    if (client == nullptr)
-        return;
-
-    // Transitional: the host relays everyone's live audio to everyone now (no listen request) and the client keeps
-    // one jitter buffer per sender (ProjectClient::remoteStreams); the engine does not mix those yet, so this flag
-    // only records the user's choice.
-    listening = enabled;
 }
 
 //==============================================================================

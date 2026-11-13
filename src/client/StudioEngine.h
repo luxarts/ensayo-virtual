@@ -4,7 +4,7 @@
 #include "client/LatencyCalibrator.h"
 #include "client/PluginSlot.h"
 #include "client/FakeAudioDevice.h"
-#include "core/JitterBuffer.h"
+#include "core/RemoteStreams.h"
 #include "core/OpusCodec.h"
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <array>
@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <thread>
 #include <vector>
 namespace ensayo
 {
@@ -71,18 +72,44 @@ public:
     int64_t getRecordOffset() const noexcept;
     Recorder& getRecorder() noexcept;
 
-    // Live listening; nullptr = off. A stream that is sounding fades out over one frame (its own concealment) instead
-    // of stopping dead; the old buffer is not touched once this returns.
-    void setPreviewBuffer (JitterBuffer*) noexcept;
-    // Encodes the recorder's live audio into 128-sample Opus frames and passes datagrams here. Invoked on the
-    // Recorder's writer thread; set it before startRecording() and never reassign it while a take is running.
-    std::function<void (const uint8_t* packet, size_t len)> onPreviewPacket;
+    // Own inputs. Send gains (linear) scale the mic and the instrument (post plugin) before everything else uses them:
+    // the recorder, the chat, the armed meter and the monitor. Ramped over rampSamples; 1.0 leaves the take bit-exact.
+    void setSendGains (float voice, float instrument) noexcept;
+    // The kind of the armed own track: the monitor plays only that input (voice: mic, centred; instrument: plugin
+    // output, stereo), crossfaded over transportFadeSamples on every change. nullopt (or imported) = no monitor.
+    void setArmed (std::optional<TrackKind>) noexcept;
+
+    // Voice chat, send side. While enabled the mic (post send gain, mono) is encoded continuously into 128-sample Opus
+    // packets; while a take records an instrument track the instrument (post send gain, stereo) goes out as a second
+    // stream. Packets come out through onChatPacket on the engine's chat-encoder thread (clientId 0: the sender stamps
+    // it). Set onChatPacket on the message thread before setChatEnabled (true) and never reassign it while enabled.
+    // A start or a stop of a stream (enable, mute, an instrument take) is faded over one frame; the sequence number
+    // and sampleTime count every frame of time, sent or not.
+    std::function<void (StreamKind, const uint8_t* packet, size_t len)> onChatPacket;
+    // Message thread. setChatEnabled (false) returns once onChatPacket is no longer running and will not be called.
+    void setChatEnabled (bool);
+    // Stops sending the voice (its last frame fades out). Neither the take nor the monitor change.
+    void setMicMuted (bool) noexcept;
+
+    // Voice chat, receive side: the streams of the other participants (ProjectClient::remoteStreams()), nullptr = none.
+    // Message thread; when it returns the callback no longer touches the previous table (it may be destroyed). Every
+    // stream that was sounding fades out over one concealed frame.
+    void setRemoteStreams (RemoteStreamTable*) noexcept;
+    // Personal level of one sender's streams (voice and instrument), linear; muted = 0. Ramped per block. Senders
+    // without an entry play at 1.0 (64 entries; one at 1.0 is reused when full). Message thread only.
+    void setParticipantGain (uint32_t clientId, float gain, bool muted) noexcept;
 
     void startCalibration();
     bool isCalibrating() const noexcept;
     std::optional<int> calibrationRoundTrip() const;
 
     EngineMeters takeMeters() noexcept;
+    // Message thread. Peak of every track of the project since the last call (post volume, pan and mute, pre master),
+    // then reset. A peak >= clipLevel is a clip.
+    std::vector<std::pair<Id, float>> takeTrackMeters();
+    // Peak of the armed kind's input (post send gain) since the last call, then reset; 0 when nothing is armed.
+    float takeArmedInputPeak() noexcept;
+    static constexpr float clipLevel = 1.0f;
     uint32_t getCallbackCount() const noexcept;
 
 private:
@@ -96,8 +123,36 @@ private:
         int64_t recordStart = 0, recordPoint = 0;           // recordStart = recordPoint - count-in
         bool countIn = false;
     };
-    // Encodes the live take on the Recorder's writer thread (128-sample frames).
-    struct PreviewEncoder;
+    // Linear gain ramp, advanced once per sample on the audio thread.
+    struct GainRamp
+    {
+        float current = 1.0f, target = 1.0f, step = 0.0f;
+        int remaining = 0;
+
+        void setTarget (float value, int length) noexcept
+        {
+            if (value == target)
+                return;
+
+            target = value;
+            remaining = length;
+            step = (target - current) / (float) length;
+        }
+
+        float next() noexcept
+        {
+            const float g = current;
+
+            if (remaining > 0)
+                current = --remaining == 0 ? target : current + step;
+
+            return g;
+        }
+    };
+    // One outgoing chat stream (voice or instrument): frames built on the audio thread, encoded on the chat thread.
+    struct ChatSender;
+    // The receive state of one RemoteStreamTable slot: decoders, concealment, decoded samples and gain.
+    struct RemoteSlotMix;
 
     void audioDeviceIOCallbackWithContext (const float* const*, int, float* const*, int, int,
                                            const juce::AudioIODeviceCallbackContext&) override;
@@ -112,8 +167,10 @@ private:
     // Audio thread: plays the transport into L/R ([0, n)); returns the block index where capture starts, or -1.
     int runTransport (float* L, float* R, int n) noexcept;
     void addMetronome (int64_t position, int n, float* L, float* R) noexcept;        // audio thread
-    void addPreview (float* L, float* R, int n) noexcept;                             // audio thread
-    void encodePreview (const float* const* channels, int numChannels, int n);        // writer thread
+    void sendChat (const float* voice, const float* instrumentL, const float* instrumentR, int n) noexcept;   // audio
+    void mixRemote (float* L, float* R, int n) noexcept;                              // audio thread
+    float participantGain (uint32_t clientId) const noexcept;                         // audio thread
+    void chatLoop();                                                                  // chat thread
     void disableCapture() noexcept;                                                   // message thread
     void restoreRecorderCallbacks();                                                  // message thread
 
@@ -123,12 +180,13 @@ private:
     Recorder recorder;
     LatencyCalibrator calibrator;
     OpusMode mode128 { FrameSize::f128 };
-    OpusDecoder previewMono { mode128, 1 }, previewStereo { mode128, 2 };
     std::array<float, transportFadeSamples + 1> fadeTable {};   // half-cosine 0 → 1
 
     // Settings (message thread → audio thread).
     std::atomic<int> micChannel { 0 }, instrumentChannel { 1 }, outputPair { 0 };
     std::atomic<float> monitorVoiceGain { 1.0f }, monitorInstrumentGain { 1.0f };
+    std::atomic<float> sendVoiceGain { 1.0f }, sendInstrumentGain { 1.0f };
+    std::atomic<int> armedKind { -1 };                         // (int) TrackKind of the armed track, -1 = none
     std::atomic<int> calibrationSamples { 0 };
     std::atomic<bool> clickOn { false }, countInOn { false };
     std::atomic<double> bpm { 120.0 };
@@ -165,24 +223,35 @@ private:
     std::atomic<bool> recording { false };
     Id recordTake;
     int64_t recordPoint = 0, recordOffset = 0;
-    std::function<void (const float* const*, int, int)> userLiveAudio;
     std::function<void (int, int64_t)> userFinished;
     int finishedSegments = 0;                                  // written on the writer thread before stop() returns
     int64_t finishedSamples = 0;
-    std::unique_ptr<PreviewEncoder> previewEncoder;
 
-    // Live listening (receive). The callback flags inPreview while it uses the buffer (same hand-off as capture).
-    std::atomic<JitterBuffer*> previewBuffer { nullptr };
-    std::atomic<bool> inPreview { false };
-    JitterBuffer* lastPreviewBuffer = nullptr;                 // audio thread
-    // Packet-loss concealment per decoder: only after a real frame, for at most maxConcealedFrames, then silence.
-    struct PreviewDecoderState { bool primed = false; int lost = 0; };
+    // Own inputs on the audio thread: send gains, monitor gains and the monitor's armed-kind fades
+    // (0..transportFadeSamples, gain fadeTable[index]).
+    GainRamp sendVoiceRamp, sendInstrumentRamp, monitorVoiceRamp, monitorInstrumentRamp;
+    int monitorVoiceFade = 0, monitorInstrumentFade = 0;
+
+    // Chat send. The audio thread builds 128-sample frames aligned to chatClock and queues them; the chat thread
+    // encodes them and calls onChatPacket, flagging inChatSink around the call (Dekker with setChatEnabled (false)).
+    std::atomic<bool> chatEnabled { false }, micMuted { false }, inChatSink { false }, chatQuit { false };
+    std::atomic<uint32_t> chatSignal { 0 };                    // bumped (and notified) when frames are queued
+    std::unique_ptr<ChatSender> chatVoice, chatInstrument;
+    int64_t chatClock = 0;                                     // audio thread: samples since the device started
+    std::thread chatThread;
+
+    // Chat receive. The callback flags inRemote while it uses the table (same hand-off as capture).
+    std::atomic<RemoteStreamTable*> remoteTable { nullptr };
+    std::atomic<bool> inRemote { false };
+    RemoteStreamTable* lastRemoteTable = nullptr;              // audio thread
+    // Packet-loss concealment: only after a real frame, for at most maxConcealedFrames, then a faded cut.
     static constexpr int maxConcealedFrames = 18;              // 48 ms of 128-sample frames
-    PreviewDecoderState monoState, stereoState;
-    int previewKind = 0;                                       // channels of the stream being decoded, 0 = none
-    std::vector<float> previewL, previewR, previewInterleaved;
-    std::vector<uint8_t> previewPacket;
-    int previewFill = 0;
+    std::array<std::unique_ptr<RemoteSlotMix>, RemoteStreamTable::capacity> remoteMix;
+    std::vector<uint8_t> remotePacket;
+    std::vector<float> remoteInterleaved;
+    // Per-sender gains: clientId << 32 | the gain's float bits; 0 = free entry.
+    static constexpr int participantCapacity = 64;
+    std::array<std::atomic<uint64_t>, participantCapacity> participantGains {};
 
     // Sample source swap: the message thread asks for silence (hold), the callback fades the master to 0 and reports
     // it, the pointer is swapped with the inRender hand-off, then the hold is released and the master fades back in.
@@ -194,11 +263,11 @@ private:
 
     // Audio-thread scratch, sized in audioDeviceAboutToStart.
     juce::AudioBuffer<float> instrumentBuffer;                 // 2 x block
-    std::vector<float> silence, mixL, mixR, scratchL, scratchR;
+    std::vector<float> silence, mixL, mixR, scratchL, scratchR, voiceSent, instrumentSentL, instrumentSentR;
     int maxBlock = 0;
 
     std::atomic<uint32_t> callbackCount { 0 };
-    std::atomic<float> peakVoice { 0.0f }, peakInstrument { 0.0f }, peakOutput { 0.0f };
+    std::atomic<float> peakVoice { 0.0f }, peakInstrument { 0.0f }, peakOutput { 0.0f }, peakArmed { 0.0f };
 
     juce::CriticalSection errorLock;
     juce::String lastError;

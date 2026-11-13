@@ -14,7 +14,9 @@ namespace ensayo
 struct SessionIdentity { Id user; juce::String name; juce::File cacheRoot; };
 
 // One session of the app or the headless client: owns the ProjectClient (and the embedded ProjectHost when hosting)
-// and wires them to a StudioEngine owned by the caller (sample source, project, preview, recording, import, export).
+// and wires them to a StudioEngine owned by the caller (sample source, project, voice chat, monitor, recording, import,
+// export). While a session is active the engine's voice chat runs: the mic goes out through the client and the other
+// participants' streams are mixed into the output.
 //
 // Threads: every method and callback runs on the message thread. Recorder callbacks run on the recorder's writer thread
 // and only call ProjectClient's any-thread methods; import and export run on their own threads and report back through
@@ -61,8 +63,9 @@ public:
     int finishUnfinishedTakes();            // also runs by itself at every onConnected
     const std::vector<Id>& getResumedTakes() const noexcept   { return resumedTakes; }   // finished by the call above
 
-    void setListening (bool);
-    bool isListening() const noexcept       { return listening; }
+    // The armed track (empty = none). The engine monitors the input of its kind when it is one of my own voice or
+    // instrument tracks; re-checked on every project change (a deleted track disarms the monitor).
+    void setArmedTrack (const Id& track);
 
     // Import: decode + resample + segments on a thread, then a new `imported` track with one region at 0. The track name
     // (trackName, else the file name) is trimmed and cut to 64 characters. The take starts only once the host applied
@@ -98,6 +101,9 @@ private:
 
     void createClient (const SessionIdentity&);
     void refreshEngine();
+    void applyArmed();
+    void attachLiveAudio();                         // engine <-> client: chat sink, remote streams, chat on
+    void detachLiveAudio();                         // chat off and remote streams gone before the client changes
     void post (std::function<void()>);
     void joinImportThread();
     void completeImport();
@@ -110,7 +116,8 @@ private:
     SessionLink link;
     juce::File cacheRoot;
     const SampleSource* engineSource = nullptr;
-    bool everConnected = false, listening = false;
+    bool everConnected = false;
+    Id armedTrack;
     std::vector<Id> resumedTakes;
 
     // Take being recorded here.

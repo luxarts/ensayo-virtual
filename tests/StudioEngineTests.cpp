@@ -1,6 +1,8 @@
 #include "client/StudioEngine.h"
 #include "client/TakeCache.h"
 #include "core/Segments.h"
+#include "core/RemoteStreams.h"
+#include "core/OpusCodec.h"
 #include "MessagePump.h"
 
 #include <algorithm>
@@ -129,7 +131,6 @@ struct Collected
     std::mutex lock;
     std::vector<juce::MemoryBlock> segments;
     std::vector<int> segmentSamples;
-    std::vector<std::vector<uint8_t>> previewPackets;
     std::atomic<bool> finished { false };
     std::atomic<int> errors { 0 };
 
@@ -145,11 +146,6 @@ struct Collected
         };
         r.onFinished = [this] (int, int64_t) { finished.store (true); };
         r.onError = [this] (const juce::String&) { ++errors; };
-        engine.onPreviewPacket = [this] (const uint8_t* packet, size_t len)
-        {
-            std::lock_guard<std::mutex> g (lock);
-            previewPackets.emplace_back (packet, packet + len);
-        };
     }
 
     // Channel 0 of the whole take.
@@ -282,6 +278,110 @@ std::vector<int64_t> detectClicks (const std::vector<float>& x)
 
     return found;
 }
+// One remote sender: a sine (amplitude 0.5) as 128-sample Opus packets of one stream kind (voice mono, instrument
+// stereo), pushed into a RemoteStreamTable as the ProjectClient's UDP thread would.
+struct RemoteSender
+{
+    RemoteSender (const OpusMode& mode, uint32_t client, StreamKind streamKind, double frequency)
+        : clientId (client), kind (streamKind), freq (frequency), channels (streamKind == StreamKind::voice ? 1 : 2),
+          encoder (mode, channels), pcm ((size_t) (128 * channels)), coded (128) {}
+
+    void send (RemoteStreamTable& table, bool drop = false)
+    {
+        for (int i = 0; i < 128; ++i)
+        {
+            const auto s = (float) (0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * freq * (double) (sample + i) / 48000.0));
+
+            for (int c = 0; c < channels; ++c)
+                pcm[(size_t) (i * channels + c)] = s;
+        }
+
+        const int n = encoder.encode (pcm.data(), coded.data(), (int) coded.size());
+
+        if (! drop)
+            table.push (clientId, kind, seq, coded.data(), n, juce::Time::getMillisecondCounterHiRes());
+
+        ++seq;
+        sample += 128;
+    }
+
+    const uint32_t clientId;
+    const StreamKind kind;
+    const double freq;
+    const int channels;
+    OpusEncoder encoder;
+    std::vector<float> pcm;
+    std::vector<uint8_t> coded;
+    uint16_t seq = 0;
+    int64_t sample = 0;
+};
+
+// The chat packets the engine's encoder thread hands to onChatPacket, by kind.
+struct ChatSink
+{
+    std::mutex lock;
+    std::vector<std::vector<uint8_t>> voice, instrument;
+
+    void attach (StudioEngine& engine)
+    {
+        engine.onChatPacket = [this] (StreamKind kind, const uint8_t* packet, size_t len)
+        {
+            std::lock_guard<std::mutex> g (lock);
+            (kind == StreamKind::voice ? voice : instrument).emplace_back (packet, packet + len);
+        };
+    }
+
+    int count (StreamKind kind)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        return (int) (kind == StreamKind::voice ? voice : instrument).size();
+    }
+};
+
+// Amplitude of the `freq` component of x[from, to) (Goertzel); exact for a whole number of cycles.
+float toneAmplitude (const std::vector<float>& x, size_t from, size_t to, double freq)
+{
+    const double w = 2.0 * juce::MathConstants<double>::pi * freq / 48000.0, c = 2.0 * std::cos (w);
+    double s1 = 0.0, s2 = 0.0;
+    to = std::min (to, x.size());
+
+    for (size_t i = from; i < to; ++i)
+    {
+        const double s = x[i] + c * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+
+    const double re = s1 - s2 * std::cos (w), im = s2 * std::sin (w);
+    return to > from ? (float) (2.0 * std::sqrt (re * re + im * im) / (double) (to - from)) : 0.0f;
+}
+
+float peakBetween (const std::vector<float>& x, size_t from, size_t to)
+{
+    float m = 0.0f;
+
+    for (size_t i = from; i < std::min (to, x.size()); ++i)
+        m = std::max (m, std::abs (x[i]));
+
+    return m;
+}
+
+// A project with one voice and one instrument track of the host user.
+struct TwoTrackProject
+{
+    Id host = newId(), voice = newId(), instrument = newId();
+    Project project = makeProject ("Song", host, "Lucas");
+    bool ok = true;
+
+    TwoTrackProject()
+    {
+        ok = applyOp (project, Ops::addTrack (voice, "Voz", TrackKind::voice), host).ok
+          && applyOp (project, Ops::addTrack (instrument, "Guitarra", TrackKind::instrument), host).ok;
+    }
+
+    std::shared_ptr<const Project> snapshot() const { return std::make_shared<const Project> (project); }
+    const Track& track (const Id& id) const { return *project.findTrack (id); }
+};
 }
 
 class StudioEngineTests : public juce::UnitTest
@@ -416,54 +516,49 @@ public:
         expect (worst == 0, "worst alignment error " + juce::String (worst));
     }
 
-    // Streams a stereo 440 Hz sine (amplitude 0.5) as 128-sample Opus packets into the preview jitter buffer at the
-    // device's pace and checks what reaches the output: the level of the source (within 15 %) and no step above
-    // 1.5 x the source's own largest step, including the stream's start, an optional lost packet mid-stream and the
-    // end of the stream (concealment, then a faded cut).
-    // cutMidStream: listening is turned off (setPreviewBuffer (nullptr)) while packets still arrive.
-    // offAndOn: listening is turned off and, one device block later (while the faded tail still plays), on again;
-    // the stream goes on.
-    void previewReceive (bool dropOne, bool cutMidStream = false, bool offAndOn = false, int blockSize = 256)
+    // How a received stream ends in remoteReceive.
+    enum class RemoteEnd
+    {
+        stops,          // the sender stops: concealment, then a faded cut
+        dropOne,        // one lost packet mid-stream (concealed), then stops
+        released,       // the slot is released mid-stream (presence says the sender left); the sender goes on, so the
+                        // next packet starts a new stream instance in the table
+        tableOff,       // setRemoteStreams (nullptr) while the stream sounds
+        offAndOn        // setRemoteStreams (nullptr) and, one device block later (the faded tail still plays), back on
+    };
+
+    // Streams a mono 440 Hz sine (amplitude 0.5) as 128-sample Opus voice packets into a RemoteStreamTable at the
+    // device's pace and checks what reaches the output: the level of the source (within 15 %) and no sample step
+    // above 0.043 (1.5 x the source's own largest step), through the stream's start, its end and the given event.
+    void remoteReceive (RemoteEnd scenario, int blockSize = 256)
     {
         StudioEngine engine;
         engine.setMonitor (0.0f, 0.0f);
         engine.useFakeDevice (blockSize, TestSignal::silence);
-        OutputCapture out (48000 * 3);
+        OutputCapture out (48000 * 4);
         out.attach (*engine.getFakeDevice());
 
-        const double blockMs = 128000.0 / sampleRate;
-        JitterBuffer rx (codedBytesStereo (FrameSize::f128), blockMs);
-        rx.setAutoSize (false);
-        rx.setSizeBlocks (8);
+        RemoteStreamTable table;
+
+        for (auto& slot : table.slots())
+        {
+            slot.buffer.setAutoSize (false);
+            slot.buffer.setSizeBlocks (8);
+        }
 
         OpusMode mode (FrameSize::f128);
-        OpusEncoder encoder (mode, 2);
-        std::vector<float> pcm (256);
-        std::vector<uint8_t> coded (128);
+        RemoteSender sender (mode, 7, StreamKind::voice, 440.0);
+        const double blockMs = 128000.0 / sampleRate;
         constexpr int blocks = 300, prefill = 8, dropped = 150, cutAt = 200;
 
-        const auto push = [&] (int b)
-        {
-            for (int i = 0; i < 128; ++i)
-                pcm[(size_t) (2 * i)] = pcm[(size_t) (2 * i + 1)] = sineAt (b * 128 + i);
-
-            const int n = encoder.encode (pcm.data(), coded.data(), (int) coded.size());
-
-            if (! (dropOne && b == dropped))
-                rx.push ((uint16_t) b, coded.data(), n, juce::Time::getMillisecondCounterHiRes());
-        };
-
         for (int b = 0; b < prefill; ++b)
-            push (b);
+            sender.send (table);
 
-        engine.setPreviewBuffer (&rx);
+        engine.setRemoteStreams (&table);
         const double startMs = juce::Time::getMillisecondCounterHiRes();
+        std::atomic<int> toggle { 0 };   // offAndOn: 1 turn off at the next block end, 2 turn on at the next, 3 done
 
-        // offAndOn: toggled from the device thread between two callbacks, so the second switch lands exactly one
-        // block after the first.
-        std::atomic<int> toggle { 0 };   // 1: turn off at the next block end, 2: turn on at the next one, 3: done
-
-        if (offAndOn)
+        if (scenario == RemoteEnd::offAndOn)
         {
             engine.getFakeDevice()->onOutputBlock = [&] (const float* l, const float* r, int n, int64_t, double)
             {
@@ -479,12 +574,12 @@ public:
 
                 if (toggle.load() == 1)
                 {
-                    engine.setPreviewBuffer (nullptr);
+                    engine.setRemoteStreams (nullptr);
                     toggle.store (2);
                 }
                 else if (toggle.load() == 2)
                 {
-                    engine.setPreviewBuffer (&rx);
+                    engine.setRemoteStreams (&table);
                     toggle.store (3);
                 }
             };
@@ -495,44 +590,48 @@ public:
             while (juce::Time::getMillisecondCounterHiRes() < startMs + (b - prefill) * blockMs)
                 juce::Thread::sleep (1);
 
-            if (offAndOn && b == cutAt)
-                toggle.store (1);
-
-            if (cutMidStream && b == cutAt)
+            if (b == cutAt)
             {
-                engine.setPreviewBuffer (nullptr);   // the sine is playing right now: it must fade, not step
-                break;
+                if (scenario == RemoteEnd::offAndOn)
+                    toggle.store (1);
+
+                if (scenario == RemoteEnd::tableOff)
+                {
+                    engine.setRemoteStreams (nullptr);   // the sine is playing right now: it must fade, not step
+                    break;
+                }
+
+                if (scenario == RemoteEnd::released)
+                {
+                    table.releaseClient (7);
+                    table.sweep (juce::Time::getMillisecondCounterHiRes());
+                    expectEquals (table.activeCount(), 0, "released");
+                }
             }
 
-            push (b);
+            sender.send (table, scenario == RemoteEnd::dropOne && b == dropped);
         }
 
-        if (offAndOn)
-            expectEquals (toggle.load(), 3, "listening was turned off and on again");
+        if (scenario == RemoteEnd::offAndOn)
+            expectEquals (toggle.load(), 3, "the table was set off and on again");
 
-        const auto stats = rx.getStats();
+        if (scenario == RemoteEnd::released)
+            expectEquals (table.activeCount(), 1, "the sender's next packet claimed a slot again");
+
         pumpMessages (150);                          // the stream ends: concealment, then a faded cut
-        engine.setPreviewBuffer (nullptr);
+        engine.setRemoteStreams (nullptr);
         engine.getFakeDevice()->onOutputBlock = nullptr;
 
-        std::vector<float> pure (48000);
-
-        for (size_t i = 0; i < pure.size(); ++i)
-            pure[i] = sineAt ((int64_t) i);
-
-        const auto bound = 1.5f * maxStepOf (pure);
+        const auto bound = 0.043f;
         std::lock_guard<std::mutex> g (out.lock);
-        const auto peak = peakOfVector (out.L), step = maxStepOf (out.L);
-        logMessage (juce::String (offAndOn ? "off and on" : cutMidStream ? "cut mid-stream" : dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
-                    + juce::String ((int) stats.underruns) + ", output peak " + juce::String (peak, 4) + ", max step "
-                    + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
-
-        if (! dropOne && ! offAndOn)
-            expectEquals ((int) stats.underruns, 0, "the stream was paced without gaps");
+        const auto peak = peakOfVector (out.L), step = maxStepOf (out.L), stepR = maxStepOf (out.R);
+        const char* names[] = { "stops", "one packet lost", "released mid-stream", "table off mid-stream", "off and on" };
+        logMessage (juce::String (names[(int) scenario]) + ", block " + juce::String (blockSize) + ": output peak "
+                    + juce::String (peak, 4) + ", max step " + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
 
         expect (peak >= 0.425f && peak <= 0.575f, "output peak " + juce::String (peak, 4));
-        expect (step <= bound, "click in the preview: step " + juce::String (step, 6));
-        expect (out.L.back() == 0.0f, "silent after the stream ended");
+        expect (step <= bound && stepR <= bound, "click in the received stream: step " + juce::String (std::max (step, stepR), 6));
+        expect (out.L.back() == 0.0f && out.R.back() == 0.0f, "silent after the stream ended");
     }
 
     void runTest() override
@@ -679,6 +778,13 @@ public:
             engine.play();
             expect (engine.isPlaying());
             pumpMessages (250);
+            float trackPeak = 0.0f;
+
+            for (const auto& [id, peak] : engine.takeTrackMeters())
+                if (id == sp.track)
+                    trackPeak = std::max (trackPeak, peak);
+
+            expect (std::abs (trackPeak - 0.5f) < 0.01f, "track meter of the playing sine: " + juce::String (trackPeak, 4));
             engine.setPosition (200000);
             pumpMessages (250);
             expect (engine.getPosition() > 200000);
@@ -849,55 +955,307 @@ public:
             }
         }
 
-        beginTest ("live preview: the take is sent as 128-sample Opus packets");
+        beginTest ("monitor: only the armed kind's input sounds, faded on every change; send gain is pre monitor and meter");
         {
-            const auto dir = studioTestDir().getChildFile ("preview");
-            const Id host = newId(), track = newId();
-            auto project = makeProject ("Song", host, "Lucas");
-            expect (applyOp (project, Ops::addTrack (track, "Voice", TrackKind::voice), host).ok);
+            StudioEngine engine;
+            engine.setMonitor (1.0f, 0.25f);         // voice at full level, instrument at a quarter: they tell apart
+            engine.setMetronome (false, false);
+            engine.useFakeDevice (256, TestSignal::sine440);
+            engine.setChannels (0, 1, 0);
+            OutputCapture out (48000 * 4);
+            out.attach (*engine.getFakeDevice());
+
+            std::vector<size_t> marks;
+            const auto mark = [&]
+            {
+                std::lock_guard<std::mutex> g (out.lock);
+                marks.push_back (out.R.size());
+            };
+
+            pumpMessages (300);
+            expectEquals (engine.takeArmedInputPeak(), 0.0f, "nothing armed, no armed input");
+            mark();
+            engine.setArmed (TrackKind::voice);
+            pumpMessages (300);
+            const auto armedVoicePeak = engine.takeArmedInputPeak();
+            mark();
+            engine.setSendGains (0.5f, 1.0f);
+            pumpMessages (200);
+            engine.takeArmedInputPeak();             // drops the peak of the ramp
+            pumpMessages (100);
+            const auto halfVoicePeak = engine.takeArmedInputPeak();
+            mark();
+            engine.setArmed (TrackKind::instrument);
+            pumpMessages (300);
+            mark();
+            engine.setArmed (std::nullopt);
+            pumpMessages (300);
+            mark();
+            engine.getFakeDevice()->onOutputBlock = nullptr;
+
+            std::lock_guard<std::mutex> g (out.lock);
+            const auto window = [&] (size_t i) { return peakBetween (out.R, marks[i] + 2048, marks[i + 1]); };
+            const auto unarmed = peakBetween (out.R, 0, marks[0]), voice = window (0), halfVoice = window (1),
+                       instrument = window (2), off = peakBetween (out.R, marks[3] + 2048, marks[4]);
+            const auto step = std::max (maxStepOf (out.L), maxStepOf (out.R));
+            logMessage ("monitor peaks: unarmed " + juce::String (unarmed, 4) + ", voice " + juce::String (voice, 4)
+                        + ", voice at send 0.5 " + juce::String (halfVoice, 4) + ", instrument " + juce::String (instrument, 4)
+                        + ", unarmed again " + juce::String (off, 4) + "; armed input " + juce::String (armedVoicePeak, 4)
+                        + " / " + juce::String (halfVoicePeak, 4) + "; max step " + juce::String (step, 6));
+            expectEquals (unarmed, 0.0f, "no monitor while nothing is armed");
+            expect (std::abs (voice - 0.5f) < 0.01f, "armed voice: the mic at the voice monitor gain");
+            expect (std::abs (halfVoice - 0.25f) < 0.01f, "the monitor hears the input after the send gain");
+            expect (std::abs (instrument - 0.125f) < 0.01f, "armed instrument: only the instrument, at its monitor gain");
+            expectEquals (off, 0.0f, "disarmed: silent again");
+            expect (std::abs (armedVoicePeak - 0.5f) < 0.01f, "armed input peak");
+            expect (std::abs (halfVoicePeak - 0.25f) < 0.01f, "armed input peak after the send gain");
+            expect (step <= 0.043f, "click when the monitor changes: step " + juce::String (step, 6));
+        }
+
+        beginTest ("send gains are printed exactly into the take once the ramp has settled");
+        {
+            const auto dir = studioTestDir().getChildFile ("sendgain");
+            TwoTrackProject p;
+            expect (p.ok);
 
             StudioEngine engine;
             engine.setMetronome (false, false);
-            engine.setProject (std::make_shared<const Project> (project));
-            engine.useFakeDevice (256, TestSignal::sine440);
-            pumpMessages (20);
+            engine.setSendGains (0.5f, 0.25f);
+            engine.setProject (p.snapshot());
+            engine.useFakeDevice (256, TestSignal::click);   // +1.0 impulses on both inputs
+            engine.setChannels (0, 1, 0);
+            pumpMessages (50);
 
-            Collected c;
-            c.attach (engine);
-            expect (engine.startRecording (*project.findTrack (track), newId(), dir.getChildFile ("take.wav")).wasOk());
+            for (const auto& [trackId, gain] : { std::pair<Id, float> { p.voice, 0.5f }, { p.instrument, 0.25f } })
+            {
+                Collected c;
+                c.attach (engine);
+                expect (engine.startRecording (p.track (trackId), newId(), dir.getChildFile (trackId + ".wav")).wasOk());
+                pumpMessages (1300);
+                const auto rec = engine.stopRecording();
+                expect (rec.has_value());
+
+                int clicks = 0;
+                bool exact = true;
+
+                for (auto s : c.decodeTake())
+                {
+                    if (s == 0.0f)
+                        continue;
+
+                    ++clicks;
+                    exact = exact && s == gain;
+                }
+
+                logMessage ("send gain " + juce::String (gain) + ": " + juce::String (clicks) + " clicks recorded");
+                expect (clicks >= 3, "clicks recorded");
+                expect (exact, "every recorded click is exactly gain x input");
+            }
+        }
+
+        beginTest ("received streams: start, end and concealment are faded");
+        remoteReceive (RemoteEnd::stops);
+
+        beginTest ("received streams: a lost packet is concealed without a click");
+        remoteReceive (RemoteEnd::dropOne);
+
+        beginTest ("received streams: a slot released mid-stream fades out and the next stream fades in");
+        remoteReceive (RemoteEnd::released);
+
+        beginTest ("received streams: setRemoteStreams (nullptr) mid-stream fades out without a click");
+        remoteReceive (RemoteEnd::tableOff);
+
+        beginTest ("received streams: off and on again during the faded tail (64-sample blocks) plays the tail out");
+        remoteReceive (RemoteEnd::offAndOn, 64);
+
+        beginTest ("received streams: two senders are mixed with independent participant gains");
+        {
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::silence);
+            OutputCapture out (48000 * 4);
+            out.attach (*engine.getFakeDevice());
+
+            RemoteStreamTable table;
+
+            for (auto& slot : table.slots())
+            {
+                slot.buffer.setAutoSize (false);
+                slot.buffer.setSizeBlocks (8);
+            }
+
+            OpusMode mode (FrameSize::f128);
+            RemoteSender voice (mode, 1, StreamKind::voice, 440.0), guitar (mode, 2, StreamKind::instrument, 1000.0);
+            engine.setParticipantGain (1, 1.0f, false);
+            engine.setParticipantGain (2, 0.25f, false);
+
+            for (int b = 0; b < 8; ++b)
+            {
+                voice.send (table);
+                guitar.send (table);
+            }
+
+            engine.setRemoteStreams (&table);
+            const double blockMs = 128000.0 / sampleRate;
+            const double startMs = juce::Time::getMillisecondCounterHiRes();
+            const int total = (int) (2.4 * sampleRate / 128);
+            size_t both = 0, muted = 0;
+
+            for (int b = 0; b < total; ++b)
+            {
+                while (juce::Time::getMillisecondCounterHiRes() < startMs + b * blockMs)
+                    juce::Thread::sleep (1);
+
+                const auto seconds = b * 128.0 / sampleRate;
+
+                if (both == 0 && seconds >= 0.8)
+                {
+                    std::lock_guard<std::mutex> g (out.lock);
+                    both = out.L.size();
+                }
+
+                if (muted == 0 && seconds >= 1.5)
+                {
+                    engine.setParticipantGain (1, 1.0f, true);
+                    std::lock_guard<std::mutex> g (out.lock);
+                    muted = out.L.size();
+                }
+
+                voice.send (table);
+                guitar.send (table);
+            }
+
+            pumpMessages (150);
+            engine.setRemoteStreams (nullptr);
+            engine.getFakeDevice()->onOutputBlock = nullptr;
+
+            std::lock_guard<std::mutex> g (out.lock);
+            const auto v1 = toneAmplitude (out.L, both, both + 24000, 440.0);
+            const auto g1 = toneAmplitude (out.L, both, both + 24000, 1000.0);
+            const auto g1r = toneAmplitude (out.R, both, both + 24000, 1000.0);
+            const auto v2 = toneAmplitude (out.L, muted + 4800, muted + 4800 + 24000, 440.0);
+            const auto g2 = toneAmplitude (out.L, muted + 4800, muted + 4800 + 24000, 1000.0);
+            const auto step = std::max (maxStepOf (out.L), maxStepOf (out.R));
+            logMessage ("two senders: voice " + juce::String (v1, 4) + " guitar " + juce::String (g1, 4) + "/"
+                        + juce::String (g1r, 4) + "; voice muted: voice " + juce::String (v2, 4) + " guitar "
+                        + juce::String (g2, 4) + "; max step " + juce::String (step, 6));
+            expect (both > 0 && muted > both + 24000, "windows");
+            expect (std::abs (v1 - 0.5f) < 0.075f, "voice at gain 1");
+            expect (std::abs (g1 - 0.125f) < 0.02f && std::abs (g1r - 0.125f) < 0.02f, "instrument (stereo) at gain 0.25");
+            expect (v2 < 0.005f, "muted voice");
+            expect (std::abs (g2 - 0.125f) < 0.02f, "the instrument is not affected by the voice sender's mute");
+            expect (step <= 1.5f * (0.5f + 0.125f * 1000.0f / 440.0f) * 0.0576f, "click: step " + juce::String (step, 6));
+        }
+
+        beginTest ("chat: the mic is sent while enabled; muting it stops the voice packets");
+        {
+            StudioEngine engine;
+            ChatSink sink;
+            sink.attach (engine);
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::sine440);
+            pumpMessages (200);
+            expectEquals (sink.count (StreamKind::voice), 0, "nothing sent before setChatEnabled (true)");
+
+            engine.setChatEnabled (true);
+            expect (waitFor ([&] { return sink.count (StreamKind::voice) >= 60; }, 3000), "voice packets flow");
+            expectEquals (sink.count (StreamKind::instrument), 0, "no instrument stream without an instrument take");
+
+            {
+                std::lock_guard<std::mutex> g (sink.lock);
+                bool wellFormed = true;
+                AudioPacketView first, view;
+                wellFormed = decodeAudioPacket (sink.voice.front().data(), sink.voice.front().size(), first);
+
+                for (size_t i = 0; i < sink.voice.size() && wellFormed; ++i)
+                {
+                    wellFormed = decodeAudioPacket (sink.voice[i].data(), sink.voice[i].size(), view)
+                              && view.frameSize == FrameSize::f128 && view.flags == AudioFlags::voice
+                              && view.voiceLen == codedBytesMono (FrameSize::f128) && view.instrumentLen == 0
+                              && view.seq == (uint16_t) (first.seq + i)
+                              && view.sampleTime == first.sampleTime + (uint32_t) (i * 128);
+                }
+
+                expect (wellFormed, "consecutive mono 128-sample voice packets");
+            }
+
+            engine.setMicMuted (true);
+            pumpMessages (100);
+            const int atMute = sink.count (StreamKind::voice);
+            pumpMessages (400);
+            expectEquals (sink.count (StreamKind::voice), atMute, "no voice packet while the mic is muted");
+
+            engine.setMicMuted (false);
+            expect (waitFor ([&] { return sink.count (StreamKind::voice) >= atMute + 40; }, 3000), "voice resumes");
+
+            {
+                // Muted time is skipped in the sequence, so a receiver places the next frame where it belongs.
+                std::lock_guard<std::mutex> g (sink.lock);
+                AudioPacketView before, after;
+                decodeAudioPacket (sink.voice[(size_t) atMute - 1].data(), sink.voice[(size_t) atMute - 1].size(), before);
+                decodeAudioPacket (sink.voice[(size_t) atMute].data(), sink.voice[(size_t) atMute].size(), after);
+                const auto gap = (uint32_t) (after.sampleTime - before.sampleTime) / 128;
+                logMessage ("muted for " + juce::String ((int) gap) + " frames");
+                expect (gap > 100 && (uint16_t) (after.seq - before.seq) == (uint16_t) gap, "sequence follows the time muted");
+            }
+
+            engine.setChatEnabled (false);
+            pumpMessages (50);
+            const int atDisable = sink.count (StreamKind::voice);
+            pumpMessages (200);
+            expectEquals (sink.count (StreamKind::voice), atDisable, "nothing is sent once the chat is disabled");
+        }
+
+        beginTest ("chat: the instrument stream is sent only while recording an instrument track");
+        {
+            const auto dir = studioTestDir().getChildFile ("chat-instrument");
+            TwoTrackProject p;
+            expect (p.ok);
+
+            StudioEngine engine;
+            ChatSink sink;
+            sink.attach (engine);
+            engine.setMetronome (false, false);
+            engine.setMonitor (0.0f, 0.0f);
+            engine.setProject (p.snapshot());
+            engine.useFakeDevice (256, TestSignal::sine440);
+            engine.setChatEnabled (true);
+            engine.play();
+            pumpMessages (300);
+            expect (sink.count (StreamKind::voice) > 50, "voice flows");
+            expectEquals (sink.count (StreamKind::instrument), 0, "no instrument stream while only playing");
+            engine.stop();
+            pumpMessages (50);
+
+            Collected voiceTake;
+            voiceTake.attach (engine);
+            expect (engine.startRecording (p.track (p.voice), newId(), dir.getChildFile ("voice.wav")).wasOk());
+            pumpMessages (400);
+            expect (engine.stopRecording().has_value());
+            expectEquals (sink.count (StreamKind::instrument), 0, "no instrument stream while recording a voice track");
+
+            Collected instrumentTake;
+            instrumentTake.attach (engine);
+            expect (engine.startRecording (p.track (p.instrument), newId(), dir.getChildFile ("instrument.wav")).wasOk());
             pumpMessages (500);
             const auto rec = engine.stopRecording();
             expect (rec.has_value());
+            pumpMessages (100);
+            const int afterTake = sink.count (StreamKind::instrument);
+            pumpMessages (300);
+            const int voiceNow = sink.count (StreamKind::voice);
+            logMessage ("instrument packets during the take: " + juce::String (afterTake) + ", voice packets so far "
+                        + juce::String (voiceNow));
+            expect (afterTake > 100, "the instrument is sent during an instrument take");
+            expectEquals (sink.count (StreamKind::instrument), afterTake, "and stops when the take ends");
 
-            std::lock_guard<std::mutex> g (c.lock);
-            const auto expected = rec.has_value() ? (int) (rec->samples / 128) : 0;
-            expectEquals ((int) c.previewPackets.size(), expected);
-            bool wellFormed = ! c.previewPackets.empty();
-
-            for (size_t i = 0; i < c.previewPackets.size(); ++i)
-            {
-                AudioPacketView view;
-                const auto& packet = c.previewPackets[i];
-                wellFormed = wellFormed && decodeAudioPacket (packet.data(), packet.size(), view)
-                          && view.flags == AudioFlags::voice && view.frameSize == FrameSize::f128
-                          && view.voiceLen == codedBytesMono (FrameSize::f128) && view.instrumentLen == 0
-                          && view.seq == (uint16_t) i && view.sampleTime == (uint32_t) (i * 128) && view.clientId == 0;
-            }
-
-            expect (wellFormed, "preview packets");
+            std::lock_guard<std::mutex> g (sink.lock);
+            AudioPacketView view;
+            expect (decodeAudioPacket (sink.instrument.front().data(), sink.instrument.front().size(), view)
+                    && view.flags == AudioFlags::instrument && view.instrumentLen == codedBytesStereo (FrameSize::f128)
+                    && view.voiceLen == 0, "stereo instrument packets");
+            engine.setChatEnabled (false);
         }
-
-        beginTest ("live preview: received packets are added to the output without clicks");
-        previewReceive (false);
-
-        beginTest ("live preview: a lost packet is concealed without a click");
-        previewReceive (true);
-
-        beginTest ("live preview: turning listening off mid-stream fades out without a click");
-        previewReceive (false, true);
-
-        beginTest ("live preview: listening off and on again during the faded tail (64-sample blocks) plays the tail out");
-        previewReceive (false, false, true, 64);
     }
 };
 

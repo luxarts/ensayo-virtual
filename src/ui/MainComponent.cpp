@@ -948,7 +948,12 @@ void MainComponent::wireDaw()
         engine.setPosition (juce::jmax ((int64_t) 0, position));
     };
 
-    daw.onArm = [this] (const Id& track) { armedTrack = track; if (demoMode) { demoState.armedTrack = track; daw.setState (demoState); } };
+    daw.onArm = [this] (const Id& track)
+    {
+        armedTrack = track;
+        if (demoMode) { demoState.armedTrack = track; daw.setState (demoState); return; }
+        session.setArmedTrack (track);
+    };
 
     daw.onSolo = [this] (const Id& track, bool on)
     {
@@ -964,9 +969,7 @@ void MainComponent::wireDaw()
     {
         listen = on;
 
-        if (demoMode) { demoState.listen = on; return; }
-
-        session.setListening (on);
+        if (demoMode) demoState.listen = on;   // the voice chat is always on in a session; the toggle goes away
     };
 
     daw.onCopyLink = [this]
