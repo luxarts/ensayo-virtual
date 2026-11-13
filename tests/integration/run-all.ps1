@@ -5,7 +5,7 @@ param ([string] $BuildDir = 'build', [string] $Config = 'Release')
 $ErrorActionPreference = 'Stop'
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
-$scripts = @('screenshots', 'record-sync', 'edit-sync', 'reconnect', 'reopen', 'import-export', 'asio-calibration')
+$scripts = @('screenshots', 'record-sync', 'edit-sync', 'reconnect', 'reopen', 'import-export', 'voice-chat', 'asio-calibration')
 $results = @()
 $anyFailed = $false
 

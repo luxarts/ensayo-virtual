@@ -3,6 +3,8 @@
 # device in loopback mode (latency in 200, out 264, block 256): what B records is its own playback of the click
 # track, delayed by the hidden latencies. A stays connected for 40 s (not --wait-takes 2: that returns as soon as both
 # takes are complete and cached here, and B's add_region lands one version later, so A's hash could miss it).
+# Voice chat is always on: A's chat reaches B's output, and B's loopback records its output. A keeps the default
+# --fake-audio silence, so its chat is silent and only B's playback of the click track ends up in the take.
 # Asserts:
 #   - A printed at least 3 distinct "cached <B's take> <k>" lines before B printed take_complete (segments arrive
 #     while B is still recording);
