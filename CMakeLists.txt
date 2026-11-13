@@ -78,6 +78,7 @@ set(ENSAYO_SERVER_SOURCES
 )
 set(ENSAYO_UI_SOURCES
     # T9
+    src/ui/DawView.cpp
     src/ui/LobbyView.cpp
     src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
@@ -133,6 +134,8 @@ set(ENSAYO_TEST_SOURCES
     tests/OfflineTests.cpp
     # T8
     tests/StudioEngineTests.cpp
+    # T9
+    tests/DawViewTests.cpp
 )
 
 set(ENSAYO_MODULES
