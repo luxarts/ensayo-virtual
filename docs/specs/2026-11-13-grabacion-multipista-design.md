@@ -134,10 +134,12 @@ saludo; un cliente con otra versión se rechaza con "versión incompatible".
 
 **Control** (cliente → host): `hello {protocol, session, user, name}` (el id del host sólo se acepta desde
 127.0.0.1), `op {seq, op}`, `rec_start {take, track, start}`, `rec_peaks {take, from, peaks:[[min,max]...]}`,
-`rec_stop {take}`, `take_complete {take}`, `listen {enabled}`, `ping {ms}`. (host → cliente):
-`welcome {clientId, token, udpPort, isHost, project}`, `applied {version, by, op}`, `rejected {seq, reason}`,
-`presence {users:[{id, name, online, recording?:{take, track, start}}]}`, `rec_start/rec_peaks/rec_stop`
-reenviados, `pong {ms}`, `error {message}` (y se cierra la conexión).
+`rec_stop {take}`, `take_complete {take}`, `ping {ms}` (`listen {enabled}` de clientes viejos se acepta y se
+ignora: el audio en vivo ya no se pide). (host → cliente):
+`welcome {clientId, token, udpPort, udpSecret, isHost, project}`, `applied {version, by, op}`,
+`rejected {seq, reason}`, `presence {users:[{id, name, online, clientId?, recording?:{take, track, start}}]}`
+(`clientId` sólo de los conectados: así el receptor sabe de quién es cada paquete UDP),
+`rec_start/rec_peaks/rec_stop` reenviados, `pong {ms}`, `error {message}` (y se cierra la conexión).
 
 **Datos** (segunda conexión TCP, mismo puerto, primera línea `data_hello {clientId, token, have}` con el
 token recibido en `welcome` y `have = {take: segmentos que ya tiene, ...}`):
@@ -156,9 +158,23 @@ token recibido en `welcome` y `have = {take: segmentos que ya tiene, ...}`):
 - `take_complete {take}` (en la conexión de control) cuando el autor terminó de subir todos los segmentos; el
   host aplica `update_take` con `complete: true` y los `samples`/`segments` que ya tiene.
 
-**Escucha en vivo (UDP)**: el formato de paquete actual (20 bytes de cabecera, Opus custom a 128 muestras;
-campo `voice` = mono, `instrument` = estéreo según la pista). El host reenvía cada paquete del que graba a
-los clientes con `listen` activado (sin mezclar ni decodificar). El receptor usa el `JitterBuffer` existente.
+**Audio en vivo (UDP, mismo puerto)**: chat de voz siempre abierto e instrumento en vivo de quien graba una
+pista de instrumento (ver `docs/specs/2026-11-13-chat-de-voz-y-transporte-design.md`).
+
+- **Keepalive** (cliente → host, una vez por segundo desde el `welcome`): 13 bytes, `0x00`, `clientId` u32 y
+  el `udpSecret` de 8 bytes que llegó sólo en el `welcome` de esa conexión. Es la única forma de fijar (o mover)
+  la dirección UDP de un integrante: los `clientId` son públicos (están en `presence`), el secreto no. Un
+  keepalive con el secreto equivocado se descarta.
+- **Paquete de audio**: 20 bytes de cabecera (magic, versión, flags, tamaño de cuadro, `seq` u16, `clientId`,
+  `sampleTime`, `trackPosition`, dos largos de payload) y un cuadro Opus custom de 128 muestras. El **tipo de
+  stream** va en los flags: `voice` (mono, 48 bytes: el micrófono, después de la ganancia de envío) o
+  `instrument` (estéreo, 96 bytes: sólo mientras se graba una pista de instrumento). Cada integrante manda a lo
+  sumo un stream de cada tipo; `seq` cuenta cada cuadro de tiempo, se mande o no.
+- **Reenvío**: el host acepta un paquete sólo si viene de la dirección que probó el keepalive de ese `clientId`
+  y lo reenvía tal cual (sin mezclar ni decodificar) a todos los demás integrantes que ya tienen dirección UDP.
+- **Recepción**: el cliente separa por `(clientId, tipo)`, un `JitterBuffer` por stream en una tabla fija de 16
+  (`RemoteStreamTable`); un stream sin paquetes durante 5 s, o de alguien que `presence` da por ido, libera su
+  lugar. El motor decodifica y mezcla cada stream con la ganancia personal de ese integrante ("Participantes").
 
 ## 6. Motor de audio
 

@@ -36,7 +36,7 @@
 - tests: ProjectHostTests, ProjectClientTests, AudioPacket tests
 
 **Changes:**
-- Add a stream kind (`voice = 0`, `instrument = 1`) to the audio packet; keep the 5-byte keepalive.
+- Add a stream kind (`voice = 0`, `instrument = 1`) to the audio packet; keep the keepalive as it is now (13 bytes: `0x00`, `clientId`, and the connection's 8-byte UDP secret from its welcome; the old 5-byte form without the secret is gone).
 - The host relays every audio packet to all other peers that have a known UDP address. Drop the `listening` gate and its control message, or keep it accepted as a no-op for compatibility.
 - Presence entries include `clientId` for online users.
 
