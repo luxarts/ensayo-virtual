@@ -4,6 +4,7 @@
 #include "MessagePump.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <string>
@@ -130,7 +131,7 @@ public:
         testUnfinishedTakes();
         testCacheReuse();
         testVersionGap();
-        testPreview();
+        testRemoteStreams();
         testSilentHost();
     }
 
@@ -1144,57 +1145,134 @@ public:
     }
 
     //==========================================================================
-    void testPreview()
+    void testRemoteStreams()
     {
-        beginTest ("preview: a listening client receives another client's datagrams in its jitter buffer");
+        beginTest ("remote streams: two senders interleaved reach separate buffers in order, without listen; "
+                   "presence maps clientIds to users; a sender that leaves frees its slots");
 
-        const auto root = testDir ("preview");
-        const auto hostUser = newId(), userB = newId();
+        const auto root = testDir ("streams");
+        const auto hostUser = newId(), userB = newId(), userC = newId();
         ProjectHost host ({ 22228, 8 });
         expect (host.start (root.getChildFile ("host"), hostUser, "Lucas", "Tema").wasOk());
 
         Peer a (root.getChildFile ("cacheA"), hostUser, "Lucas");
         Peer b (root.getChildFile ("cacheB"), userB, "Ana");
+        auto c = std::make_unique<Peer> (root.getChildFile ("cacheC"), userC, "Caro");
         expect (a.connectTo (22228, host.getSessionId()));
         expect (b.connectTo (22228, host.getSessionId()));
+        expect (c->connectTo (22228, host.getSessionId()));
 
-        a->setListening (true);
-        pumpMessages (1500);   // A's keepalive teaches the host its UDP endpoint
+        uint32_t idB = 0, idC = 0;
 
-        std::array<uint8_t, 48> payload {};
-
-        for (size_t i = 0; i < payload.size(); ++i)
-            payload[i] = (uint8_t) (i * 3 + 1);
-
-        bool received = false;
-        std::array<uint8_t, 96> out {};
-        int outLen = 0;
-        uint16_t seq = 0;
-        const auto deadline = juce::Time::getMillisecondCounter() + 5000;
-
-        while (! received && juce::Time::getMillisecondCounter() < deadline)
+        expect (waitUntil ([&]
         {
+            for (const auto& p : a->presence())
+            {
+                if (p.user == userB && p.online) idB = p.clientId;
+                if (p.user == userC && p.online) idC = p.clientId;
+            }
+
+            return idB != 0 && idC != 0;
+        }, 3000), "A's presence carries B's and C's clientIds");
+
+        expect (idB != idC);
+        expect (a->userForClient (idB) == userB);
+        expect (a->userForClient (idC) == userC);
+        expect (a->userForClient (12345).isEmpty());
+
+        pumpMessages (1500);   // A's keepalive (always on now) teaches the host its UDP endpoint
+
+        auto send = [] (Peer& from, StreamKind kind, uint8_t marker, uint16_t seq, int bytes)
+        {
+            std::array<uint8_t, 96> payload {};
+            payload.fill ((uint8_t) seq);
+            payload[0] = marker;
+            payload[1] = (uint8_t) seq;
+
             AudioPacketView view;
-            view.flags = AudioFlags::voice;
+            view.flags = 0;                  // sendAudio stamps the kind
             view.frameSize = FrameSize::f128;
-            view.seq = seq++;
-            view.clientId = 0;   // stamped by the client
+            view.seq = seq;
+            view.clientId = 0;               // and the client its own id
             view.voice = payload.data();
-            view.voiceLen = (int) payload.size();
+            view.voiceLen = bytes;
             uint8_t packet[maxPacketBytes];
             const auto len = encodeAudioPacket (view, packet, sizeof (packet));
-            b->sendPreview (packet, len);
-            pumpMessages (3);
+            from->sendAudio (kind, packet, len);
+        };
 
-            received = a->previewBuffer()->pop (out.data(), outLen);
+        auto& table = a->remoteStreams();
+
+        auto slotFor = [&table] (uint32_t clientId, StreamKind kind) -> RemoteStreamTable::Slot*
+        {
+            for (auto& slot : table.slots())
+                if (slot.key.load() == RemoteStreamTable::keyFor (clientId, kind))
+                    return &slot;
+
+            return nullptr;
+        };
+
+        // 20 interleaved packets per sender, inside one 80 ms jitter window.
+        uint16_t seqB = 0, seqC = 1000;
+
+        for (int i = 0; i < 20; ++i)
+        {
+            send (b, StreamKind::voice, 1, seqB++, 48);
+            send (*c, StreamKind::voice, 2, seqC++, 48);
+            juce::Thread::sleep (2);
         }
 
-        expect (received, "A pops a preview block");
-        expectEquals (outLen, 48);
-        expect (std::equal (payload.begin(), payload.end(), out.begin()));
+        expect (waitUntil ([&] { return slotFor (idB, StreamKind::voice) != nullptr && slotFor (idC, StreamKind::voice) != nullptr; },
+                           3000), "A claims one slot per sender");
+        juce::Thread::sleep (200);
+
+        auto* sb = slotFor (idB, StreamKind::voice);
+        auto* sc = slotFor (idC, StreamKind::voice);
+        expect (sb != nullptr && sc != nullptr && sb != sc);
+
+        if (sb == nullptr || sc == nullptr)
+            return;
+
+        std::array<uint8_t, 96> out {};
+        int len = 0;
+
+        for (auto [slot, marker] : { std::pair { sb, 1 }, std::pair { sc, 2 } })
+        {
+            const auto generation = slot->generation.load();
+            int popped = 0, last = -1;
+            bool ordered = true;
+
+            for (int i = 0; i < 20; ++i)
+            {
+                if (! slot->pop (generation, out.data(), len))
+                    continue;
+
+                const int seq = out[1];
+                ordered = ordered && len == 48 && out[0] == marker && seq > last;
+                last = seq;
+                ++popped;
+            }
+
+            expect (ordered, "only this sender's blocks, in sequence order");
+            expect (popped >= 15, "popped " + juce::String (popped) + " of 20");
+        }
+
+        // The instrument stream of the same sender gets its own slot.
+        expect (waitUntil ([&]
+        {
+            send (b, StreamKind::instrument, 3, (uint16_t) (seqB++ + 30000), 96);
+            return slotFor (idB, StreamKind::instrument) != nullptr;
+        }, 3000), "B's instrument stream is a separate slot");
+
+        // C leaves: presence frees its slot well before the 5 s idle release.
+        c->client->disconnect();
+        c.reset();
+        expect (waitUntil ([&] { return slotFor (idC, StreamKind::voice) == nullptr; }, 2500), "C's slot is released");
+        expect (slotFor (idB, StreamKind::voice) != nullptr);
 
         a->disconnect();
         b->disconnect();
+        expectEquals (table.activeCount(), 0);
         host.stop();
     }
 

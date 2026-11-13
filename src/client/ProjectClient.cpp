@@ -20,6 +20,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 
 namespace ensayo
@@ -39,7 +40,9 @@ namespace
     constexpr int maxUploadFailures = 3;
     constexpr juce::uint32 welcomeTimeoutMs = 10000;
     constexpr juce::uint32 controlSilenceMs = 15000;   // the host answers a ping every second
+    constexpr int flagsOffset = 2;                        // magic, version, flags
     constexpr int clientIdOffset = 6;                     // magic, version, flags, frameCode, seq u16, clientId u32
+    constexpr double sweepIntervalMs = 250.0;             // idle live-audio streams are released this often
 
     juce::var object (std::initializer_list<std::pair<const char*, juce::var>> fields)
     {
@@ -245,7 +248,8 @@ juce::File defaultCacheRoot()
 //   writer   - LineWriter: every control-socket write
 //   data     - connects the data socket, sends data_hello, reads segments (→ TakeCache) and upload replies
 //   uploader - every data-socket write after data_hello: one segment at a time, the next one after its reply
-//   udp      - preview receive (→ previewBuffer) with a nested send thread (sendPreview queue + keepalive)
+//   udp      - live audio receive (→ remoteStreams, plus their idle sweep) with a nested send thread (sendAudio
+//              queues + keepalive)
 // Callbacks reach the message thread through post(), tagged with the connection's generation.
 struct ProjectClient::Impl
 {
@@ -271,8 +275,6 @@ struct ProjectClient::Impl
 
     Impl (ProjectClient& o, ClientConfig c)
         : owner (o), config (std::move (c)),
-          preview (codedBytesStereo (FrameSize::f128), 128.0 / 48.0),
-          outgoing (64),
           generation (std::make_shared<std::atomic<int>> (0))
     {
        #if JUCE_WINDOWS
@@ -310,7 +312,7 @@ struct ProjectClient::Impl
     std::atomic<int> ping { -1 };
     std::atomic<uint32_t> clientId { 0 };
     std::atomic<int64_t> downloaded { 0 };
-    std::atomic<bool> listening { false }, canSend { false }, dataReady { false };
+    std::atomic<bool> canSend { false }, dataReady { false };
     int connectionGeneration = 0;
     int resyncAttempts = 0;
     static constexpr int maxResyncAttempts = 3;
@@ -330,8 +332,9 @@ struct ProjectClient::Impl
     std::shared_ptr<LineWriter> writer;
     std::unique_ptr<FnThread> control, data, uploader, udp;
 
-    JitterBuffer preview;
-    PacketQueue outgoing;
+    RemoteStreamTable streams;              // filled by the udp thread; cleared only while it is stopped
+    std::set<uint32_t> onlineClients;       // message thread: clientIds of the latest presence
+    std::array<PacketQueue, 2> outgoing;    // per StreamKind: one producer each (the engine's encoder threads)
     void* sendWake = nullptr;
    #if JUCE_WINDOWS
     std::atomic<SOCKET> udpSocket { INVALID_SOCKET };
@@ -738,7 +741,7 @@ struct ProjectClient::Impl
         downloaded.store (0);
         ping.store (-1);
         clientId.store (0);
-        preview.reset();
+        streams.clear();
         connectionGeneration = generation->load();
 
         controlSocket = std::make_unique<juce::StreamingSocket>();
@@ -794,6 +797,8 @@ struct ProjectClient::Impl
 
         oldWriter = nullptr;
         stopUdp();
+        streams.clear();
+        onlineClients.clear();
 
         controlSocket = nullptr;
         dataSocket = nullptr;
@@ -1070,9 +1075,6 @@ struct ProjectClient::Impl
         data->startThread();
         startUdp();
 
-        if (listening.load())
-            sendLine (object ({ { "t", "listen" }, { "enabled", true } }));
-
         if (owner.onWelcomeForTest != nullptr)
             owner.onWelcomeForTest();
 
@@ -1203,6 +1205,7 @@ struct ProjectClient::Impl
                 p.user = u["id"].toString();
                 p.name = u["name"].toString();
                 p.online = (bool) u["online"];
+                p.clientId = p.online ? (uint32_t) readInteger (u["clientId"], 1, 0x7fffffff).value_or (0) : 0u;
                 users.push_back (p);
 
                 const auto& rec = u["recording"];
@@ -1213,6 +1216,20 @@ struct ProjectClient::Impl
         }
 
         presenceList = std::move (users);
+
+        // A sender that was online and is not any more frees its live-audio slots now rather than after 5 s of
+        // silence. Only departures: a joiner's datagrams may arrive before the presence that lists it.
+        std::set<uint32_t> online;
+
+        for (const auto& p : presenceList)
+            if (p.clientId != 0)
+                online.insert (p.clientId);
+
+        for (const auto id : onlineClients)
+            if (online.count (id) == 0)
+                streams.releaseClient (id);
+
+        onlineClients = std::move (online);
 
         // Presence is authoritative for who is recording: joiners learn recordings in progress, and a recorder that
         // dropped out disappears.
@@ -1592,6 +1609,9 @@ struct ProjectClient::Impl
         setsockopt (sock, SOL_SOCKET, SO_RCVBUF, (const char*) &bufferBytes, sizeof (bufferBytes));
         setsockopt (sock, SOL_SOCKET, SO_SNDBUF, (const char*) &bufferBytes, sizeof (bufferBytes));
 
+        const DWORD receiveTimeoutMs = (DWORD) sweepIntervalMs;   // wakes up to release idle streams
+        setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, (const char*) &receiveTimeoutMs, sizeof (receiveTimeoutMs));
+
         sockaddr_in local {};
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = htonl (INADDR_ANY);
@@ -1611,19 +1631,29 @@ struct ProjectClient::Impl
             sender.startThread (juce::Thread::Priority::highest);
 
             std::vector<uint8_t> incoming (2048);
+            double nextSweep = juce::Time::getMillisecondCounterHiRes() + sweepIntervalMs;
 
             while (! t.threadShouldExit())
             {
                 sockaddr_in from {};
                 int fromLen = sizeof (from);
                 const int n = recvfrom (sock, (char*) incoming.data(), (int) incoming.size(), 0, (sockaddr*) &from, &fromLen);
+                const auto now = juce::Time::getMillisecondCounterHiRes();
+
+                if (now >= nextSweep)
+                {
+                    streams.sweep (now);
+                    nextSweep = now + sweepIntervalMs;
+                }
 
                 if (n < 0)
                 {
                     if (t.threadShouldExit())
                         break;
 
-                    if (WSAGetLastError() != WSAEMSGSIZE)
+                    const int error = WSAGetLastError();
+
+                    if (error != WSAEMSGSIZE && error != WSAETIMEDOUT)
                         juce::Thread::sleep (1);
 
                     continue;
@@ -1636,7 +1666,7 @@ struct ProjectClient::Impl
 
                 const auto* payload = view.voiceLen > 0 ? view.voice : view.instrument;
                 const auto len = view.voiceLen > 0 ? view.voiceLen : view.instrumentLen;
-                preview.push (view.seq, payload, len, juce::Time::getMillisecondCounterHiRes());
+                streams.push (view.clientId, streamKindOf (view.flags), view.seq, payload, len, now);
             }
 
             sender.signalThreadShouldExit();
@@ -1663,20 +1693,24 @@ struct ProjectClient::Impl
             const auto id = clientId.load (std::memory_order_relaxed);
             size_t len = 0;
 
-            while (outgoing.pop (packet.data(), len))
+            for (auto& queue : outgoing)
             {
-                if (sock == INVALID_SOCKET || len < audioHeaderBytes || packet[0] != packetMagic)
-                    continue;
+                while (queue.pop (packet.data(), len))
+                {
+                    if (sock == INVALID_SOCKET || id == 0 || len < audioHeaderBytes || packet[0] != packetMagic)
+                        continue;
 
-                for (int i = 0; i < 4; ++i)   // the client stamps its own id (u32 little-endian)
-                    packet[(size_t) (clientIdOffset + i)] = (uint8_t) (id >> (8 * i));
+                    for (int i = 0; i < 4; ++i)   // the client stamps its own id (u32 little-endian)
+                        packet[(size_t) (clientIdOffset + i)] = (uint8_t) (id >> (8 * i));
 
-                sendto (sock, (const char*) packet.data(), (int) len, 0, (const sockaddr*) &server, sizeof (server));
+                    sendto (sock, (const char*) packet.data(), (int) len, 0, (const sockaddr*) &server, sizeof (server));
+                }
             }
 
             const auto now = juce::Time::getMillisecondCounter();
 
-            if (listening.load() && sock != INVALID_SOCKET && id != 0 && now >= nextKeepalive)
+            // Always on: the host relays the others' live audio to every peer whose UDP endpoint it knows.
+            if (sock != INVALID_SOCKET && id != 0 && now >= nextKeepalive)
             {
                 const uint8_t keepalive[5] = { 0x00, (uint8_t) id, (uint8_t) (id >> 8), (uint8_t) (id >> 16), (uint8_t) (id >> 24) };
                 sendto (sock, (const char*) keepalive, (int) sizeof (keepalive), 0, (const sockaddr*) &server, sizeof (server));
@@ -1891,22 +1925,16 @@ void ProjectClient::finishTake (const Id& take, const Id& track, const Region& r
     impl->reconcile();
 }
 
-void ProjectClient::setListening (bool enabled)
+void ProjectClient::sendAudio (StreamKind kind, const uint8_t* packet, size_t len) noexcept
 {
-    impl->listening.store (enabled);
+    if (packet == nullptr || len < audioHeaderBytes || len > maxPacketBytes || packet[0] != packetMagic)
+        return;
 
-    if (impl->welcomed)
-        impl->sendLine (object ({ { "t", "listen" }, { "enabled", enabled } }));
+    std::array<uint8_t, maxPacketBytes> stamped;
+    std::memcpy (stamped.data(), packet, len);
+    stamped[flagsOffset] = withStreamKind (stamped[flagsOffset], kind);
 
-   #if JUCE_WINDOWS
-    if (impl->sendWake != nullptr)
-        SetEvent ((HANDLE) impl->sendWake);
-   #endif
-}
-
-void ProjectClient::sendPreview (const uint8_t* packet, size_t len) noexcept
-{
-    if (! impl->outgoing.push (packet, len))
+    if (! impl->outgoing[(size_t) kind].push (stamped.data(), len))
         return;
 
    #if JUCE_WINDOWS
@@ -1957,7 +1985,17 @@ void ProjectClient::discardTake (const Id& take)
     impl->postTransfers();
 }
 
-JitterBuffer* ProjectClient::previewBuffer() noexcept   { return &impl->preview; }
+RemoteStreamTable& ProjectClient::remoteStreams() noexcept   { return impl->streams; }
+
+Id ProjectClient::userForClient (uint32_t clientId) const
+{
+    for (const auto& p : impl->presenceList)
+        if (p.online && p.clientId != 0 && p.clientId == clientId)
+            return p.user;
+
+    return {};
+}
+
 std::vector<Presence> ProjectClient::presence() const   { return impl->presenceList; }
 std::vector<LiveRecording> ProjectClient::liveRecordings() const   { return impl->live; }
 

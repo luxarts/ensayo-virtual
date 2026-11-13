@@ -376,7 +376,15 @@ juce::Result SessionController::startTake (const Id& trackId)
             });
     };
 
-    engine.onPreviewPacket = [c] (const uint8_t* packet, size_t len) { c->sendPreview (packet, len); };
+    engine.onPreviewPacket = [c] (const uint8_t* packet, size_t len)
+    {
+        // Transitional: the take's live preview goes out as the stream of its kind (mono = voice, stereo =
+        // instrument) until the engine sends the always-on voice chat itself.
+        AudioPacketView view;
+
+        if (decodeAudioPacket (packet, len, view))
+            c->sendAudio (streamKindOf (view.flags), packet, len);
+    };
 
     const auto started = engine.startRecording (*track, take, wav);
 
@@ -470,9 +478,10 @@ void SessionController::setListening (bool enabled)
     if (client == nullptr)
         return;
 
+    // Transitional: the host relays everyone's live audio to everyone now (no listen request) and the client keeps
+    // one jitter buffer per sender (ProjectClient::remoteStreams); the engine does not mix those yet, so this flag
+    // only records the user's choice.
     listening = enabled;
-    client->setListening (enabled);
-    engine.setPreviewBuffer (enabled ? client->previewBuffer() : nullptr);
 }
 
 //==============================================================================

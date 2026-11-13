@@ -1,6 +1,6 @@
 #pragma once
 #include "core/Project.h"
-#include "core/JitterBuffer.h"
+#include "core/RemoteStreams.h"
 #include "client/TakeCache.h"
 #include "client/SessionLink.h"
 #include <functional>
@@ -11,7 +11,7 @@ struct ClientConfig { juce::File cacheRoot; Id user; juce::String userName; };  
 juce::File defaultCacheRoot();
 
 struct LiveRecording { Id user, take, track; int64_t start = 0; std::vector<Peak> peaks; };
-struct Presence { Id user; juce::String name; bool online = false; };
+struct Presence { Id user; juce::String name; bool online = false; uint32_t clientId = 0; };   // clientId: online only
 struct Transfers { int pendingUploads = 0; int downloadingTakes = 0; int pendingTakes = 0; };   // pendingTakes: own takes not yet complete with their region
 // A take of this user that was begun (beginTake) but never finished (the app stopped mid-recording).
 struct UnfinishedTake { Id take, track; int64_t start = 0, offset = 0; int channels = 0; int64_t samples = 0; };
@@ -50,9 +50,16 @@ public:
     std::vector<UnfinishedTake> unfinishedTakes() const;
     // Message thread: forgets a pending take and its files and sends rec_stop, so no one keeps showing it as recording.
     void discardTake (const Id& take);
-    void setListening (bool);
-    void sendPreview (const uint8_t* packet, size_t len) noexcept;   // any thread (UDP)
-    JitterBuffer* previewBuffer() noexcept;                           // mix-free: datagrams from whoever records
+    // Live audio (voice chat, live instrument). Sends one encoded datagram (encodeAudioPacket) of stream `kind`; the
+    // client stamps its own clientId and the kind's flag bit. Real-time safe; at most one calling thread per kind.
+    // Dropped while not connected or when the per-kind queue is full.
+    void sendAudio (StreamKind kind, const uint8_t* packet, size_t len) noexcept;
+    // What the others send, one jitter buffer per (sender clientId, kind); see RemoteStreamTable for the threading.
+    // The table lives as long as this client; slots are freed after 5 s of silence, when presence says the sender
+    // left, and on every connect / disconnect.
+    RemoteStreamTable& remoteStreams() noexcept;
+    // Message thread: the online user behind a UDP clientId, from the latest presence (empty if unknown).
+    Id userForClient (uint32_t clientId) const;
     std::vector<Presence> presence() const;
     std::vector<LiveRecording> liveRecordings() const;
     Transfers transfers() const;
