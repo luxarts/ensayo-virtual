@@ -12,6 +12,7 @@
     "transport.bpm", "transport.meter", "transport.click", "transport.countin",
     "edit.split", "edit.delete", "daw.export", "timeline", "timeline.ruler",
     "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
+    "track.1", "track.2", "track.3", "track.4",
     "track.1.color", "track.1.name", "track.1.author", "track.1.kind", "track.1.mute", "track.1.solo", "track.1.arm",
     "track.1.volume", "track.1.volume.text", "track.1.pan", "track.1.pan.text",
     "track.2.color", "track.2.name", "track.2.author", "track.2.kind", "track.2.mute", "track.2.solo", "track.2.arm",

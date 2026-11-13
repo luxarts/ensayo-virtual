@@ -1,7 +1,8 @@
 # 1. `--screenshot <dir>`: renders lobby.png, session.png and controls.json; every control named in
 #    expected-controls.json must be present, visible and have w/h > 0.
 # 2. `--demo`: launches the real window, captures it with PrintWindow (CopyFromScreen as fallback) to
-#    out\shots\demo-window.png for visual inspection, then kills it.
+#    out\shots\demo-window.png for visual inspection, then kills it. That part is skipped (with the reason) when an
+#    Ensayo Virtual is already running, since --demo would only forward to it; the running app is never touched.
 # Prints SKIP when the build has no screenshot mode (exit code 2).
 param ([string] $BuildDir = 'build', [string] $Config = 'Release')
 
@@ -139,27 +140,57 @@ try
     }
 
     # ---- 2. real window capture of --demo
-    $demo = Start-Proc -Name 'demo' -FilePath $bin.Client -RunDir $run -Arguments @('--demo')
-    $procs += $demo
-
-    $handle = [IntPtr]::Zero
-    $deadline = (Get-Date).AddSeconds(15)
-    while ($handle -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+    # A running Ensayo Virtual (the user's own, not started here) makes --demo hand its arguments to that instance and
+    # exit instead of opening a window: that part is skipped, and the user's app is left alone.
+    $demoSkip = $null
+    $running = @(Get-Process -Name 'Ensayo Virtual', 'EnsayoVirtual' -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0)
     {
-        Start-Sleep -Milliseconds 250
-        $demo.Process.Refresh()
-        if ($demo.Process.HasExited) { throw "--demo exited early with code $($demo.Process.ExitCode) (another instance already running?)" }
-        $handle = $demo.Process.MainWindowHandle
+        $demoSkip = "Ensayo Virtual is already running (pid $(($running | ForEach-Object { $_.Id }) -join ', ')), so --demo would only forward to it"
     }
-    Assert ($handle -ne [IntPtr]::Zero) '--demo never showed a main window'
+    else
+    {
+        $demo = Start-Proc -Name 'demo' -FilePath $bin.Client -RunDir $run -Arguments @('--demo')
+        $procs += $demo
 
-    Start-Sleep -Seconds 2   # let the demo session render
-    $capture = Join-Path $shots 'demo-window.png'
-    $size = Save-WindowCapture $handle $capture
-    Assert ((Get-Item $capture).Length -gt 0) 'demo-window.png is empty'
-    Write-Host ("  demo-window.png captured ({0}x{1}) at {2}" -f $size.Width, $size.Height, $capture)
+        $handle = [IntPtr]::Zero
+        $deadline = (Get-Date).AddSeconds(15)
+        while ($handle -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+        {
+            Start-Sleep -Milliseconds 250
+            $demo.Process.Refresh()
+            if ($demo.Process.HasExited) { break }
+            $handle = $demo.Process.MainWindowHandle
+        }
 
-    Stop-Procs @($demo)
+        if ($demo.Process.HasExited -and $handle -eq [IntPtr]::Zero)
+        {
+            Assert ($demo.Process.ExitCode -eq 0) "--demo exited early with code $($demo.Process.ExitCode)"
+            $demoSkip = '--demo exited without a window (another instance took the arguments)'
+        }
+        else
+        {
+            Assert ($handle -ne [IntPtr]::Zero) '--demo never showed a main window'
+
+            Start-Sleep -Seconds 2   # let the demo session render
+            $capture = Join-Path $shots 'demo-window.png'
+            $size = Save-WindowCapture $handle $capture
+            Assert ((Get-Item $capture).Length -gt 0) 'demo-window.png is empty'
+            Write-Host ("  demo-window.png captured ({0}x{1}) at {2}" -f $size.Width, $size.Height, $capture)
+        }
+
+        Stop-Procs @($demo)
+    }
+
+    if ($null -ne $demoSkip)
+    {
+        Write-Host "  demo window: SKIP ($demoSkip)"
+        Write-Host "  result: controls OK; demo window SKIP"
+    }
+    else
+    {
+        Write-Host "  result: controls OK; demo window captured"
+    }
 
     if ($null -ne $skipReason)
     {

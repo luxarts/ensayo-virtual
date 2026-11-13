@@ -2,6 +2,7 @@
 #include "client/SessionController.h"
 #include "client/Offline.h"
 #include "client/SessionLink.h"
+#include "client/YouTubeImporter.h"
 #include "core/MessagePump.h"
 #include "ui/Text.h"
 
@@ -29,8 +30,18 @@ namespace ensayo
 // Stdout from a GUI-subsystem exe: the CRT's std::cout is bound to nothing unless the parent redirected the
 // standard handles, so write straight to the inherited handle. GetStdHandle returns the pipe/file the parent
 // gave us even for a /SUBSYSTEM:WINDOWS process; when there is none, try attaching to the parent's console.
+static std::function<void (const juce::String&)> outputCopyForTest;
+
+void setHeadlessOutputCopyForTest (std::function<void (const juce::String&)> copy)
+{
+    outputCopyForTest = std::move (copy);
+}
+
 void headlessPrint (const juce::String& line)
 {
+    if (outputCopyForTest != nullptr)
+        outputCopyForTest (line);
+
     const auto text = (line + "\n").toStdString();
 
    #if JUCE_WINDOWS
@@ -280,6 +291,18 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
             if (! needValue (arg)) return std::nullopt;
             o.importFile = fileArgument (value);
         }
+        else if (arg == "--import-url")
+        {
+            if (! needValue (arg)) return std::nullopt;
+
+            if (! YouTubeImporter::looksLikeYouTubeUrl (value))
+            {
+                error = "--import-url needs a YouTube URL";
+                return std::nullopt;
+            }
+
+            o.importUrl = value;
+        }
         else if (arg == "--ops")
         {
             if (! needValue (arg)) return std::nullopt;
@@ -330,7 +353,7 @@ std::optional<HeadlessOptions> parseHeadlessOptions (const juce::StringArray& ar
         return std::nullopt;
     }
 
-    if (! o.hasSession() && (! o.addTracks.empty() || o.recordTrack.isNotEmpty() || o.importFile != juce::File()
+    if (! o.hasSession() && (! o.addTracks.empty() || o.recordTrack.isNotEmpty() || o.importFile != juce::File() || o.importUrl.isNotEmpty()
                              || o.opsFile != juce::File() || o.waitTakes > 0 || o.resume || o.exportFile != juce::File()
                              || o.dumpProject != juce::File()))
     {
@@ -513,6 +536,7 @@ int runHeadless (const HeadlessOptions& o)
     int64_t lastVersion = -1;
     juce::String failure;
     std::set<Id> completeSeen, completePrinted, cachedPrinted;
+    std::map<Id, int> partialPrinted;
     bool takesKnown = false;
     std::optional<juce::Result> importResult;
 
@@ -541,7 +565,22 @@ int runHeadless (const HeadlessOptions& o)
         for (const auto& take : p->takes)
         {
             if (! take.complete)
+            {
+                // Segments of a take still being recorded arrive one by one: report each new count.
+                if (cache != nullptr)
+                {
+                    const int have = cache->segmentCount (take.id);
+                    auto& printed = partialPrinted[take.id];
+
+                    if (have > printed)
+                    {
+                        printed = have;
+                        headlessPrint ("cached " + take.id + " " + juce::String (have));
+                    }
+                }
+
                 continue;
+            }
 
             if (takesKnown && completeSeen.count (take.id) == 0 && completePrinted.insert (take.id).second)
                 headlessPrint ("take_complete " + take.id + " " + juce::String ((juce::int64) take.samples));
@@ -680,16 +719,57 @@ int runHeadless (const HeadlessOptions& o)
         sendAndWait (Ops::addTrack (newId(), track.name, track.kind), "add_track " + track.name);
     }
 
-    if (o.importFile != juce::File() && ! failed)
+    const auto importOne = [&] (const juce::File& file)
     {
         ownTakes = true;
+        importResult.reset();
 
-        if (const auto started = session.importFile (o.importFile); started.failed())
+        if (const auto started = session.importFile (file); started.failed())
             markFailed (started.getErrorMessage());
         else if (! waitUntil ([&] { return importResult.has_value(); }, 600000.0, isFailed))
-            markFailed ("timed out importing " + o.importFile.getFullPathName());
+            markFailed ("timed out importing " + file.getFullPathName());
         else if (importResult->failed())
             markFailed (importResult->getErrorMessage());
+    };
+
+    if (o.importFile != juce::File() && ! failed)
+        importOne (o.importFile);
+
+    if (o.importUrl.isNotEmpty() && ! failed)
+    {
+        // The same path as "Importar de YouTube": yt-dlp (+ deno) from tools\, then a normal import of the file.
+        const auto ytDlp = YouTubeImporter::findYtDlp ({});
+
+        if (ytDlp == juce::File())
+        {
+            markFailed ("youtube: yt-dlp not found (tools\\yt-dlp.exe next to the program)");
+        }
+        else
+        {
+            YouTubeImporter importer;
+            std::optional<juce::File> downloaded;
+            juce::String downloadError;
+            importer.onFinished = [&] (const juce::File& file) { downloaded = file; };
+            importer.onError = [&] (const juce::String& e) { downloadError = e.isNotEmpty() ? e : juce::String ("download failed"); };
+            importer.start (ytDlp, o.importUrl, cacheDir.getChildFile ("youtube"), YouTubeImporter::findDeno (ytDlp));
+
+            if (! waitUntil ([&] { return downloaded.has_value() || downloadError.isNotEmpty(); }, 600000.0, isFailed))
+            {
+                importer.cancel();
+
+                if (! failed)
+                    markFailed ("youtube: timed out downloading " + o.importUrl);
+            }
+            else if (! downloaded)
+            {
+                markFailed ("youtube: " + downloadError);
+            }
+            else
+            {
+                headlessPrint ("downloaded " + downloaded->getFullPathName());
+                importOne (*downloaded);
+            }
+        }
     }
 
     if (o.recordTrack.isNotEmpty() && ! failed)

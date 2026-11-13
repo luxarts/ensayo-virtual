@@ -9,6 +9,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <cmath>
 #include <functional>
+#include <set>
 
 namespace ensayo
 {
@@ -17,7 +18,7 @@ class HeadlessClientTests : public juce::UnitTest
 public:
     HeadlessClientTests() : juce::UnitTest ("HeadlessClient", "EnsayoVirtual") {}
 
-    static constexpr int recordPort = 22252, resumePort = 22253, hostPort = 22254, deadPort = 22255;
+    static constexpr int recordPort = 22252, resumePort = 22253, hostPort = 22254, deadPort = 22255, growPort = 22260;
 
     static bool waitFor (const std::function<bool()>& predicate, int timeoutMs)
     {
@@ -123,6 +124,9 @@ public:
             const auto d = parse ({ "--host", "proj" });
             expect (d.has_value() && d->hostPort == defaultPort);
 
+            const auto y = parse ({ "--host", "proj", "--import-url", "https://www.youtube.com/watch?v=jNQXAC9IVRw" });
+            expect (y.has_value() && y->importUrl == "https://www.youtube.com/watch?v=jNQXAC9IVRw" && y->importFile == juce::File());
+
             const auto c = parse ({ "--calibrate", "--fake-audio", "loopback", "--latency-in", "200", "--latency-out", "264" });
             expect (c.has_value() && c->calibrate && ! c->hasSession(), "--calibrate runs without a session");
         }
@@ -168,6 +172,9 @@ public:
             rejects ({ "--host", "p", "--mic", "64" }, "mic channel out of range");
             rejects ({ "--host", "p", "--out", "-1" }, "negative output pair");
             rejects ({ "--calibrate", "--resume" }, "resume needs a session");
+            rejects ({ "--host", "p", "--import-url", "https://example.com/v.m4a" }, "--import-url accepts only YouTube URLs");
+            rejects ({ "--host", "p", "--import-url" }, "--import-url without a URL");
+            rejects ({ "--calibrate", "--import-url", "https://youtu.be/jNQXAC9IVRw" }, "--import-url needs a session");
 
             for (const auto* removed : { "--simulate-loss", "--role", "--probe", "--emit-log", "--compare", "--track", "--stats" })
                 rejects ({ "--host", "p", removed, "1" }, juce::String ("removed flag ") + removed);
@@ -506,6 +513,70 @@ public:
 
             if (o)
                 expectEquals (runHeadless (*o), 0);
+        }
+
+        beginTest ("runHeadless prints cached <take> <k> while the segments of a take still being recorded arrive");
+        {
+            const auto dir = tempDir ("growing");
+            ProjectHost host ({ growPort, 8 });
+            expect (host.start (dir.getChildFile ("project"), newId(), "Host", "Crecer").wasOk());
+            const SessionLink link { "127.0.0.1", growPort, host.getSessionId() };
+
+            ProjectClient rec ({ dir.getChildFile ("rec-cache"), newId(), "Rita" });
+            bool connected = false;
+            rec.onConnected = [&] { connected = true; };
+            rec.connect (link);
+            expect (waitFor ([&] { return connected; }, 8000));
+            const auto track = newId(), take = newId();
+            rec.sendOp (Ops::addTrack (track, "Voz", TrackKind::voice));
+            expect (waitFor ([&] { return rec.project()->findTrack (track) != nullptr; }, 5000));
+            rec.beginTake (take, 1, track, 0);
+
+            // Once the observer is in, one 1 s segment every 400 ms, then the take is finished.
+            struct Feeder : juce::Timer { std::function<void()> tick; void timerCallback() override { tick(); } } feeder;
+            int next = 0;
+            feeder.tick = [&]
+            {
+                if (next < 4)
+                {
+                    rec.queueSegment (take, next, sineSegment (48000, 440.0f));
+                    ++next;
+                    return;
+                }
+
+                feeder.stopTimer();
+                rec.finishTake (take, track, { newId(), take, 0, 0, 4 * 48000 });
+            };
+
+            juce::StringArray lines;
+            setHeadlessOutputCopyForTest ([&] (const juce::String& line)
+            {
+                lines.add (line);
+
+                if (line.startsWith ("welcome "))
+                    feeder.startTimer (400);
+            });
+
+            const auto o = parse ({ "--join", link.toString(), "--cache", dir.getChildFile ("cache").getFullPathName(),
+                                    "--wait-takes", "1", "--duration", "30" });
+
+            if (o)
+                expectEquals (runHeadless (*o), 0);
+
+            setHeadlessOutputCopyForTest (nullptr);
+            feeder.stopTimer();
+
+            const int completeAt = lines.indexOf ("take_complete " + take + " " + juce::String (4 * 48000));
+            expect (completeAt >= 0, "no take_complete: " + lines.joinIntoString (" | "));
+            std::set<juce::String> partial;
+
+            for (int i = 0; i < completeAt; ++i)
+                if (lines[i].startsWith ("cached " + take + " "))
+                    partial.insert (lines[i].fromLastOccurrenceOf (" ", false, false));
+
+            expect (partial.size() >= 3, "segment counts seen before the take was complete: " + lines.joinIntoString (" | "));
+            expect (lines.contains ("cached " + take + " 4"), "the complete take is reported as cached");
+            host.stop();
         }
 
         beginTest ("runHeadless --join to a dead host fails cleanly");

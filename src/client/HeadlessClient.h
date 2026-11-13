@@ -2,6 +2,7 @@
 #include "core/Project.h"
 #include "client/FakeAudioDevice.h"
 #include <juce_core/juce_core.h>
+#include <functional>
 #include <optional>
 #include <vector>
 namespace ensayo
@@ -27,6 +28,9 @@ namespace ensayo
 //                                    --host/--join the run ends there.
 //   --add-track voice|instrument <name>   adds a track of mine (repeatable), waits until applied
 //   --import <file>                  imports the file as a new `imported` track (region at 0), waits until queued
+//   --import-url <url>               downloads a YouTube URL with tools\yt-dlp (+ deno), as "Importar de YouTube" does,
+//                                    prints "downloaded <file>" and imports it like --import (after --import when
+//                                    both are given); a failed download prints "error youtube: <reason>"
 //   --record <trackName> --at <seconds> --for <seconds>   records on that track (mine) from timeline position --at for
 //                                    --for seconds of device time; count-in and click are off
 //   --ops <jsonl>                    one op object per line, sent in order (each waits until applied or rejected)
@@ -42,9 +46,10 @@ namespace ensayo
 // host, wait-takes or the duration, export, dump, hash.
 //
 // Stdout lines: "link <ensayo://...>", "welcome <session> host|guest", "applied <version>" (every version after the
-// welcome's), "rejected <reason>", "take_complete <take> <samples>" (a take that became complete during the run, and every
+// welcome's), "rejected <reason>", "downloaded <file>" (--import-url), "take_complete <take> <samples>" (a take that became complete during the run, and every
 // take finished by --resume), "cached <take> <segments>" (a complete take fully in the local cache, once each, also the
-// ones already complete at the welcome), "calibration <samples>", "exported <wav>", "project_hash <sha1>" (at exit),
+// ones already complete at the welcome; and, for a take that is not complete yet, each time the number of its segments
+// in the local cache grows, so segments that arrive while it is being recorded show up), "calibration <samples>", "exported <wav>", "project_hash <sha1>" (at exit),
 // "error <text>". Returns 0 on success, 1 on a runtime failure, 2 on bad arguments.
 struct HeadlessOptions
 {
@@ -64,6 +69,8 @@ struct HeadlessOptions
     std::vector<NewTrack> addTracks;                                // --add-track kind name (repeatable)
     juce::String recordTrack; double recordAt = 0.0, recordFor = 0.0;   // --record <track> --at S --for S
     juce::File importFile, opsFile, exportFile, dumpProject;        // --import, --ops, --export, --dump-project
+    juce::String importUrl;                                         // --import-url <YouTube url>
+
     int waitTakes = 0;                                              // --wait-takes N (0 = no wait)
     double durationSeconds = 10.0; bool durationGiven = false;      // --duration S
 
@@ -75,4 +82,6 @@ int runHeadless (const HeadlessOptions&);   // message thread with JUCE initiali
 // Writes one line to the process's standard output. Works from the GUI-subsystem exe when its stdout is
 // redirected by the parent (Start-Process -RedirectStandardOutput) and from console apps.
 void headlessPrint (const juce::String& line);
+// Tests: every line headlessPrint writes is also handed to `copy` (message thread; nullptr to stop).
+void setHeadlessOutputCopyForTest (std::function<void (const juce::String&)> copy);
 }

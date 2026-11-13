@@ -1,31 +1,41 @@
 # Ensayo Virtual
 
-Ensayo de banda online con baja latencia, escrito desde cero en C++20 / JUCE 8, al estilo de
-Jamulus: cada músico entra con nombre y rol, usa su interfaz **ASIO** con dos entradas
-(micrófono e instrumento), puede poner un **VST3** sobre el instrumento, controla el volumen de
-cada integrante (voz e instrumento por separado) y de su propio monitoreo, y la banda comparte un
-**backing track** (MP3/WAV/FLAC/OGG o el audio de un video de YouTube) que suena sincronizado para
-todos.
+Grabador multipista colaborativo para bandas, escrito en C++20 / JUCE 8. Cada músico graba en su
+casa, con su interfaz **ASIO**, sobre lo que ya grabaron los demás; las tomas llegan a todos
+mientras se graban y cualquiera puede editar sus pistas (cortar, mover, recortar, volumen, paneo,
+mute). Al final se exporta la mezcla a WAV.
+
+No es un ensayo en vivo: tocar en tiempo real por internet chocaba con la latencia y el jitter de
+la red. Acá cada toma se graba localmente sin cortes y por la red viajan sólo archivos (FLAC) y
+operaciones de edición, por TCP, así que nada de lo grabado se pierde ni se desfasa.
 
 ```
-ASIO in mic ─────► voz ─────────────┬─► monitoreo local (0 ms) ─────┐
-ASIO in instr ───► VST3 ─► instr L/R ┤                             ├─► ASIO out
-                                    └─► Opus (64/128 muestras) ─► UDP ─► servidor ─► mezcla por cliente ─► UDP ─┘
-                                                      servidor: voces + instrumentos de los demás + backing track
+músico A (host)                                         músico B (invitado)
+┌───────────────────────────────┐   TCP control (ops)   ┌──────────────────────────────┐
+│ proyecto: project.json + tomas│◄─────────────────────►│ réplica del proyecto         │
+│ servidor embebido (ProjectHost│   TCP datos (FLAC)    │ caché local de tomas         │
+│ puerto 22140)                 │◄─────────────────────►│ graba en su PC, sube 1 s a   │
+│ graba, edita, reproduce       │   UDP "escuchar en    │ la vez mientras graba        │
+│                               │◄ ─ vivo" (opcional) ─►│                              │
+└───────────────────────────────┘                       └──────────────────────────────┘
 ```
 
-- Un paquete UDP por bloque de audio (64 o 128 muestras a 48 kHz), Opus en modo custom, CBR.
-- El servidor arma una mezcla distinta para cada cliente (con los faders de ese cliente) y lo
-  excluye de su propia mezcla: uno se escucha a sí mismo localmente sin latencia.
-- El backing track lo reproduce el servidor dentro de la mezcla, así todos lo escuchan alineado
-  con la banda.
-- Latencia medida en esta máquina entre dos procesos (bloques de 128): **≈ 25 ms** ida.
+- **El proyecto vive en la PC del host** (`%APPDATA%\EnsayoVirtual\projects\<id>\`). Cada invitado
+  guarda una copia en caché (`%LOCALAPPDATA%\EnsayoVirtual\cache\`) y puede seguir escuchando sin
+  conexión; para editar o grabar hace falta que el host esté conectado.
+- **Tomas progresivas**: mientras grabás, cada segundo de audio se codifica a FLAC 24 bits y se
+  sube; los demás lo ven crecer en rojo y lo reciben al instante. Al parar no hay que esperar.
+- **Alineación exacta**: la toma se ubica en la línea de tiempo compensando la latencia de entrada y
+  salida que reporta el driver más el desvío medido con **Calibrar latencia**.
+- **Permisos**: cada uno edita sus pistas; el host puede editar todo. Las pistas de otros muestran
+  un candado ("Bloq.").
 
-El diseño, las alternativas evaluadas (P2P, Opus estándar, resampling adaptativo, etc.) y el
-plan están en [`docs/specs/2026-11-04-ensayo-virtual-design.md`](docs/specs/2026-11-04-ensayo-virtual-design.md)
-y [`docs/plans/2026-11-04-ensayo-virtual.md`](docs/plans/2026-11-04-ensayo-virtual.md).
+El diseño y el plan están en
+[`docs/specs/2026-11-13-grabacion-multipista-design.md`](docs/specs/2026-11-13-grabacion-multipista-design.md)
+y [`docs/plans/2026-11-13-grabacion-multipista.md`](docs/plans/2026-11-13-grabacion-multipista.md);
+la verificación con números, en [`docs/plans/2026-11-13-verification.md`](docs/plans/2026-11-13-verification.md).
 
-> Solo Windows 10/11 x64.
+> Solo Windows 10/11 x64. Audio a 48 kHz.
 
 ## Compilar
 
@@ -35,13 +45,13 @@ Git. JUCE (`8.0.17-security`) y libopus (`v1.6.1`) se descargan solos en la prim
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release --target EnsayoVirtual EnsayoServer -- /m
+cmake --build build --config Release -- /m
 ```
 
 Binarios:
 
 ```
-build\EnsayoVirtual_artefacts\Release\Ensayo Virtual.exe
+build\EnsayoVirtual_artefacts\Release\Ensayo Virtual.exe      (+ tools\yt-dlp.exe y tools\deno.exe)
 build\EnsayoServer_artefacts\Release\EnsayoServer.exe
 ```
 
@@ -50,108 +60,175 @@ build\EnsayoServer_artefacts\Release\EnsayoServer.exe
 ```powershell
 cmake --build build --config Debug --target EnsayoTests -- /m
 .\build\EnsayoTests_artefacts\Debug\EnsayoTests.exe            # unitarias; exit 0 = todo OK
-.\tests\integration\run-all.ps1                                # dos instancias reales, latencia, backing track, capturas
+powershell -ExecutionPolicy Bypass -File tests\integration\run-all.ps1   # procesos reales (Release)
 ```
 
-Para aislar la red sin la app (UDP puro en el puerto 22140, con Ensayo Virtual cerrado):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\udp-test.ps1 -Listen              # en el host
-powershell -ExecutionPolicy Bypass -File tools\udp-test.ps1 -Send <IP del host>  # en el invitado
-```
-
-`run-all.ps1` levanta `EnsayoServer.exe` y dos clientes headless con dispositivo de audio falso,
-mide la latencia ida con clicks (emitidos en A, detectados en la salida de B), prueba el servidor
-embebido, la subida y reproducción del backing track, la pérdida de paquetes simulada, y genera
-capturas de la UI (`tests/integration/out/<run>/shots/`) verificando que cada control exista.
-`asio-loopback.ps1` usa hardware real: abre el driver ASIO (`-Driver`, por defecto el MiniFuse) en
-una instancia cuyas salidas LOOPBACK vuelven a sus entradas y mide la ida y vuelta completa
-(cliente falso → servidor → ASIO salida → loopback → ASIO entrada → servidor → cliente falso); se
-salta (SKIP) si el driver no está instalado.
+`run-all.ps1` levanta `EnsayoServer.exe` con un proyecto y varios clientes `--headless` con un
+dispositivo de audio falso: uno graba sobre la reproducción de otro (y se verifica que los clicks
+grabados caigan en la misma muestra que los originales), ediciones de tres clientes que terminan en
+el mismo proyecto, un cliente que se cae a mitad de una toma y la retoma, el host que se reinicia,
+importar un WAV y un video de YouTube y exportar la mezcla, y las capturas de la interfaz.
+`asio-calibration.ps1` usa hardware real (el loopback del Arturia MiniFuse) y se salta (SKIP) si
+el driver no está o no se puede abrir. Detalle en [`tests/integration/README.md`](tests/integration/README.md).
 
 ## Usar
 
-### Crear una sesión
+### Antes de empezar: audio y calibración
 
-1. Abrir **Ensayo Virtual**, poner **Nombre** y **Rol** (Voz / Instrumento / Instrumento + Voz).
-2. En **Audio** elegir el driver ASIO, frecuencia 48000 Hz, buffer 128 (o 64), canal de micrófono,
-   canal de instrumento y par de salida. **Panel ASIO** abre el panel del driver.
-3. Opcional: en **VST (instrumento)** elegir un plugin `.vst3` (amp sim, efectos), **Abrir editor**.
-4. **Crear sesión**. La app levanta el servidor embebido (puerto 22140 TCP y UDP) y muestra el link
-   `ensayo://<tu IP>:22140/XXXXXX`. **Copiar link** y mandarlo a la banda.
-   - Para gente fuera de tu red hay que abrir/redirigir el puerto 22140 (TCP y UDP) en el router,
-     y usar tu IP pública en el link.
-   - Alternativa: correr `EnsayoServer.exe --port 22140` en un VPS cercano a todos y que cada uno
-     se una a `ensayo://<ip del vps>:22140/NEW` (el primero crea la sesión; el link real aparece en
-     la ventana).
+1. Abrir **Ensayo Virtual** y poner tu **Nombre**.
+2. En **Audio** elegir el driver ASIO, buffer (256 por defecto; 128 o 64 también andan), canal de
+   micrófono, canal de instrumento y par de salida. La frecuencia es siempre 48000 Hz. **Panel
+   ASIO** abre el panel del driver.
+3. **Calibrar latencia** (una vez por interfaz y tamaño de buffer): conectá la salida elegida a la
+   entrada del micrófono con un cable (o usá el loopback de la interfaz, si tiene) y apretá el
+   botón. La app emite 8 clicks, los busca en la entrada y guarda el desvío respecto de lo que
+   reporta el driver ("Calibración: N muestras"). Sin calibrar también se graba alineado según el
+   driver; calibrar corrige a las placas que reportan mal su latencia.
+4. Opcional: en **VST (instrumento)** elegir un plugin `.vst3` (amp sim, efectos) para el
+   instrumento.
 
-### Unirse
+### Crear o abrir un proyecto (host)
+
+- **Crear sesión** crea un proyecto nuevo ("Proyecto dd-mm-aaaa HH.MM"), lo hostea en el puerto
+  22140 y te conecta. **Abrir proyecto…** lista los proyectos guardados (o busca un `project.json`
+  en otra carpeta) y lo hostea igual.
+- Arriba aparece el link `ensayo://<tu IP>:22140/XXXXXX`: **Copiar link** y mandarlo a la banda.
+  El link es el mismo cada vez que abrís ese proyecto.
+
+### Unirse (invitado)
 
 Pegar el link en **Link de sesión** y **Unirse**, o hacer clic en el link (la app registra el
-esquema `ensayo://` en el primer arranque; si ya está abierta, se une en la misma ventana).
+esquema `ensayo://` en el primer arranque; si ya está abierta, se une en la misma ventana). La app
+baja las tomas que falten; la barra de estado muestra "Subidas: n · Descargas: m".
 
-### Durante el ensayo
+### Grabar
 
-- **Yo (monitoreo)**: faders de tu voz y tu instrumento como los escuchás vos (no afectan a los
-  demás).
-- Por cada integrante: fader de **Voz** y de **Instrumento** + Mute (solo los que su rol envía).
-- **Backing track**: **Cargar archivo…** (WAV/MP3/FLAC/OGG) o pegar una **URL de YouTube** y
-  **Descargar**. El archivo se sube al servidor y el transporte (**Play/Pausa**, **Stop**, **Loop**,
-  posición) es compartido: todos escuchan lo mismo en el mismo momento. **Volumen** y **Mute** del
-  track son propios.
-- Barra de estado: ping, bloques del jitter buffer (cliente/servidor), latencia estimada total,
-  pérdida de paquetes, CPU. **Reintentar** reabre el dispositivo de audio tras un error.
+1. **+ Pista de voz** o **+ Pista de instrumento** (la voz graba el canal de micrófono en mono; el
+   instrumento, el canal de instrumento después del VST).
+2. Armar la pista con **●R**, poner el cursor donde querés entrar (clic en la regla o **|<**).
+3. **Grabar** (o la tecla **R**). Con **Cuenta** activada suena un compás antes; con **Click**,
+   el metrónomo (BPM y compás arriba; los cambia el host). Mientras tanto suena el resto del
+   proyecto.
+4. **Stop** (o **Espacio**, o **R** de nuevo). La toma queda como una región en tu pista y se
+   termina de subir en segundo plano.
 
-### YouTube
+Los demás ven tu toma crecer en rojo ("● grabando (tu nombre)"). Si activan **Escuchar en vivo**
+oyen lo que estás tocando con un poco de demora (Opus por UDP); eso es sólo para escuchar: lo que
+queda en el proyecto es tu toma original.
 
-No hay nada que instalar: el zip de la app trae en `tools\` los dos programas que hacen falta,
-[`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp) y [`deno.exe`](https://deno.com) (el runtime de
-JavaScript que yt-dlp necesita para YouTube desde fines de 2025). No hace falta ffmpeg: el audio
-se baja tal cual (`m4a`/AAC) con
-`yt-dlp -f "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/bestaudio" --no-playlist --js-runtimes deno:<tools\deno.exe> <url>`
-y el servidor lo decodifica con Media Foundation (nativo de Windows). La app busca `yt-dlp.exe`
-en la ruta configurada en `settings.json` (`ytDlpPath`), en `tools\`, junto al ejecutable y en el
-`PATH`, en ese orden; `deno.exe` junto a yt-dlp, en `tools\` o en el `PATH`. Si compilás vos, bajá
-los binarios con `.\tools\fetch-tools.ps1`. Descargar contenido de YouTube puede ir contra sus
-términos de uso: es responsabilidad de quien lo hace.
+Si se corta la conexión mientras grabás, la toma sigue grabándose en tu PC y se sube al
+reconectar. Si la app se cierra de golpe, la toma se recupera la próxima vez que abras ese proyecto.
+
+### Editar
+
+- **Mover**: arrastrar la región. **Recortar**: arrastrar su borde izquierdo o derecho.
+- **Cortar (S)**: corta la región seleccionada en el cursor. **Borrar (Supr)**: borra la región.
+- Por pista: **M** (mute, para todos), **S** (solo, sólo en tu PC), volumen, paneo y nombre
+  (doble clic). Ctrl + rueda hace zoom; la rueda desplaza.
+- Cada edición se manda al host y le llega igual a todos. Si el host la rechaza (pista ajena, sin
+  conexión), la barra de estado dice por qué.
+- Mientras grabás, la edición queda bloqueada.
+
+### Importar y exportar
+
+- **Importar archivo…** (WAV, MP3, FLAC, OGG, M4A; cualquier frecuencia, se convierte a 48 kHz)
+  crea una pista "Importada" con el audio desde el comienzo, y se sube a todos.
+- **URL de YouTube** + Enter: baja el audio con `yt-dlp` y lo importa igual.
+- **Exportar mezcla…** guarda la mezcla (lo que se oye, con mute/solo/volumen/paneo) en un WAV
+  24 bits, 48 kHz, estéreo, desde el comienzo hasta el final de la última región.
+
+### Salir y volver
+
+**Salir** vuelve al lobby. Si quedaron segmentos por subir, se envían la próxima vez que abras ese
+proyecto. Si el host se desconecta, los invitados quedan en "Sólo lectura: host desconectado":
+pueden seguir escuchando lo que tienen en caché y **Reintentar** cuando el host vuelve.
+
+## Hostear: puertos, red y Tailscale
+
+El host usa el puerto **22140**: TCP para el proyecto y las tomas (obligatorio) y UDP para
+"Escuchar en vivo" (opcional). Opciones para que la banda llegue a tu PC:
+
+- **Misma red**: alcanza con el link (IP local). Permitir Ensayo Virtual en el firewall de Windows
+  (redes privadas) la primera vez que lo pregunta.
+- **Tailscale** (recomendado por internet, sin tocar el router): todos instalan Tailscale y entran
+  a la misma red; el host comparte el link con su IP de Tailscale (`ensayo://100.x.y.z:22140/ID`).
+- **Abrir el puerto**: redirigir 22140 TCP (y UDP si quieren escuchar en vivo) en el router hacia
+  la PC del host y compartir el link con la IP pública.
+
+El puerto se cambia con `hostPort` en `settings.json`. `EnsayoServer.exe` hostea un proyecto sin
+interfaz (por ejemplo en otra PC que queda prendida):
+
+```
+EnsayoServer.exe --project <carpeta> [--port 22140] [--name <nombre>] [--user <id>] [--user-name <nombre>] [--log]
+```
+
+Imprime `host_user <id>` y `listening port=N session=ID`; el link es `ensayo://<ip>:N/ID`. Sale con
+Ctrl+C o al cerrarse su entrada estándar. El usuario host (`--user`, por defecto el del
+`project.json` o uno nuevo) sólo puede conectarse desde la misma PC.
 
 ## Modos de línea de comandos
 
 ```
 "Ensayo Virtual.exe" ensayo://host:puerto/ID            unirse directo
-"Ensayo Virtual.exe" --demo                             ventana con sesión de demostración
+"Ensayo Virtual.exe" --demo                             ventana con un proyecto de demostración (4 pistas)
 "Ensayo Virtual.exe" --screenshot <dir>                 lobby.png, session.png y controls.json; sale
-"Ensayo Virtual.exe" --headless --host|--join <link> [--name N --role R --fake-audio click|sine|silence
-                     --block 64|128|256 --emit-log a.csv --probe b.csv --compare a.csv --track f.wav --play
-                     --simulate-loss N --duration S --stats s.jsonl
-                     --asio "<driver>" --mic N --inst N --out P --mute-monitor]   # driver real en vez del falso
-EnsayoServer.exe [--port N] [--udp-port N] [--frame 64|128] [--log]
+"Ensayo Virtual.exe" --headless ...                     cliente sin interfaz (pruebas):
+    --host <carpeta> [--port N] | --join <link>          hostear un proyecto o unirse
+    --name N  --user <id>  --cache <dir>                 identidad y caché
+    --fake-audio silence|sine|click|loopback --block N --latency-in N --latency-out N
+    --asio "<driver>" --mic N --inst N --out P --mute-monitor
+    --calibrate                                          imprime "calibration <muestras>"
+    --add-track voice|instrument <nombre>  --import <archivo>  --import-url <url de YouTube>
+    --record <pista> --at <s> --for <s>  --ops <ops.jsonl>  --wait-takes N  --resume
+    --export <mezcla.wav>  --dump-project <archivo>  --duration S
+EnsayoServer.exe --project <carpeta> [--port N] [--name N] [--user <id>] [--user-name N] [--log]
 ```
 
-## Configuración
+Las líneas que imprime `--headless` (`welcome`, `applied`, `rejected`, `take_complete`, `cached`,
+`project_hash`, …) están documentadas en `src/client/HeadlessClient.h`.
 
-`%APPDATA%\EnsayoVirtual\settings.json` (dispositivo, canales, plugin y su estado, faders,
-puerto, ruta de yt-dlp). Borrarlo para volver a los valores por defecto. Los archivos subidos al
-servidor quedan en `%TEMP%\EnsayoVirtual\`.
+## Configuración y archivos
+
+| Qué | Dónde |
+|---|---|
+| Configuración (nombre, id de usuario, dispositivo, canales, buffer, plugin, calibraciones, puerto, ruta de yt-dlp, último proyecto) | `%APPDATA%\EnsayoVirtual\settings.json` |
+| Proyectos hosteados (`project.json`, `session.txt`, `takes\<toma>\<n>.flac`) | `%APPDATA%\EnsayoVirtual\projects\<id>\` |
+| Caché de tomas, grabaciones locales (`recordings\<toma>.wav`) y subidas pendientes | `%LOCALAPPDATA%\EnsayoVirtual\cache\<proyecto>\` |
+
+Si `settings.json` está dañado se aparta como `settings.json.bad` y se usan valores por defecto.
+
+## YouTube
+
+No hay nada que instalar: el zip de la app trae en `tools\` [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp)
+y [`deno.exe`](https://deno.com) (el runtime de JavaScript que yt-dlp necesita para YouTube). No
+hace falta ffmpeg: el audio se baja tal cual (`m4a`/AAC) y se decodifica con Media Foundation. La
+app busca `yt-dlp.exe` en `ytDlpPath` de `settings.json`, en `tools\`, junto al ejecutable y en el
+`PATH`. Si compilás vos, la compilación copia `tools\` junto al exe; bajá los binarios con
+`.\tools\fetch-tools.ps1`. Descargar contenido de YouTube puede ir contra sus términos de uso: es
+responsabilidad de quien lo hace.
 
 ## Problemas frecuentes
 
 | Mensaje / síntoma | Qué hacer |
 |---|---|
 | `No se encontraron drivers ASIO` | Instalar el driver ASIO de la interfaz. |
-| `Error de audio: ...` | Otro programa (DAW) usa el driver, o se desconectó la interfaz. Cerrarlo y **Reintentar**. |
-| `Sin audio del servidor` | No llegan paquetes UDP: revisar firewall/puerto 22140 UDP en el host. |
-| `El host no recibe tu audio: el UDP a ... no llega` | Tu UDP no sale o no llega al host (TCP sí): permití Ensayo Virtual en el firewall de Windows **y en el antivirus** de tu PC (redes públicas y privadas). Probalo sin la app con `tools\udp-test.ps1`. |
-| `El host recibe tu audio pero el suyo no llega a esta PC` | La vuelta está bloqueada en tu PC: mismo arreglo (firewall/antivirus de esta PC). |
-| `No llega el audio de <nombre>` (en el host) | El UDP de esa persona no alcanza tu servidor; el problema está en su PC o su red. Ella ve "El host no recibe tu audio". |
-| `<nombre> usa otro tamaño de buffer` / `tu buffer no coincide` | Bloques de 64 vs 128: salir y volver a entrar (la app ajusta el buffer al unirse) o igualar el Buffer en el lobby. |
-| Nadie puede unirse desde afuera | Abrir el puerto 22140 TCP y UDP en el router del host, o usar `EnsayoServer.exe` en un VPS. |
-| Latencia alta / cortes | Bajar el buffer ASIO a 64 o 128; usar cable, no Wi-Fi; elegir un host cercano. |
+| `Error de audio: ...` / `No hay un dispositivo de audio funcionando` | Otro programa (DAW) tiene el driver tomado, o se desconectó la interfaz. Cerrarlo, elegir el dispositivo en el lobby y **Reintentar**. |
+| `No se detectaron los clicks en la entrada` (calibración) | Revisar el cable o el loopback, el par de salida y el canal de micrófono, y que el volumen de salida no esté en cero. |
+| La toma suena corrida respecto de los demás | **Calibrar latencia** con el mismo buffer con el que grabás (la calibración se guarda por interfaz y buffer). |
+| `Armá una pista propia (●R) para grabar` | Armar una pista tuya (no importada) antes de **Grabar**. |
+| `La toma es más corta que la cuenta y la latencia; no se guardó` | Se paró antes de que empezara a grabar de verdad: grabar un poco más. |
+| `Sólo lectura: host desconectado` | El host cerró la app o se cortó la red. Se puede escuchar lo que ya está en caché; **Reintentar** cuando vuelva. |
+| `Operación rechazada: not allowed to edit this track` | Es una pista de otro integrante; sólo el autor y el host pueden editarla. |
+| `este proyecto pertenece a otro anfitrión` | Ese proyecto lo creó otra instalación (otro id de usuario); abrilo desde la PC de su host o unite con su link. |
+| Nadie puede unirse desde afuera | Usar Tailscale o abrir el puerto 22140 TCP en el router del host (ver "Hostear"). |
+| "Escuchar en vivo" no suena | Llega por UDP 22140: permitirlo en el firewall/antivirus del host y del que escucha (el resto anda igual por TCP). |
+| `Descargas` no baja de 1 | Las tomas se bajan del host: si está desconectado, esperan a que vuelva. |
 | `Falta tools\yt-dlp.exe` | Falta la carpeta `tools` junto al exe (está en el zip del release; o correr `tools\fetch-tools.ps1`). |
 | `yt-dlp falló` con "JS challenge" / pocos formatos | Falta `tools\deno.exe` o yt-dlp está viejo: bajar los dos de nuevo con `tools\fetch-tools.ps1`. |
+| `La configuración estaba dañada…` | Se guardó una copia `settings.json.bad`; revisar el dispositivo y la calibración en el lobby. |
 
 ## Licencia
 
 AGPL-3.0 (JUCE se usa bajo su licencia AGPLv3). Incluye el SDK ASIO de Steinberg distribuido con
-JUCE (GPLv3), el SDK VST3 (MIT) y libopus (BSD). ASIO y VST son marcas de Steinberg Media
-Technologies GmbH.
+JUCE (GPLv3), el SDK VST3 (MIT), libopus (BSD) y FLAC (BSD). ASIO y VST son marcas de Steinberg
+Media Technologies GmbH.
