@@ -1,5 +1,6 @@
 #include "Settings.h"
 #include "core/Project.h"
+#include <cmath>
 #include <regex>
 
 namespace ensayo
@@ -14,6 +15,18 @@ float readFloat (const juce::var& v, const char* name, float fallback)
 int readInt (const juce::var& v, const char* name, int fallback)
 {
     return static_cast<int> (v.getProperty (name, fallback));
+}
+
+// A fader level in dB, clamped to [minFaderDb, maxDb]; a non-number (or NaN) keeps the fallback.
+float readFader (const juce::var& v, const char* name, float fallback, float maxDb)
+{
+    const auto value = v.getProperty (name, fallback);
+
+    if (! (value.isDouble() || value.isInt() || value.isInt64()))
+        return fallback;
+
+    const auto db = static_cast<float> (static_cast<double> (value));
+    return std::isnan (db) ? fallback : juce::jlimit (minFaderDb, maxDb, db);
 }
 
 bool readBool (const juce::var& v, const char* name, bool fallback)
@@ -64,8 +77,21 @@ juce::String toJson (const AppSettings& s)
     root->setProperty ("pluginBypassed", s.pluginBypassed);
     root->setProperty ("monitorVoiceDb", s.monitorVoiceDb);
     root->setProperty ("monitorInstrumentDb", s.monitorInstrumentDb);
-    root->setProperty ("monitorVoiceMuted", s.monitorVoiceMuted);
-    root->setProperty ("monitorInstrumentMuted", s.monitorInstrumentMuted);
+    root->setProperty ("sendVoiceDb", s.sendVoiceDb);
+    root->setProperty ("sendInstrumentDb", s.sendInstrumentDb);
+    root->setProperty ("micMuted", s.micMuted);
+
+    auto* participants = new juce::DynamicObject();
+
+    for (const auto& [user, mix] : s.participants)
+    {
+        auto* entry = new juce::DynamicObject();
+        entry->setProperty ("gainDb", mix.gainDb);
+        entry->setProperty ("muted", mix.muted);
+        participants->setProperty (user, juce::var (entry));
+    }
+
+    root->setProperty ("participants", juce::var (participants));
     root->setProperty ("receiveDb", s.receiveDb);
     root->setProperty ("trackDb", s.trackDb);
     root->setProperty ("trackMuted", s.trackMuted);
@@ -108,10 +134,30 @@ AppSettings fromJson (const juce::String& json)
     s.pluginFile = readString (root, "pluginFile", s.pluginFile);
     s.pluginState = readString (root, "pluginState", s.pluginState);
     s.pluginBypassed = readBool (root, "pluginBypassed", s.pluginBypassed);
-    s.monitorVoiceDb = readFloat (root, "monitorVoiceDb", s.monitorVoiceDb);
-    s.monitorInstrumentDb = readFloat (root, "monitorInstrumentDb", s.monitorInstrumentDb);
-    s.monitorVoiceMuted = readBool (root, "monitorVoiceMuted", s.monitorVoiceMuted);
-    s.monitorInstrumentMuted = readBool (root, "monitorInstrumentMuted", s.monitorInstrumentMuted);
+    s.monitorVoiceDb = readFader (root, "monitorVoiceDb", s.monitorVoiceDb, maxOwnFaderDb);
+    s.monitorInstrumentDb = readFader (root, "monitorInstrumentDb", s.monitorInstrumentDb, maxOwnFaderDb);
+
+    // Older files muted the monitors with a flag; the faders now reach silence at their minimum.
+    if (readBool (root, "monitorVoiceMuted", false))       s.monitorVoiceDb = minFaderDb;
+    if (readBool (root, "monitorInstrumentMuted", false))  s.monitorInstrumentDb = minFaderDb;
+
+    s.sendVoiceDb = readFader (root, "sendVoiceDb", s.sendVoiceDb, maxOwnFaderDb);
+    s.sendInstrumentDb = readFader (root, "sendInstrumentDb", s.sendInstrumentDb, maxOwnFaderDb);
+    s.micMuted = readBool (root, "micMuted", s.micMuted);
+
+    if (auto* participants = root["participants"].getDynamicObject())
+        for (const auto& property : participants->getProperties())
+        {
+            const auto user = property.name.toString();
+
+            if (! isValidId (user) || ! property.value.isObject())
+                continue;
+
+            ParticipantSetting mix;
+            mix.gainDb = readFader (property.value, "gainDb", mix.gainDb, maxFaderDb);
+            mix.muted = readBool (property.value, "muted", mix.muted);
+            s.participants[user] = mix;
+        }
     s.receiveDb = readFloat (root, "receiveDb", s.receiveDb);
     s.trackDb = readFloat (root, "trackDb", s.trackDb);
     s.trackMuted = readBool (root, "trackMuted", s.trackMuted);

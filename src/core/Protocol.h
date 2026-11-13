@@ -13,6 +13,7 @@ constexpr uint8_t protocolVersion = 1;
 constexpr size_t maxPacketBytes = 512;
 constexpr int defaultPort = 22140;
 constexpr float minFaderDb = -60.0f, maxFaderDb = 12.0f;
+constexpr float maxOwnFaderDb = 6.0f;   // "Mi audio" faders (my monitor and send levels) top out lower than the mix
 
 enum class FrameSize : uint8_t { f64 = 0, f128 = 1 };
 constexpr int frameSamples (FrameSize f) noexcept           { return f == FrameSize::f64 ? 64 : 128; }

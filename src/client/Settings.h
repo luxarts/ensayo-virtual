@@ -3,6 +3,9 @@
 #include <map>
 namespace ensayo
 {
+// Personal level of another participant's voice chat and live instrument (not part of the project).
+struct ParticipantSetting { float gainDb = 0.0f; bool muted = false; };
+
 struct AppSettings
 {
     juce::String name; Role role = Role::both;
@@ -11,7 +14,10 @@ struct AppSettings
     juce::String deviceName; double sampleRate = 48000.0; int bufferSize = 256;
     int micChannel = 0, instrumentChannel = 1, outputPair = 0;
     juce::String pluginFile, pluginState; bool pluginBypassed = false;
-    float monitorVoiceDb = 0, monitorInstrumentDb = 0; bool monitorVoiceMuted = false, monitorInstrumentMuted = false;
+    // "Mi audio": monitor and send levels of my own inputs, and the voice chat mute. A file from before these fields
+    // loads with its monitorVoiceMuted / monitorInstrumentMuted mapped to the fader minimum (silence).
+    float monitorVoiceDb = 0, monitorInstrumentDb = 0, sendVoiceDb = 0, sendInstrumentDb = 0; bool micMuted = false;
+    std::map<juce::String, ParticipantSetting> participants;   // userId → personal level ("Participantes")
     float receiveDb = 0; float trackDb = 0; bool trackMuted = false;
     int hostPort = defaultPort; juce::String lastLink; juce::String ytDlpPath;
     std::map<juce::String, int> calibration;   // "<device>@<buffer>" → samples measured by "Calibrar latencia"

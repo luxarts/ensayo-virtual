@@ -35,8 +35,11 @@ public:
             s.pluginBypassed = true;
             s.monitorVoiceDb = -6.0f;
             s.monitorInstrumentDb = 3.5f;
-            s.monitorVoiceMuted = true;
-            s.monitorInstrumentMuted = false;
+            s.sendVoiceDb = -4.5f;
+            s.sendInstrumentDb = 2.0f;
+            s.micMuted = true;
+            s.participants["0123456789abcdef0123456789abcdef"] = { -12.5f, false };
+            s.participants["fedcba9876543210fedcba9876543210"] = { 6.0f, true };
             s.receiveDb = -2.0f;
             s.trackDb = -12.0f;
             s.trackMuted = true;
@@ -202,6 +205,33 @@ public:
             expect (s.role == Role::both);
         }
 
+        beginTest ("an old file without the voice chat fields loads, its monitor mutes become the fader minimum");
+        {
+            const auto s = fromJson (R"({ "monitorVoiceDb": -6.0, "monitorInstrumentDb": 3.0,
+                                          "monitorVoiceMuted": true, "monitorInstrumentMuted": false })");
+            expectEquals (s.monitorVoiceDb, minFaderDb);
+            expectEquals (s.monitorInstrumentDb, 3.0f);
+            expectEquals (s.sendVoiceDb, 0.0f);
+            expectEquals (s.sendInstrumentDb, 0.0f);
+            expect (! s.micMuted);
+            expect (s.participants.empty());
+            expect (! toJson (s).contains ("monitorVoiceMuted"), "the superseded mute fields are no longer written");
+        }
+
+        beginTest ("participant entries with a bad id or a non-object value are skipped, gains are clamped");
+        {
+            const auto s = fromJson (R"({ "participants": { "0123456789abcdef0123456789abcdef": { "gainDb": 40.0, "muted": true },
+                                                            "not-an-id": { "gainDb": -3.0 },
+                                                            "fedcba9876543210fedcba9876543210": 5,
+                                                            "00000000000000000000000000000001": { "gainDb": -99.0 } },
+                                          "sendVoiceDb": 20.0 })");
+            expectEquals ((int) s.participants.size(), 2);
+            expectEquals (s.participants.at ("0123456789abcdef0123456789abcdef").gainDb, maxFaderDb);
+            expect (s.participants.at ("0123456789abcdef0123456789abcdef").muted);
+            expectEquals (s.participants.at ("00000000000000000000000000000001").gainDb, minFaderDb);
+            expectEquals (s.sendVoiceDb, 6.0f);
+        }
+
         beginTest ("unknown role falls back to both");
         {
             expect (fromJson (R"({ "role": "drums" })").role == Role::both);
@@ -229,8 +259,22 @@ private:
         expect (a.pluginBypassed == b.pluginBypassed);
         expectEquals (a.monitorVoiceDb, b.monitorVoiceDb);
         expectEquals (a.monitorInstrumentDb, b.monitorInstrumentDb);
-        expect (a.monitorVoiceMuted == b.monitorVoiceMuted);
-        expect (a.monitorInstrumentMuted == b.monitorInstrumentMuted);
+        expectEquals (a.sendVoiceDb, b.sendVoiceDb);
+        expectEquals (a.sendInstrumentDb, b.sendInstrumentDb);
+        expect (a.micMuted == b.micMuted);
+        expectEquals ((int) a.participants.size(), (int) b.participants.size());
+
+        for (const auto& [user, mix] : a.participants)
+        {
+            const auto it = b.participants.find (user);
+            expect (it != b.participants.end(), "missing participant " + user);
+
+            if (it != b.participants.end())
+            {
+                expectEquals (it->second.gainDb, mix.gainDb);
+                expect (it->second.muted == mix.muted);
+            }
+        }
         expectEquals (a.receiveDb, b.receiveDb);
         expectEquals (a.trackDb, b.trackDb);
         expect (a.trackMuted == b.trackMuted);
