@@ -287,6 +287,38 @@ public:
             expect (buffer.getStats().jitterMs < 0.1);
         }
 
+        beginTest ("6f. resetForNewStream forgets the auto size learned from the previous stream; manual sizes stay");
+        {
+            JitterBuffer buffer (blockBytes, blockMs);
+            juce::Random random (42);
+            double ideal = 0.0;
+
+            for (uint16_t seq = 0; seq < (uint16_t) (2000.0 / blockMs); ++seq)
+            {
+                pushSeq (buffer, seq, ideal + (random.nextDouble() * 6.0 - 3.0));
+                popDiscarding (buffer);
+                ideal += blockMs;
+            }
+
+            expect (buffer.getSizeBlocks() > JitterBuffer::initialBlocks);
+            buffer.resetForNewStream();
+            expectEquals (buffer.getSizeBlocks(), JitterBuffer::initialBlocks);
+
+            // Primes again at the initial depth: four pushes, then a pop.
+            for (uint16_t seq = 500; seq < 503; ++seq)
+                pushSeq (buffer, seq, 10000.0 + seq);
+
+            expect (! popDiscarding (buffer));
+            pushSeq (buffer, 503, 10503.0);
+            expect (popExpecting (buffer, 500));
+
+            JitterBuffer manual (blockBytes, blockMs);
+            manual.setAutoSize (false);
+            manual.setSizeBlocks (9);
+            manual.resetForNewStream();
+            expectEquals (manual.getSizeBlocks(), 9);
+        }
+
         beginTest ("6b. up moves apply immediately at the one-second boundary");
         {
             JitterBuffer buffer (blockBytes, blockMs);

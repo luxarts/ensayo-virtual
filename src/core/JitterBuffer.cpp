@@ -72,6 +72,14 @@ void JitterBuffer::reset() noexcept
     jitterMs.store (0.0, std::memory_order_relaxed);   // the producer restarts its estimator on the next push
 }
 
+void JitterBuffer::resetForNewStream() noexcept
+{
+    reset();
+
+    if (autoSize.load (std::memory_order_relaxed))
+        sizeBlocks.store (clampBlocks (initialBlocks), std::memory_order_relaxed);
+}
+
 void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arrivalMs) noexcept
 {
     if (data == nullptr || len <= 0 || len > blockBytes)
@@ -125,7 +133,8 @@ void JitterBuffer::push (uint16_t seq, const uint8_t* data, int len, double arri
     }
 
     const size_t slot = slotOf (seq);
-    tags[slot].store (0, std::memory_order_release);
+    tags[slot].store (0, std::memory_order_relaxed);
+    std::atomic_thread_fence (std::memory_order_release);   // the invalidation is visible before any payload write
     std::memcpy (storage.data() + slot * (size_t) blockBytes, data, (size_t) len);
     lengths[slot].store (len, std::memory_order_relaxed);
     tags[slot].store (taggedSeq (seq), std::memory_order_release);
@@ -257,8 +266,11 @@ bool JitterBuffer::pop (uint8_t* out, int& len) noexcept
         const int length = std::clamp (lengths[slot].load (std::memory_order_relaxed), 0, blockBytes);
         std::memcpy (out, storage.data() + slot * (size_t) blockBytes, (size_t) length);
 
-        // The producer only rewrites this slot during a resync; a tag change means the copy may be torn.
-        if (tags[slot].load (std::memory_order_acquire) == expected)
+        // The producer only rewrites this slot during a resync; a tag change means the copy may be torn. The fence
+        // keeps the payload reads above from moving past the recheck (seqlock reader).
+        std::atomic_thread_fence (std::memory_order_acquire);
+
+        if (tags[slot].load (std::memory_order_relaxed) == expected)
         {
             tags[slot].store (0, std::memory_order_release);
             len = length;

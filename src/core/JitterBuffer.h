@@ -29,6 +29,9 @@ public:
     // Consumer. Copies one block into out and returns true; false → caller does PLC. Advances the read sequence.
     bool pop (uint8_t* out, int& len) noexcept;
     void reset() noexcept;                         // forgets everything; next push defines the window
+    // Producer side, for a buffer reused by another stream: reset(), and in auto mode the size goes back to
+    // initialBlocks (the previous stream's jitter says nothing about the new one).
+    void resetForNewStream() noexcept;
     struct Stats { int sizeBlocks = 0; uint32_t underruns = 0, late = 0, resyncs = 0; double jitterMs = 0.0; bool primed = false; };
     Stats getStats() const noexcept;
 private:
