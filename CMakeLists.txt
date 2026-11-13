@@ -64,6 +64,8 @@ set(ENSAYO_SERVER_SOURCES
     src/server/ServerHost.cpp
     src/server/HighResClock.cpp
     src/server/MediaFoundationAudioFormat.cpp
+    # T4
+    src/server/ProjectHost.cpp
 )
 set(ENSAYO_UI_SOURCES
     # T9
@@ -111,6 +113,8 @@ set(ENSAYO_TEST_SOURCES
     tests/AudioDiagnosisTests.cpp
     # T10-tests
     tests/ScreenshotTests.cpp
+    # T4
+    tests/ProjectHostTests.cpp
 )
 
 set(ENSAYO_MODULES
