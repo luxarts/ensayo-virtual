@@ -507,6 +507,59 @@ public:
             engine.getDeviceManager().closeAudioDevice();
         }
 
+        beginTest ("an import with a long name gets a 64-character track; a rejected track ends the import with no take");
+        {
+            const auto dir = tempDir ("import-name");
+            const auto wav = writeWav (dir.getChildFile ("Corta.wav"), 48000.0, 2);
+            StudioEngine engine;
+            engine.useFakeDevice (256, TestSignal::silence);
+            SessionController session (engine);
+            bool connected = false;
+            int finishedOk = 0, finishedFailed = 0;
+            juce::String failure;
+            session.onConnected = [&] { connected = true; };
+            session.onImportFinished = [&] (const juce::String&, const juce::Result& r)
+            {
+                if (r.wasOk()) ++finishedOk; else { ++finishedFailed; failure = r.getErrorMessage(); }
+            };
+            expect (session.host (dir.getChildFile ("project"), recordPort, { newId(), "Hana", dir.getChildFile ("cache") }, "Nombres").wasOk());
+            expect (waitFor ([&] { return connected; }, 8000));
+
+            // A YouTube-like title well over 64 characters (with multibyte characters).
+            const auto longName = juce::String (juce::CharPointer_UTF8 ("  Canci\xc3\xb3n ")) + juce::String::repeatedString (juce::String (juce::CharPointer_UTF8 ("largu\xc3\xadsima ")), 12);
+            expect (session.importFile (wav, longName).wasOk());
+            expect (waitFor ([&] { return finishedOk + finishedFailed == 1; }, 15000));
+            expectEquals (finishedOk, 1, failure);
+            expect (waitFor ([&]
+            {
+                const auto p = session.getHost()->snapshot();
+                return p->tracks.size() == 1 && p->tracks[0].regions.size() == 1;
+            }, 15000), "the long-named import never got its region");
+            expectEquals (session.getHost()->snapshot()->tracks[0].name, clampName (longName));
+            expectEquals (session.getHost()->snapshot()->tracks[0].name.length(), 64);
+
+            // An add_track the host rejects (track id in use): an error, no take, nothing pending.
+            const auto existing = session.getHost()->snapshot()->tracks[0].id;
+            const auto takesBefore = session.getHost()->snapshot()->takes.size();
+            session.importTrackIdForTest = existing;
+            expect (session.importFile (wav, "Otra").wasOk());
+            expect (waitFor ([&] { return finishedOk + finishedFailed == 2; }, 15000));
+            expectEquals (finishedFailed, 1);
+            expect (failure.startsWith ("No se pudo crear la pista de Otra"), failure);
+            expect (! session.isImporting());
+            pumpMessages (300);
+            expectEquals (session.getHost()->snapshot()->takes.size(), takesBefore);
+            expectEquals (session.getClient()->transfers().pendingTakes, 0);
+            expectEquals ((int) session.getHost()->snapshot()->tracks.size(), 1);
+
+            // The session keeps importing normally afterwards.
+            expect (session.importFile (wav, "Tercera").wasOk());
+            expect (waitFor ([&] { return finishedOk == 2; }, 15000));
+
+            session.leave();
+            engine.getDeviceManager().closeAudioDevice();
+        }
+
         beginTest ("runHeadless --calibrate on a fake loopback finds the hidden latency and exits");
         {
             const auto o = parse ({ "--calibrate", "--fake-audio", "loopback", "--latency-in", "200", "--latency-out", "264" });

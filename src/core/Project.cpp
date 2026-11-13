@@ -768,6 +768,12 @@ bool canEditTrack (const Project& p, const Track& t, const Id& by) noexcept
     return by == t.author || by == p.hostUser;
 }
 
+juce::String clampName (const juce::String& name)
+{
+    const auto trimmed = name.trim();
+    return trimmed.length() <= maxNameLength ? trimmed : trimmed.substring (0, maxNameLength).trimEnd();
+}
+
 OpResult applyOp (Project& p, const juce::var& op, const Id& by)
 {
     Project scratch = p;

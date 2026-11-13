@@ -1158,6 +1158,9 @@ struct ProjectClient::Impl
             regionSeqs.erase (it);
         }
 
+        if (owner.onOpRejected != nullptr)
+            owner.onOpRejected (seq, reason);
+
         if (owner.onRejected != nullptr)
             owner.onRejected (reason);
     }
@@ -1699,17 +1702,17 @@ TakeCache* ProjectClient::cache() noexcept
     return impl->takeCache.get();
 }
 
-void ProjectClient::sendOp (const juce::var& op)
+int ProjectClient::sendOp (const juce::var& op)
 {
     if (! impl->welcomed)
     {
         if (onRejected != nullptr)
             onRejected (utf8 ("Sin conexi\xc3\xb3n con el anfitri\xc3\xb3n"));
 
-        return;
+        return 0;
     }
 
-    impl->sendOpInternal (op);
+    return impl->sendOpInternal (op);
 }
 
 void ProjectClient::beginTake (const Id& take, int channels, const Id& track, int64_t timelineStart, int64_t takeOffset,

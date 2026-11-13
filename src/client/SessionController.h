@@ -63,7 +63,9 @@ public:
     void setListening (bool);
     bool isListening() const noexcept       { return listening; }
 
-    // Import: decode + resample + segments on a thread, then a new `imported` track with one region at 0.
+    // Import: decode + resample + segments on a thread, then a new `imported` track with one region at 0. The track name
+    // (trackName, else the file name) is trimmed and cut to 64 characters. The take starts only once the host applied
+    // the track: a rejected add_track or a lost connection ends the import with an error and nothing recorded.
     juce::Result importFile (const juce::File&, const juce::String& trackName = {});
     bool isImporting() const noexcept       { return importBusy; }
     // Export: offline render of the whole project to a 24-bit WAV on a thread.
@@ -80,14 +82,21 @@ public:
 
     static juce::String lanAddress();       // first private IPv4, else any routable IPv4, else 127.0.0.1
 
+    Id importTrackIdForTest;                // test hook: the next import uses this track id (an id in use is rejected)
+
 private:
     struct ImportFinish { Id take, track; juce::String name; int64_t samples = 0; };
+    // Phase 2 of an import: add_track sent (op seq), waiting for the host to apply or reject it.
+    struct ImportWait { int seq = 0; Id track; juce::String name; int channels = 0; int64_t samples = 0;
+                        std::shared_ptr<std::vector<juce::MemoryBlock>> segments; };
 
     void createClient (const SessionIdentity&);
     void refreshEngine();
     void post (std::function<void()>);
     void joinImportThread();
     void completeImport();
+    void checkImportWait();                         // starts the take and the queueing once the track exists
+    void failImport (const juce::String& message);  // ends a waiting import with an error
 
     StudioEngine& engine;
     std::unique_ptr<ProjectHost> projectHost;
@@ -109,6 +118,7 @@ private:
     // Import / export.
     std::thread importThread, exportThread;
     std::atomic<bool> importBusy { false }, importCancel { false }, exportBusy { false }, exportCancel { false };
+    std::optional<ImportWait> importWait;       // message thread: the import's add_track is not applied yet
     std::optional<ImportFinish> importFinish;   // message thread: set before the queueing thread starts
     std::atomic<bool> importQueued { false };   // the queueing thread queued every segment
 

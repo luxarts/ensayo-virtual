@@ -118,15 +118,27 @@ void SessionController::createClient (const SessionIdentity& identity)
     client->onProjectChanged = [this]
     {
         refreshEngine();
+        checkImportWait();
 
         if (onProjectChanged) onProjectChanged();
     };
 
     client->onTransfersChanged = [this] { if (onTransfersChanged) onTransfersChanged(); };
     client->onPresenceChanged  = [this] { if (onPresenceChanged) onPresenceChanged(); };
-    client->onDisconnected     = [this] (const juce::String& reason) { if (onDisconnected) onDisconnected (reason); };
+    client->onDisconnected     = [this] (const juce::String& reason)
+    {
+        if (importWait)
+            failImport (ES ("Se perdi\xC3\xB3 la conexi\xC3\xB3n con el anfitri\xC3\xB3n: no se import\xC3\xB3 ") + importWait->name);
+
+        if (onDisconnected) onDisconnected (reason);
+    };
     client->onError            = [this] (const juce::String& message) { if (onError) onError (message); };
     client->onRejected         = [this] (const juce::String& reason) { if (onRejected) onRejected (reason); };
+    client->onOpRejected       = [this] (int seq, const juce::String& reason)
+    {
+        if (importWait && importWait->seq == seq)
+            failImport ("No se pudo crear la pista de " + importWait->name + ": " + reason);
+    };
 }
 
 // The engine plays the replica from the client's cache. The cache is created at the first welcome and kept across
@@ -197,6 +209,12 @@ void SessionController::leave()
     if (importFinish && importQueued)
         completeImport();
 
+    // The track was asked for but its take never started: remove it if the host applies it after all (ops are applied
+    // in order, so a rejected add_track only makes this a rejected delete).
+    if (importWait && client != nullptr && client->isConnected())
+        client->sendOp (Ops::deleteTrack (importWait->track));
+
+    importWait.reset();
     importFinish.reset();
     importBusy = false;
     importQueued = false;
@@ -242,6 +260,7 @@ void SessionController::leave()
         client->onDisconnected = nullptr;
         client->onError = nullptr;
         client->onRejected = nullptr;
+        client->onOpRejected = nullptr;
         client->disconnect();
         client = nullptr;
     }
@@ -471,6 +490,64 @@ void SessionController::completeImport()
     client->finishTake (f.take, f.track, Region { newId(), f.take, 0, 0, f.samples });
 }
 
+void SessionController::failImport (const juce::String& message)
+{
+    if (! importWait)
+        return;
+
+    const auto name = importWait->name;
+    importWait.reset();
+    importBusy = false;
+
+    if (onImportFinished) onImportFinished (name, juce::Result::fail (message));
+}
+
+void SessionController::checkImportWait()
+{
+    if (! importWait || client == nullptr)
+        return;
+
+    const auto p = client->project();
+
+    if (p == nullptr || p->findTrack (importWait->track) == nullptr)
+        return;
+
+    const auto w = std::move (*importWait);
+    importWait.reset();
+    joinImportThread();
+
+    const Id take = newId();
+    client->beginTake (take, w.channels, w.track, 0, 0, false);   // not a live recording: nothing to announce
+    importFinish = ImportFinish { take, w.track, w.name, w.samples };
+
+    auto* c = client.get();
+    const auto segments = w.segments;
+    const auto name = w.name;
+
+    importThread = std::thread ([this, c, take, segments, name]
+    {
+        const auto total = (int) segments->size();
+
+        for (int i = 0; i < total; ++i)
+        {
+            c->queueSegment (take, i, (*segments)[(size_t) i]);
+            const float fraction = (float) (i + 1) / (float) total;
+            post ([this, name, fraction] { if (onImportProgress) onImportProgress (name, fraction); });
+        }
+
+        importQueued = true;
+
+        post ([this, name]
+        {
+            joinImportThread();
+            completeImport();
+            importBusy = false;
+
+            if (onImportFinished) onImportFinished (name, juce::Result::ok());
+        });
+    });
+}
+
 juce::Result SessionController::importFile (const juce::File& file, const juce::String& trackName)
 {
     if (client == nullptr || ! client->isConnected() || client->project() == nullptr)
@@ -488,7 +565,10 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
     joinImportThread();
     importBusy = true;
     importQueued = false;
-    const auto name = trackName.isNotEmpty() ? trackName : file.getFileNameWithoutExtension();
+    auto name = clampName (trackName.isNotEmpty() ? trackName : file.getFileNameWithoutExtension());
+
+    if (name.isEmpty())
+        name = ES ("Pista importada");
 
     if (onImportProgress) onImportProgress (name, 0.0f);
 
@@ -531,34 +611,22 @@ juce::Result SessionController::importFile (const juce::File& file, const juce::
                 return;
             }
 
-            const Id track = newId(), take = newId();
-            client->sendOp (Ops::addTrack (track, name, TrackKind::imported));
-            client->beginTake (take, channels, track, 0, 0, false);   // not a live recording: nothing to announce
-            importFinish = ImportFinish { take, track, name, samples };
+            // The take starts only once the host has applied the track (checkImportWait): a rejected track would
+            // otherwise leave an uploaded take whose region can never be added.
+            const Id track = importTrackIdForTest.isNotEmpty() ? std::exchange (importTrackIdForTest, Id()) : newId();
+            const int seq = client->isConnected() ? client->sendOp (Ops::addTrack (track, name, TrackKind::imported)) : 0;
 
-            auto* c = client.get();
-            importThread = std::thread ([this, c, take, segments, name]
+            if (seq <= 0)
             {
-                const auto total = (int) segments->size();
+                importBusy = false;
 
-                for (int i = 0; i < total; ++i)
-                {
-                    c->queueSegment (take, i, (*segments)[(size_t) i]);
-                    const float fraction = (float) (i + 1) / (float) total;
-                    post ([this, name, fraction] { if (onImportProgress) onImportProgress (name, fraction); });
-                }
+                if (onImportFinished)
+                    onImportFinished (name, juce::Result::fail (ES ("Sin conexi\xC3\xB3n con el anfitri\xC3\xB3n: no se import\xC3\xB3 ") + name));
 
-                importQueued = true;
+                return;
+            }
 
-                post ([this, name]
-                {
-                    joinImportThread();
-                    completeImport();
-                    importBusy = false;
-
-                    if (onImportFinished) onImportFinished (name, juce::Result::ok());
-                });
-            });
+            importWait = ImportWait { seq, track, name, channels, samples, segments };
         });
     });
 

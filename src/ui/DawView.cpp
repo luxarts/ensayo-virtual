@@ -269,7 +269,7 @@ struct DawView::Impl
         void renameFromLabel()
         {
             const auto* track = impl.currentProject() != nullptr ? impl.currentProject()->findTrack (trackId) : nullptr;
-            const auto text = name.getText().trim();
+            const auto text = clampName (name.getText());
 
             if (track == nullptr || text.isEmpty() || text == track->name || ! impl.canEdit (*track))
             {

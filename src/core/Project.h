@@ -42,6 +42,11 @@ juce::String contentHash (const Project&);                              // SHA-1
 
 bool canEditTrack (const Project&, const Track&, const Id& by) noexcept;   // author or hostUser
 
+// A user-supplied track or project name made acceptable to applyOp's length rule: trimmed, at most 64 characters
+// (juce::String characters, so a multibyte character is never cut in half), no trailing space after the cut.
+// Can be empty: the caller supplies a fallback.
+juce::String clampName (const juce::String&);
+
 struct OpResult { bool ok = false; juce::String error; };
 // Validates `op` (an object with "op") for user `by`, applies it and increments version on success.
 // Unknown op, missing/invalid field, unknown id, broken invariant or missing permission → ok=false, project untouched.

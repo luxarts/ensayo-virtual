@@ -29,7 +29,9 @@ public:
     const Id& user() const noexcept;
     std::shared_ptr<const Project> project() const;          // latest replica (message thread)
     TakeCache* cache() noexcept;                              // created at `welcome`, per project id; nullptr before
-    void sendOp (const juce::var& op);                         // queued; result arrives as onProjectChanged or onRejected
+    // Queued; the result arrives as onProjectChanged or onRejected (+ onOpRejected with this seq). Returns the op's
+    // seq, or 0 when not welcomed (then onRejected is called right away).
+    int sendOp (const juce::var& op);
     // Recording plumbing (message thread unless noted)
     // add_take op + rec_start. takeOffset (persisted, not sent) = take samples before the record point (count-in and
     // latency); used only to finish the take if the app stops before finishTake (see unfinishedTakes).
@@ -58,6 +60,7 @@ public:
 
     std::function<void()> onConnected, onProjectChanged, onPresenceChanged, onTransfersChanged;
     std::function<void (const juce::String&)> onRejected, onError, onDisconnected;   // message thread
+    std::function<void (int seq, const juce::String& reason)> onOpRejected;           // message thread, before onRejected
 
     // Test hooks.
     int64_t bytesDownloaded() const noexcept;      // any thread: segment payload bytes received since the last connect()

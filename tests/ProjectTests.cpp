@@ -94,6 +94,25 @@ public:
             expectEquals ((int) p.tracks.size(), 1);
         }
 
+        beginTest ("clampName trims and keeps at most 64 characters, counting multibyte characters as one");
+        {
+            const auto host = newId(), tr = newId();
+            auto p = makeProject ("T", host, "Lucas");
+            expectEquals (clampName ("  Guia  "), juce::String ("Guia"));
+            expectEquals (clampName ("   "), juce::String());
+
+            // 70 enye (2 bytes each in UTF-8) plus spaces around: 64 characters stay, and the op is accepted.
+            const auto enye = juce::String (juce::CharPointer_UTF8 ("\xc3\xb1"));
+            const auto clamped = clampName ("  " + juce::String::repeatedString (enye, 70) + "  ");
+            expectEquals (clamped.length(), 64);
+            expect (clamped == juce::String::repeatedString (enye, 64));
+            expect (applyOp (p, Ops::addTrack (tr, clamped, TrackKind::imported), host).ok);
+
+            // A cut that lands on a space does not leave it trailing.
+            const auto spaced = clampName (juce::String::repeatedString ("a", 63) + "  bcd");
+            expectEquals (spaced, juce::String::repeatedString ("a", 63));
+        }
+
         beginTest ("track permissions: author and host only");
         {
             const auto host = newId(), a = newId(), b = newId(), tr = newId(), take = newId(), reg = newId();
