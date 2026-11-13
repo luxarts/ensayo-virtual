@@ -36,6 +36,8 @@ set(ENSAYO_CORE_SOURCES
     # T1
     src/core/Project.cpp
     # T2
+    src/core/Segments.cpp
+    src/client/TakeCache.cpp
     src/core/Protocol.cpp
     src/core/MixMath.cpp
     # T3
@@ -76,6 +78,9 @@ set(ENSAYO_TEST_SOURCES
     tests/BuildConfigTests.cpp
     # T1
     tests/ProjectTests.cpp
+    # T2
+    tests/SegmentsTests.cpp
+    tests/TakeCacheTests.cpp
     # T2-tests
     tests/ProtocolTests.cpp
     tests/MixMathTests.cpp
