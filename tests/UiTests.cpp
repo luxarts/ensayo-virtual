@@ -140,7 +140,7 @@ public:
 
         beginTest ("a stored calibration for the device and buffer shows in the lobby");
         {
-            auto s = writeTestSettings ("Ana", 22246);
+            auto s = writeTestSettings ("Ana", 22233);
             s.calibration[calibrationKey ("", 256)] = 37;
             saveSettings (s, testSettingsFile());
             MainComponent main;
@@ -258,7 +258,7 @@ public:
             }
         }
 
-        beginTest ("a guest joins a link; a lost connection is read-only until Reintentar reconnects");
+        beginTest ("a guest joins a link; a lost connection is read-only (Play with an armed track only plays) until Reintentar reconnects");
         {
             const auto hostUser = newId();
             const auto dir = MainComponent::projectsRoot().getChildFile ("guest-test");
@@ -277,10 +277,22 @@ public:
             expect (main.getDaw().getState().link.contains (host.getSessionId()));
             expect (main.getDaw().getState().online.count (hostUser) == 1, "the host is listed");
 
+            main.getDaw().onAddVoice();
+            expect (waitFor ([&] { auto p = main.getSession().project(); return p != nullptr && p->tracks.size() == 1; }, 5000),
+                    "track never applied");
+            main.getDaw().onArm (main.getSession().project()->tracks[0].id);
+
             main.getSession().getClient()->dropConnectionForTest();
             expect (waitFor ([&] { return ! main.getSession().isConnected(); }, 8000));
             main.refreshSessionView();
             expect (main.getDaw().getState().readOnly);
+
+            // Read-only with my track armed: Play only plays, it does not try to record.
+            const auto before = statusText (main);
+            main.getDaw().onPlay();
+            expect (! main.getSession().isRecording());
+            expectEquals (statusText (main), before);
+            main.getDaw().onPause();
             expectEquals (labelText (main, "status.sync"), ES ("S\xC3\xB3lo lectura: host desconectado"));
             expect (main.getStatus().retry.isEnabled());
             expect (main.isInSession(), "a lost connection keeps the session view");

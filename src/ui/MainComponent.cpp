@@ -926,7 +926,7 @@ void MainComponent::wireDaw()
             c->sendOp (op);
     };
 
-    // Play records when an own track is armed; Pausa ends a take, otherwise it pauses where the cursor is.
+    // Play records when an own track is armed (and the session is connected); Pausa ends a take, otherwise it pauses where the cursor is.
     daw.onPlay = [this]
     {
         if (demoMode)
@@ -940,7 +940,8 @@ void MainComponent::wireDaw()
         if (session.isRecording())
             return;
 
-        if (armedTrack.isNotEmpty())
+        // Read-only (the host is gone): nothing can be recorded, so an armed track does not stop it from playing.
+        if (armedTrack.isNotEmpty() && session.isConnected())
             startTake();
         else
             engine.play();

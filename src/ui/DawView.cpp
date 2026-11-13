@@ -1241,8 +1241,9 @@ struct DawView::Impl
         return std::any_of (state.live.begin(), state.live.end(), [&] (const LiveRegion& l) { return l.track == t.id; });
     }
 
-    // The author or the host, never in read-only mode nor while someone records on the track.
-    bool canDeleteTrack (const Track& t) const { return canEditBase (t) && ! isRecordingOn (t); }
+    // The author or the host, never in read-only mode, during my own take (like every other edit) nor while someone
+    // records on the track.
+    bool canDeleteTrack (const Track& t) const { return canEdit (t) && ! isRecordingOn (t); }
 
     juce::String deleteTooltip (const Track& t) const
     {
@@ -1254,6 +1255,9 @@ struct DawView::Impl
 
         if (isRecordingOn (t))
             return ES ("No se puede borrar una pista mientras se graba en ella");
+
+        if (state.recording)
+            return ES ("No se pueden borrar pistas mientras grab\xC3\xA1s");
 
         return "Borrar la pista";
     }

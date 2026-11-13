@@ -428,7 +428,7 @@ public:
             view.removeFromDesktop();
         }
 
-        beginTest ("the delete button: author or host, confirmation, delete_track, disarm; not while recording on it");
+        beginTest ("the delete button: author or host, confirmation, delete_track, disarm; not while recording on it nor during my take");
         {
             Fixture f;
             DawView view;
@@ -468,14 +468,26 @@ public:
             expect (find (view, "track.1.delete")->isEnabled());
             expect (find (view, "track.3.delete")->isEnabled());
 
-            // Not while recording on that track (me or someone else); other tracks stay deletable.
+            // Not while I record on that track, and during my own take no other track either (like every other edit).
             s = f.state (f.guest);
             s.armedTrack = f.t2;
             s.recording = true;
             view.setState (s);
+            ops.clear();
             expect (! find (view, "track.2.delete")->isEnabled());
             expect (dynamic_cast<juce::SettableTooltipClient*> (find (view, "track.2.delete"))->getTooltip().contains ("graba"));
-            expect (find (view, "track.1.delete")->isEnabled());
+            expect (! find (view, "track.1.delete")->isEnabled(), "my own take locks deleting my other tracks");
+            expect (dynamic_cast<juce::SettableTooltipClient*> (find (view, "track.1.delete"))->getTooltip().contains (ES ("grab\xC3\xA1s")));
+            click (find (view, "track.1.delete"));
+            expect (ops.empty());
+
+            s = f.state (f.host);
+            s.armedTrack = f.t3;
+            s.recording = true;
+            view.setState (s);
+            expect (! find (view, "track.1.delete")->isEnabled(), "the host recording cannot delete a guest's track either");
+
+            // Someone else recording on a track: only that track is locked.
 
             s = f.state (f.host);
             s.live.push_back ({ f.guest, newId(), f.t1, 0, {} });
