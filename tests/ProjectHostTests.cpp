@@ -477,6 +477,14 @@ public:
         expectEquals ((int) bad["index"], 3);
         expectEquals ((int) bad["expected"], 3);
 
+        // Segment 2 was short (12000 samples): it can only be the last one, so a well-formed segment 3 is refused.
+        aData.upload (take, 3, 48000, 1, flacs[0]);
+        bad = aData.waitFor ("segment_bad", 3000);
+        expectEquals ((int) bad["index"], 3);
+        expectEquals ((int) bad["expected"], 3);
+        expect (bad["reason"].toString().contains ("corto"), bad["reason"].toString());
+        expectEquals (host.snapshot()->findTake (take)->samples, (int64_t) 108000);
+
         bData.upload (take, 3, 48000, 1, flacs[0]);
         bad = bData.waitFor ("segment_bad", 3000);
         expectEquals ((int) bad["index"], 3);
@@ -508,6 +516,21 @@ public:
         const auto onlyLast = dData.waitFor ("segment", 5000);
         expectEquals ((int) onlyLast["index"], 2);
         expect (dData.waitFor ("segment", 300).isVoid());
+
+        // A stored segment that cannot be read closes the data connection (the client reconnects and asks again)
+        // instead of silently skipping to the next take and leaving a gap.
+        {
+            const auto stored = dir.getChildFile ("takes").getChildFile (take).getChildFile ("1.flac");
+            const auto aside = stored.getSiblingFile ("1.flac.aside");
+            expect (stored.moveFileTo (aside));
+
+            Client eData (22206);
+            expect (eData.dataHello (c));
+            const auto first = eData.waitFor ("segment", 5000);
+            expectEquals ((int) first["index"], 0);
+            expect (eData.waitForClose (5000), "the data connection stayed open after an unreadable segment");
+            expect (aside.moveFileTo (stored));
+        }
 
         beginTest ("take_complete applies update_take complete:true");
 

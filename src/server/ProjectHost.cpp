@@ -438,7 +438,12 @@ struct ProjectHost::Impl
                 {
                     for (int index = item.from; index < item.to && ! dead.load (std::memory_order_acquire); ++index)
                         if (! sendStoredSegment (item.catchUpTake, index, item.channels))
+                        {
+                            // A gap would leave the client's cache stuck below it: drop the connection so the client
+                            // reconnects and asks again from its own count.
+                            markDead();
                             break;
+                        }
                 }
                 else
                 {
@@ -1292,6 +1297,11 @@ struct ProjectHost::Impl
         if (index != take->segments)
             return bad (take->segments, "fuera de orden");
 
+        // Every segment but the last is exactly segmentSamples long, so segment k starts at k * segmentSamples: a short
+        // segment ends the take and nothing may follow it.
+        if (take->samples != (int64_t) index * segmentSamples)
+            return bad (take->segments, "la toma ya termino con un segmento corto");
+
         if (Sha1::of (bytes.getData(), bytes.getSize()) != sha1)
             return bad (take->segments, "SHA-1 incorrecto");
 
@@ -1315,7 +1325,8 @@ struct ProjectHost::Impl
         const auto* current = project.load()->findTake (take->id);
 
         // Only a take_complete racing this upload can change the take meanwhile.
-        if (current == nullptr || current->segments != index || current->complete)
+        if (current == nullptr || current->segments != index || current->complete
+             || current->samples != (int64_t) index * segmentSamples)
         {
             file.deleteFile();
             return bad (current != nullptr ? current->segments : 0, "la toma cambio durante la subida");
