@@ -1,5 +1,6 @@
 #pragma once
 #include <juce_core/juce_core.h>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -65,6 +66,18 @@ struct AudioPacketView
 size_t encodeAudioPacket (const AudioPacketView&, uint8_t* out, size_t capacity) noexcept;
 // Real-time safe. Pointers in the result point into `data`. False on any malformed field.
 bool decodeAudioPacket (const uint8_t* data, size_t len, AudioPacketView& out) noexcept;
+
+// UDP keepalive (client → host, once a second): 0x00, clientId u32 little-endian, the connection's UDP secret.
+// The secret comes only in that connection's own welcome ("udpSecret", 16 lowercase hex chars), so a clientId
+// learned from presence is not enough to claim someone's endpoint. The host learns a peer's UDP address only from a
+// keepalive with the right secret and relays audio only when it comes from that address.
+using UdpSecret = std::array<uint8_t, 8>;
+constexpr uint8_t keepaliveMarker = 0x00;
+constexpr size_t keepaliveBytes = 1 + 4 + std::tuple_size_v<UdpSecret>;
+void encodeKeepalive (uint32_t clientId, const UdpSecret&, uint8_t* out) noexcept;   // writes keepaliveBytes
+bool decodeKeepalive (const uint8_t* data, size_t len, uint32_t& clientId, UdpSecret&) noexcept;
+juce::String udpSecretToHex (const UdpSecret&);
+std::optional<UdpSecret> udpSecretFromHex (const juce::String&);   // exactly 16 hex chars, either case
 
 // Control channel: one JSON object per line, field "t" = type.
 juce::String makeLine (const juce::var& object);               // JSON + '\n', single line

@@ -42,9 +42,6 @@ namespace
     constexpr size_t maxConnections = 64;                    // live identified TCP connections (control + data)
     constexpr size_t maxUnidentified = 16;                   // connections still waiting for hello / data_hello
     constexpr int64_t firstLineDeadlineMs = 5000;            // no complete hello / data_hello by then: closed
-    constexpr int64_t endpointSilenceMs = 2000;
-    constexpr uint8_t keepaliveByte = 0x00;
-    constexpr int keepaliveBytes = 5;                        // 0x00 + clientId u32 little-endian
 
     // Linear scan of the bracket/brace nesting (ignoring characters inside strings).
     bool nestsDeeperThan (const char* data, size_t len, int maxDepth) noexcept
@@ -716,11 +713,11 @@ struct ProjectHost::Impl
         Id user;
         juce::String name, token;
         uint32_t clientId = 0;
+        UdpSecret udpSecret {};               // control only; sent only in this connection's welcome
         std::optional<Recording> recording;   // control only, under stateLock
 
         // UDP (read lock-free by the UDP thread through udpPeers).
         std::atomic<uint64_t> udpAddress { 0 };     // ip << 16 | port, 0 = unknown
-        std::atomic<int64_t> udpLastSeenMs { 0 };
     };
 
     using ConnectionPtr = std::shared_ptr<Connection>;
@@ -1108,8 +1105,10 @@ struct ProjectHost::Impl
             clientId = randomClientId();
 
         const auto token = randomToken();
+        UdpSecret udpSecret {};
+        const bool secretOk = secureRandom (udpSecret.data(), udpSecret.size());
 
-        if (! clientId || ! token)
+        if (! clientId || ! token || ! secretOk)
         {
             log ("BCryptGenRandom fallo: se rechaza la conexion de " + name);
             return refuse (c, "error interno");
@@ -1129,10 +1128,11 @@ struct ProjectHost::Impl
         c.name = name;
         c.clientId = *clientId;
         c.token = *token;
+        c.udpSecret = udpSecret;
         c.identified.store (true, std::memory_order_release);
 
         c.send (object ({ { "t", "welcome" }, { "clientId", (int) *clientId }, { "token", c.token },
-                          { "udpPort", boundPort }, { "isHost", user == hostUser },
+                          { "udpPort", boundPort }, { "udpSecret", udpSecretToHex (udpSecret) }, { "isHost", user == hostUser },
                           { "project", toVar (*project.load()) } }));
 
         controls.push_back (std::move (self));
@@ -1552,18 +1552,15 @@ struct ProjectHost::Impl
                 continue;   // e.g. WSAEMSGSIZE, WSAECONNRESET
             }
 
+            // A keepalive with the connection's secret is the only way to set (or move) its UDP endpoint; audio is
+            // relayed only from that endpoint. clientIds are public (presence), the secrets are not.
             uint32_t clientId = 0;
-            const bool keepalive = n == keepaliveBytes && buffer[0] == keepaliveByte;
+            UdpSecret secret {};
+            const bool keepalive = decodeKeepalive (buffer, (size_t) n, clientId, secret);
+            AudioPacketView view;
 
-            if (keepalive)
+            if (! keepalive)
             {
-                clientId = (uint32_t) buffer[1] | ((uint32_t) buffer[2] << 8) | ((uint32_t) buffer[3] << 16)
-                         | ((uint32_t) buffer[4] << 24);
-            }
-            else
-            {
-                AudioPacketView view;
-
                 if (! decodeAudioPacket (buffer, (size_t) n, view))
                     continue;
 
@@ -1584,19 +1581,20 @@ struct ProjectHost::Impl
                 continue;
 
             const auto packed = packAddress (from);
-            const auto now = nowMs();
-            const auto known = sender->udpAddress.load (std::memory_order_acquire);
-
-            if (known != 0 && known != packed && now - sender->udpLastSeenMs.load (std::memory_order_relaxed) < endpointSilenceMs)
-                continue;   // someone else is still sending from the recorded address
-
-            if (known != packed)
-                sender->udpAddress.store (packed, std::memory_order_release);
-
-            sender->udpLastSeenMs.store (now, std::memory_order_relaxed);
 
             if (keepalive)
+            {
+                if (secret != sender->udpSecret)
+                    continue;
+
+                if (sender->udpAddress.load (std::memory_order_acquire) != packed)
+                    sender->udpAddress.store (packed, std::memory_order_release);
+
                 continue;
+            }
+
+            if (sender->udpAddress.load (std::memory_order_acquire) != packed)
+                continue;   // not from the endpoint its keepalive proved
 
             for (auto& p : *peers)
             {

@@ -149,6 +149,41 @@ bool decodeAudioPacket (const uint8_t* data, size_t len, AudioPacketView& out) n
     return true;
 }
 
+void encodeKeepalive (uint32_t clientId, const UdpSecret& secret, uint8_t* out) noexcept
+{
+    out[0] = keepaliveMarker;
+    writeU32 (out + 1, clientId);
+    std::memcpy (out + 5, secret.data(), secret.size());
+}
+
+bool decodeKeepalive (const uint8_t* data, size_t len, uint32_t& clientId, UdpSecret& secret) noexcept
+{
+    if (data == nullptr || len != keepaliveBytes || data[0] != keepaliveMarker)
+        return false;
+
+    clientId = readU32 (data + 1);
+    std::memcpy (secret.data(), data + 5, secret.size());
+    return true;
+}
+
+juce::String udpSecretToHex (const UdpSecret& secret)
+{
+    return juce::String::toHexString (secret.data(), (int) secret.size(), 0).toLowerCase();
+}
+
+std::optional<UdpSecret> udpSecretFromHex (const juce::String& text)
+{
+    if (text.length() != (int) (2 * std::tuple_size_v<UdpSecret>) || ! text.containsOnly ("0123456789abcdefABCDEF"))
+        return std::nullopt;
+
+    UdpSecret secret {};
+
+    for (size_t i = 0; i < secret.size(); ++i)
+        secret[i] = (uint8_t) text.substring ((int) (2 * i), (int) (2 * i + 2)).getHexValue32();
+
+    return secret;
+}
+
 juce::String makeLine (const juce::var& object)
 {
     return juce::JSON::toString (object, true) + "\n";

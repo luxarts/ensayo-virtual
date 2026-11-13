@@ -632,13 +632,25 @@ public:
         juce::DatagramSocket ua, ub, uc;
         expect (ua.bindToPort (0) && ub.bindToPort (0) && uc.bindToPort (0));
 
-        auto keepalive = [] (juce::DatagramSocket& s, const juce::var& welcome)
+        // Each welcome carries a private UDP secret; only a keepalive with it teaches the host an endpoint.
+        for (const auto* w : { &a.welcome, &b.welcome, &c.welcome })
+            expect (udpSecretFromHex ((*w)["udpSecret"].toString()).has_value(), "welcome carries a udpSecret");
+
+        expect (a.welcome["udpSecret"].toString() != b.welcome["udpSecret"].toString());
+
+        auto keepaliveWith = [] (juce::DatagramSocket& s, const juce::var& welcome, UdpSecret secret)
         {
-            const auto id = (uint32_t) (int) welcome["clientId"];
-            const uint8_t bytes[5] { 0x00, (uint8_t) id, (uint8_t) (id >> 8), (uint8_t) (id >> 16), (uint8_t) (id >> 24) };
-            s.write ("127.0.0.1", 22210, bytes, 5);
+            uint8_t bytes[keepaliveBytes];
+            encodeKeepalive ((uint32_t) (int) welcome["clientId"], secret, bytes);
+            s.write ("127.0.0.1", 22210, bytes, (int) keepaliveBytes);
         };
 
+        auto keepalive = [&] (juce::DatagramSocket& s, const juce::var& welcome)
+        {
+            keepaliveWith (s, welcome, udpSecretFromHex (welcome["udpSecret"].toString()).value_or (UdpSecret {}));
+        };
+
+        keepalive (ua, a.welcome);
         keepalive (ub, b.welcome);
         keepalive (uc, c.welcome);
 
@@ -674,6 +686,7 @@ public:
 
         for (int attempt = 0; attempt < 20 && ! (receivedB && receivedC); ++attempt)
         {
+            keepalive (ua, a.welcome);
             keepalive (ub, b.welcome);
             keepalive (uc, c.welcome);
             ua.write ("127.0.0.1", 22210, packet, (int) len);
@@ -700,6 +713,32 @@ public:
         }
 
         expect (afterListenOff, "listen:false does not stop the relay");
+
+        // Spoofing: someone who knows B's and A's clientIds (they are in presence) but not their secrets can neither
+        // redirect B's audio to itself nor inject audio as A.
+        juce::DatagramSocket ux;
+        expect (ux.bindToPort (0));
+        UdpSecret wrong {};
+        wrong.fill (0x5a);
+        keepaliveWith (ux, b.welcome, wrong);
+        {
+            const auto id = (uint32_t) (int) b.welcome["clientId"];   // the old 5-byte keepalive
+            const uint8_t old[5] { 0x00, (uint8_t) id, (uint8_t) (id >> 8), (uint8_t) (id >> 16), (uint8_t) (id >> 24) };
+            ux.write ("127.0.0.1", 22210, old, 5);
+        }
+        juce::Thread::sleep (100);
+
+        while (ub.waitUntilReady (true, 0) == 1) ub.read (in, sizeof (in), false);
+        while (uc.waitUntilReady (true, 0) == 1) uc.read (in, sizeof (in), false);
+
+        ua.write ("127.0.0.1", 22210, packet, (int) len);
+        expect (readExact (ub) || readExact (ub), "B still gets A's audio at its own endpoint");
+        expect (ux.waitUntilReady (true, 200) != 1, "a keepalive without B's secret does not redirect B's audio");
+
+        while (uc.waitUntilReady (true, 0) == 1) uc.read (in, sizeof (in), false);
+
+        ux.write ("127.0.0.1", 22210, packet, (int) len);   // claims A's clientId from another endpoint
+        expect (uc.waitUntilReady (true, 300) != 1, "audio from an endpoint that is not the sender's is not relayed");
     }
 
     void testPresence()

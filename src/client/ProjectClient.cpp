@@ -303,6 +303,7 @@ struct ProjectClient::Impl
     bool welcomed = false, connected = false, hostFlag = false, resyncing = false;
     juce::String hostError, token;
     int udpPort = 0;
+    UdpSecret udpSecret {};                 // from the welcome; proves our UDP endpoint to the host
     std::shared_ptr<const Project> replica;
     std::vector<Presence> presenceList;
     std::vector<LiveRecording> live;
@@ -1027,6 +1028,7 @@ struct ProjectClient::Impl
         token = m["token"].toString();
         udpPort = (int) readInteger (m["udpPort"], 1, 65535).value_or (link.port);
         clientId.store ((uint32_t) *id);
+        udpSecret = udpSecretFromHex (m["udpSecret"].toString()).value_or (UdpSecret {});   // none: no live audio
 
         TakeCache* cachePtr = nullptr;
 
@@ -1535,7 +1537,16 @@ struct ProjectClient::Impl
        #if JUCE_WINDOWS
         const auto host = link.host;
         const auto port = udpPort;
-        udp = std::make_unique<FnThread> ("EnsayoProjectUdp", [this, host, port] (FnThread& t) { udpLoop (t, host, port); });
+        const auto secret = udpSecret;
+
+        // Nothing queued for an earlier connection goes out on this one (no send thread runs now: safe to pop).
+        std::array<uint8_t, maxPacketBytes> stale;
+        size_t staleLen = 0;
+
+        for (auto& queue : outgoing)
+            while (queue.pop (stale.data(), staleLen)) {}
+
+        udp = std::make_unique<FnThread> ("EnsayoProjectUdp", [this, host, port, secret] (FnThread& t) { udpLoop (t, host, port, secret); });
         udp->startThread (juce::Thread::Priority::highest);
        #endif
     }
@@ -1561,7 +1572,7 @@ struct ProjectClient::Impl
     }
 
    #if JUCE_WINDOWS
-    void udpLoop (FnThread& t, const juce::String& host, int port)
+    void udpLoop (FnThread& t, const juce::String& host, int port, UdpSecret secret)
     {
         WSADATA wsaData;
 
@@ -1627,7 +1638,7 @@ struct ProjectClient::Impl
         HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);
 
         {
-            FnThread sender ("EnsayoProjectUdpSend", [this, server] (FnThread& st) { udpSendLoop (st, server); });
+            FnThread sender ("EnsayoProjectUdpSend", [this, server, secret] (FnThread& st) { udpSendLoop (st, server, secret); });
             sender.startThread (juce::Thread::Priority::highest);
 
             std::vector<uint8_t> incoming (2048);
@@ -1680,7 +1691,7 @@ struct ProjectClient::Impl
         WSACleanup();
     }
 
-    void udpSendLoop (FnThread& t, sockaddr_in server)
+    void udpSendLoop (FnThread& t, sockaddr_in server, UdpSecret secret)
     {
         DWORD taskIndex = 0;
         HANDLE mmcss = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);
@@ -1712,7 +1723,8 @@ struct ProjectClient::Impl
             // Always on: the host relays the others' live audio to every peer whose UDP endpoint it knows.
             if (sock != INVALID_SOCKET && id != 0 && now >= nextKeepalive)
             {
-                const uint8_t keepalive[5] = { 0x00, (uint8_t) id, (uint8_t) (id >> 8), (uint8_t) (id >> 16), (uint8_t) (id >> 24) };
+                uint8_t keepalive[keepaliveBytes];
+                encodeKeepalive (id, secret, keepalive);
                 sendto (sock, (const char*) keepalive, (int) sizeof (keepalive), 0, (const sockaddr*) &server, sizeof (server));
                 nextKeepalive = now + (juce::uint32) keepaliveIntervalMs;
             }

@@ -43,7 +43,8 @@ Ampliación de `2026-11-13-grabacion-multipista-design.md` a partir de la primer
 
 ## 5. Protocolo
 
-- El paquete de audio UDP indica el tipo de stream (voz o instrumento), por un campo o por un bit del encabezado existente. El host lo reenvía sin cambios a todos los demás conectados, sin la condición previa de "escuchando". El keepalive no cambia.
+- El paquete de audio UDP indica el tipo de stream (voz o instrumento) con los bits `voice`/`instrument` de `flags` del encabezado existente. El host lo reenvía sin cambios a todos los demás conectados que tengan una dirección UDP conocida, sin la condición previa de "escuchando" (el mensaje `listen` se acepta y se ignora).
+- Cada conexión recibe en su propio `welcome` un secreto UDP privado (`udpSecret`, 8 bytes en 16 caracteres hex). El keepalive pasa a tener 13 bytes: `0x00`, `clientId` u32 little-endian y el secreto. El host aprende o actualiza la dirección UDP de una conexión solo con un keepalive que trae su secreto, y reenvía un paquete de audio solo si llega desde esa dirección. Como el `clientId` es público (va en la presencia), sin el secreto nadie puede desviar ni suplantar el audio de otro.
 - La presencia que difunde el host incluye el `clientId` de cada conexión en línea para que los clientes mapeen emisor → usuario.
 
 ## 6. Pruebas

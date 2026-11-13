@@ -157,6 +157,36 @@ public:
             expect (streamKindOf (out.flags) == StreamKind::instrument);
         }
 
+        beginTest ("keepalive carries the clientId and the UDP secret; secrets round-trip as hex");
+        {
+            UdpSecret secret { 1, 2, 3, 4, 0xa5, 0xb6, 0xc7, 0xff };
+            const auto hex = udpSecretToHex (secret);
+            expectEquals (hex, juce::String ("01020304a5b6c7ff"));
+            expect (udpSecretFromHex (hex) == secret);
+            expect (udpSecretFromHex ("01020304A5B6C7FF") == secret);
+            expect (! udpSecretFromHex ("0102").has_value());
+            expect (! udpSecretFromHex ("01020304a5b6c7fg").has_value());
+            expect (! udpSecretFromHex ({}).has_value());
+
+            uint8_t wire[keepaliveBytes];
+            expectEquals (keepaliveBytes, (size_t) 13);
+            encodeKeepalive (0x12345678u, secret, wire);
+            expectEquals ((int) wire[0], 0);
+            expectEquals ((int) wire[1], 0x78);
+            expectEquals ((int) wire[4], 0x12);
+            expectEquals ((int) wire[5], 1);
+            expectEquals ((int) wire[12], 0xff);
+
+            uint32_t id = 0;
+            UdpSecret back {};
+            expect (decodeKeepalive (wire, sizeof (wire), id, back));
+            expectEquals (id, 0x12345678u);
+            expect (back == secret);
+            expect (! decodeKeepalive (wire, 5, id, back), "the old 5-byte keepalive is refused");
+            wire[0] = packetMagic;
+            expect (! decodeKeepalive (wire, sizeof (wire), id, back));
+        }
+
         beginTest ("decode rejects malformed packets");
         {
             std::array<uint8_t, 24> voice {};
