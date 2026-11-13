@@ -1,4 +1,5 @@
 #include "core/Project.h"
+#include <limits>
 #include <set>
 
 namespace ensayo
@@ -208,6 +209,82 @@ public:
             expect (applyOp (p, Ops::trimRegion (tr, r1, 3100, 600, 1000), host).ok);
             const auto& last = p.findTrack (tr)->regions.back();
             expect (last.id == r1 && last.start == 3100 && last.offset == 600 && last.length == 1000);
+        }
+
+        beginTest ("huge int64 values cannot overflow region invariants");
+        {
+            const auto host = newId(), tr = newId(), take = newId(), reg = newId();
+            const auto big = std::numeric_limits<int64_t>::max();
+            auto p = makeProject ("T", host, "Lucas");
+            applyOp (p, Ops::addTake (take, 1), host);
+            applyOp (p, Ops::updateTake (take, 1, 10000, true), host);
+            applyOp (p, Ops::addTrack (tr, "A", TrackKind::voice), host);
+
+            expect (! applyOp (p, Ops::addRegion (tr, { newId(), take, 0, big, 1 }), host).ok);
+            expect (! applyOp (p, Ops::addRegion (tr, { newId(), take, big, 0, 1 }), host).ok);
+            expect (! applyOp (p, Ops::addRegion (tr, { newId(), take, big - 5, 0, 100 }), host).ok);
+            expect (! applyOp (p, Ops::addRegion (tr, { newId(), take, 0, 0, big }), host).ok);
+            expect (applyOp (p, Ops::addRegion (tr, { reg, take, 0, 0, 100 }), host).ok);
+
+            expect (! applyOp (p, Ops::moveRegion (tr, reg, big), host).ok);
+            expect (! applyOp (p, Ops::trimRegion (tr, reg, 0, big, 1), host).ok);
+            expect (! applyOp (p, Ops::trimRegion (tr, reg, big, big, 1), host).ok);
+            expect (! applyOp (p, Ops::trimRegion (tr, reg, 0, 0, big), host).ok);
+            expect (! applyOp (p, Ops::splitRegion (tr, reg, big, newId()), host).ok);
+            expect (! applyOp (p, Ops::updateTake (take, 1, big, true), host).ok);
+            expectEquals (p.findTrack (tr)->regions[0].length, (int64_t) 100);
+        }
+
+        beginTest ("beatsPerBar is limited to 1..12");
+        {
+            const auto host = newId();
+            auto p = makeProject ("T", host, "Lucas");
+            expect (applyOp (p, Ops::setTempo (120.0, 1), host).ok);
+            expect (applyOp (p, Ops::setTempo (120.0, 12), host).ok);
+            expect (! applyOp (p, Ops::setTempo (120.0, 0), host).ok);
+            expect (! applyOp (p, Ops::setTempo (120.0, 13), host).ok);
+        }
+
+        beginTest ("loader rejects projects that break the invariants");
+        {
+            const auto host = newId(), tr = newId(), take = newId();
+            auto p = makeProject ("T", host, "Lucas");
+            applyOp (p, Ops::addTake (take, 1), host);
+            applyOp (p, Ops::updateTake (take, 1, 1000, true), host);
+            applyOp (p, Ops::addTrack (tr, "A", TrackKind::voice), host);
+            applyOp (p, Ops::addRegion (tr, { newId(), take, 0, 0, 500 }), host);
+
+            juce::String err;
+            expect (projectFromVar (toVar (p), err).has_value(), err);
+
+            // Edits the serialized project, then expects the loader to refuse it and name the field.
+            auto rejects = [&] (const juce::String& what, const juce::String& field, auto&& mutate)
+            {
+                auto v = toVar (p);
+                mutate (v);
+                juce::String e;
+                expect (! projectFromVar (v, e).has_value(), what);
+                expect (e.containsIgnoreCase (field), what + ": error was " + e);
+            };
+
+            auto track0 = [] (juce::var& v) { return v["tracks"][0].getDynamicObject(); };
+            auto region0 = [] (juce::var& v) { return v["tracks"][0]["regions"][0].getDynamicObject(); };
+
+            rejects ("bpm 0", "bpm", [] (juce::var& v) { v.getDynamicObject()->setProperty ("bpm", 0.0); });
+            rejects ("beatsPerBar 13", "beatsPerBar", [] (juce::var& v) { v.getDynamicObject()->setProperty ("beatsPerBar", 13); });
+            rejects ("beatsPerBar huge", "beatsPerBar", [] (juce::var& v) { v.getDynamicObject()->setProperty ("beatsPerBar", (juce::int64) 1 << 33); });
+            rejects ("empty name", "name", [] (juce::var& v) { v.getDynamicObject()->setProperty ("name", ""); });
+            rejects ("gain 1000", "gain", [&] (juce::var& v) { track0 (v)->setProperty ("gainDb", 1000.0); });
+            rejects ("channels 3", "channels", [] (juce::var& v) { v["takes"][0].getDynamicObject()->setProperty ("channels", 3); });
+            rejects ("missing take", "take", [&] (juce::var& v) { region0 (v)->setProperty ("take", newId()); });
+            rejects ("region beyond take", "regions", [&] (juce::var& v) { region0 (v)->setProperty ("length", 5000); });
+            rejects ("duplicate track ids", "tracks.id", [] (juce::var& v)
+            {
+                auto* tracks = v["tracks"].getArray();
+                auto copy = (*tracks)[0].clone();
+                copy.getDynamicObject()->setProperty ("regions", juce::Array<juce::var>());
+                tracks->add (copy);
+            });
         }
 
         beginTest ("set_tempo and rename_project are host only");

@@ -1,7 +1,9 @@
 #include "core/Project.h"
 #include "core/Sha1.h"
+#include <algorithm>
 #include <climits>
 #include <cmath>
+#include <utility>
 
 namespace ensayo
 {
@@ -9,7 +11,9 @@ namespace
 {
 constexpr int maxNameLength = 64;
 constexpr double minBpm = 30.0, maxBpm = 300.0;
-constexpr int maxBeatsPerBar = 32;
+constexpr int maxBeatsPerBar = 12;
+// Every position, offset and length stays below this, so sums of two of them can never overflow int64.
+constexpr int64_t maxSamples = (int64_t) 1 << 40;
 
 juce::var makeObject (std::initializer_list<std::pair<const char*, juce::var>> props)
 {
@@ -67,6 +71,19 @@ public:
 
         fail (juce::String ("not an integer: ") + key);
         return 0;
+    }
+
+    int integer32 (const char* key)
+    {
+        const auto n = integer (key);
+
+        if (n < INT_MIN || n > INT_MAX)
+        {
+            fail (juce::String ("out of range: ") + key);
+            return 0;
+        }
+
+        return (int) n;
     }
 
     double number (const char* key)
@@ -142,6 +159,18 @@ juce::var trackToVar (const Track& t)
     return makeObject ({ { "id", t.id }, { "name", t.name }, { "author", t.author },
                          { "kind", trackKindToString (t.kind) }, { "gainDb", (double) t.gainDb },
                          { "pan", (double) t.pan }, { "muted", t.muted }, { "regions", regions } });
+}
+
+bool validTempo (double bpm, int64_t beats) noexcept
+{
+    return std::isfinite (bpm) && bpm >= minBpm && bpm <= maxBpm && beats >= 1 && beats <= maxBeatsPerBar;
+}
+
+bool validRegion (const Region& r, const Take& take) noexcept
+{
+    return r.start >= 0 && r.start <= maxSamples && r.offset >= 0 && r.offset <= maxSamples
+        && r.length >= 1 && r.length <= maxSamples
+        && r.length <= take.samples && r.offset <= take.samples - r.length;
 }
 
 bool validName (const juce::String& trimmed)   { return trimmed.isNotEmpty() && trimmed.length() <= maxNameLength; }
@@ -220,8 +249,7 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
             const auto beats = r.integer ("beatsPerBar");
 
             if (! r.ok)  return bad();
-            if (bpm < minBpm || bpm > maxBpm)  return fail ("bpm out of range");
-            if (beats < 1 || beats > maxBeatsPerBar)  return fail ("beatsPerBar out of range");
+            if (! validTempo (bpm, beats))  return fail ("tempo out of range");
 
             p.bpm = bpm;
             p.beatsPerBar = (int) beats;
@@ -287,7 +315,7 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
         if (take == nullptr)                       return fail ("unknown take");
         if (by != take->author && ! isHost)        return fail ("not allowed to update this take");
         if (segments < take->segments || segments > INT_MAX)  return fail ("segments can only grow");
-        if (samples < take->samples)               return fail ("samples can only grow");
+        if (samples < take->samples || samples > maxSamples)  return fail ("samples can only grow, up to the maximum");
         if (take->complete && ! complete)          return fail ("a complete take cannot be reopened");
 
         take->segments = (int) segments;
@@ -359,8 +387,7 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
 
         if (take == nullptr)  return fail ("unknown take");
         if (idUsedByRegion (p, reg.id))  return fail ("region id in use");
-        if (reg.start < 0 || reg.offset < 0 || reg.length < 1)  return fail ("invalid region bounds");
-        if (reg.offset + reg.length > take->samples)  return fail ("region reaches beyond the take");
+        if (! validRegion (reg, *take))  return fail ("invalid region bounds");
 
         track->regions.push_back (reg);
         return success();
@@ -391,7 +418,7 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
 
         const auto left = regions[(size_t) index];
 
-        if (at <= left.start || at >= left.end())  return fail ("split point outside the region");
+        if (at <= left.start || at >= left.end() || at > maxSamples)  return fail ("split point outside the region");
         if (idUsedByRegion (p, newRegion))  return fail ("region id in use");
 
         Region right { newRegion, left.take, at, left.offset + (at - left.start), left.end() - at };
@@ -405,7 +432,7 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
         const auto start = r.integer ("start");
 
         if (! r.ok)  return bad();
-        if (start < 0)  return fail ("invalid start");
+        if (start < 0 || start > maxSamples)  return fail ("invalid start");
 
         auto moved = regions[(size_t) index];
         moved.start = start;
@@ -426,8 +453,13 @@ OpResult apply (Project& p, const juce::var& opVar, const Id& by)
         const auto* take = p.findTake (trimmed.take);
 
         if (take == nullptr)  return fail ("unknown take");
-        if (start < 0 || offset < 0 || length < 1)  return fail ("invalid region bounds");
-        if (offset + length > take->samples)  return fail ("region reaches beyond the take");
+
+        Region candidate = trimmed;
+        candidate.start = start;
+        candidate.offset = offset;
+        candidate.length = length;
+
+        if (! validRegion (candidate, *take))  return fail ("invalid region bounds");
         if (start - offset != trimmed.start - trimmed.offset)  return fail ("trim must keep the audio anchored");
 
         trimmed.start = start;
@@ -554,17 +586,79 @@ juce::var toVar (const Project& p)
                          { "version", i64 (p.version) }, { "users", users }, { "takes", takes }, { "tracks", tracks } });
 }
 
+// Same invariants applyOp keeps; returns an error naming the offending field, or "" when the project is sound.
+static juce::String checkProject (const Project& p)
+{
+    auto trimmedName = [] (const juce::String& n) { return n == n.trim() && validName (n); };
+
+    if (p.version < 0)  return "version: negative";
+    if (! trimmedName (p.name))  return "name: invalid";
+    if (! validTempo (p.bpm, p.beatsPerBar))  return "bpm/beatsPerBar: out of range";
+
+    for (size_t i = 0; i < p.users.size(); ++i)
+    {
+        if (! trimmedName (p.users[i].name))  return "users.name: invalid";
+
+        for (size_t j = 0; j < i; ++j)
+            if (p.users[j].id == p.users[i].id)  return "users.id: duplicate";
+    }
+
+    for (size_t i = 0; i < p.takes.size(); ++i)
+    {
+        const auto& t = p.takes[i];
+
+        if (t.channels != 1 && t.channels != 2)  return "takes.channels: must be 1 or 2";
+        if (t.segments < 0)  return "takes.segments: negative";
+        if (t.samples < 0 || t.samples > maxSamples)  return "takes.samples: out of range";
+
+        for (size_t j = 0; j < i; ++j)
+            if (p.takes[j].id == t.id)  return "takes.id: duplicate";
+    }
+
+    for (size_t i = 0; i < p.tracks.size(); ++i)
+    {
+        const auto& t = p.tracks[i];
+
+        if (! trimmedName (t.name))  return "tracks.name: invalid";
+        if (! validMix (t.gainDb, t.pan))  return "tracks.gainDb/pan: out of range";
+
+        for (size_t j = 0; j < i; ++j)
+            if (p.tracks[j].id == t.id)  return "tracks.id: duplicate";
+
+        for (const auto& r : t.regions)
+        {
+            const auto* take = p.findTake (r.take);
+
+            if (take == nullptr)  return "regions.take: unknown take";
+            if (! validRegion (r, *take))  return "regions: invalid bounds";
+        }
+    }
+
+    // Region ids are unique across the whole project.
+    std::vector<juce::String> seen;
+
+    for (const auto& t : p.tracks)
+        for (const auto& r : t.regions)
+            seen.push_back (r.id);
+
+    std::sort (seen.begin(), seen.end());
+
+    if (std::adjacent_find (seen.begin(), seen.end()) != seen.end())  return "regions.id: duplicate";
+
+    return {};
+}
+
 std::optional<Project> projectFromVar (const juce::var& v, juce::String& error)
 {
     Reader r (v);
     Project p;
-    p.format = (int) r.integer ("format");
+    p.format = r.integer32 ("format");
     p.id = r.id ("id");
     p.name = r.str ("name");
     p.hostUser = r.id ("hostUser");
     const auto rate = r.integer ("sampleRate");
     p.bpm = r.number ("bpm");
-    p.beatsPerBar = (int) r.integer ("beatsPerBar");
+    p.beatsPerBar = r.integer32 ("beatsPerBar");
     p.version = r.integer ("version");
 
     if (r.ok && p.format != 1)  { error = "unsupported format"; return std::nullopt; }
@@ -586,8 +680,8 @@ std::optional<Project> projectFromVar (const juce::var& v, juce::String& error)
             Take take;
             take.id = t.id ("id");
             take.author = t.id ("author");
-            take.channels = (int) t.integer ("channels");
-            take.segments = (int) t.integer ("segments");
+            take.channels = t.integer32 ("channels");
+            take.segments = t.integer32 ("segments");
             take.samples = t.integer ("samples");
             take.complete = t.boolean ("complete");
 
@@ -638,6 +732,11 @@ std::optional<Project> projectFromVar (const juce::var& v, juce::String& error)
         error = r.error;
         return std::nullopt;
     }
+
+    error = checkProject (p);
+
+    if (error.isNotEmpty())
+        return std::nullopt;
 
     return p;
 }
