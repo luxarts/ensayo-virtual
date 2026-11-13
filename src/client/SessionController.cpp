@@ -358,6 +358,7 @@ juce::Result SessionController::startTake (const Id& trackId)
         else
             post ([this, message] { if (onError) onError ("Error grabando: " + message); });
     };
+    recorder.onWarning = [this] (const juce::String& message) { post ([this, message] { if (onWarning) onWarning (message); }); };
 
     // Fires on the writer thread when the take ends, normally inside stopRecording; by itself only when a segment
     // could not be encoded (the recorder stops) - then the take is stopped and finished from the message thread.

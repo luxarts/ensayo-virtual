@@ -1,6 +1,7 @@
 #include "client/Recorder.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace ensayo
 {
@@ -11,6 +12,7 @@ constexpr int rate = 48000;
 constexpr int chunkSamples = 4096;
 constexpr int writerPollMs = 20;
 constexpr int peakPublishMs = 100;
+constexpr int lostReportMs = 1000;
 }
 
 int64_t recordingOffset (int64_t countInSamples, int inputLatency, int outputLatency, int calibration) noexcept
@@ -298,6 +300,33 @@ void Recorder::writerLoop()
     int64_t fifoRead = 0;                 // samples read from the FIFO
     int64_t nextGap = -1, nextGapLength = 0, silenceLeft = 0;
 
+    // Overflow reports: every gap adds to lostSamples; a report (running total) goes out at most once per
+    // lostReportMs, and once more at the end if the last gaps were not reported yet.
+    int64_t lostSamples = 0, reportedLost = 0;
+    juce::uint32 lastLostReport = 0;
+    bool lostReported = false;
+
+    auto reportLost = [&] (bool final)
+    {
+        if (lostSamples == reportedLost)
+            return;
+
+        const auto now = juce::Time::getMillisecondCounter();
+
+        if (! final && lostReported && now - lastLostReport < (juce::uint32) lostReportMs)
+            return;
+
+        lostReported = true;
+        lastLostReport = now;
+        reportedLost = lostSamples;
+
+        if (onWarning)
+            onWarning (juce::String (juce::CharPointer_UTF8 ("Se perdieron "))
+                       + juce::String ((juce::int64) std::llround ((double) lostSamples * 1000.0 / rate))
+                       + juce::String (juce::CharPointer_UTF8 (" ms de audio en total porque la grabaci\xc3\xb3n no dio abasto; "
+                                                               "se rellenaron con silencio y la toma sigue alineada")));
+    };
+
     // Moves one chunk (from the FIFO, or silence for an overflow gap) through the WAV, the segmenter, the peaks and
     // the live preview.
     auto drainChunk = [&] () -> bool
@@ -320,12 +349,8 @@ void Recorder::writerLoop()
         {
             silenceLeft = nextGapLength;
             nextGap = -1;
-
-            if (onError)
-                onError (juce::String (juce::CharPointer_UTF8 ("Se perdieron "))
-                         + juce::String ((double) silenceLeft * 1000.0 / rate, 0)
-                         + juce::String (juce::CharPointer_UTF8 (" ms de audio porque la grabaci\xc3\xb3n no dio abasto; "
-                                                                 "se rellenaron con silencio y la toma sigue alineada")));
+            lostSamples += silenceLeft;
+            reportLost (false);
         }
 
         if (silenceLeft > 0)
@@ -370,6 +395,8 @@ void Recorder::writerLoop()
         if (stopping || ! paused.load())
             while (drainChunk()) {}
 
+        reportLost (false);   // gaps held back by the once-a-second limit go out when it allows
+
         if (encodeFailed)
             break;
 
@@ -387,6 +414,7 @@ void Recorder::writerLoop()
 
     cutSegment (w.segmentFill);              // the partial last segment; never retried after an encode failure
     publishPeaks();
+    reportLost (true);
     w.wav.reset();                           // closes the file and finalises the header
 
     if (onFinished)

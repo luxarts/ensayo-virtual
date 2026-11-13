@@ -31,6 +31,7 @@ public:
         int64_t finishedSamples = -1;
         int finishedCalls = 0;
         int errors = 0;
+        juce::StringArray warnings;
     };
 
     static void attach (Recorder& r, Collected& c)
@@ -57,6 +58,11 @@ public:
         {
             std::lock_guard<std::mutex> g (c.lock);
             ++c.errors;
+        };
+        r.onWarning = [&c] (const juce::String& message)
+        {
+            std::lock_guard<std::mutex> g (c.lock);
+            c.warnings.add (message);
         };
         r.onFinished = [&c] (int segments, int64_t samples)
         {
@@ -262,7 +268,9 @@ public:
             expectEquals (rec.samplesDropped(), droppedFirst);
             expectEquals (c.finishedSamples, total);
             expectEquals (c.liveSamples, total);
-            expectEquals (c.errors, 1);
+            expectEquals (c.errors, 0);
+            expectEquals (c.warnings.size(), 1);
+            expect (c.warnings[0].contains (" " + juce::String ((juce::int64) std::llround ((double) droppedFirst * 1000.0 / 48000.0)) + " ms"), c.warnings.joinIntoString ("|"));
 
             // Decode the segments back to back: ramp until the overflow, silence for the dropped samples, then the
             // ramp again at its own device positions.
@@ -291,6 +299,49 @@ public:
             }
 
             expectEquals (mismatches, (int64_t) 0);
+        }
+
+        beginTest ("many overflow gaps in a burst are reported at most once a second, with the running total");
+        {
+            Recorder rec;
+            Collected c;
+            attach (rec, c);
+            expect (rec.start (newId(), 1, testDir().getChildFile ("overflow-burst.wav")).wasOk());
+            rec.setWriterPausedForTest (true);
+
+            // Fill the paused FIFO until 1000 samples are free, then alternate a block that does not fit (dropped) with
+            // one sample that does (publishes the gap): 50 separate gaps, drained in one go.
+            std::vector<float> block (2048, 0.25f);
+            const float* ch[1] = { block.data() };
+            int64_t pushed = 0;
+
+            while (pushed + 256 <= 8 * 48000 - 1000)
+            {
+                rec.push (ch, 256);
+                pushed += 256;
+            }
+
+            const int free = (int) (8 * 48000 - pushed);
+            constexpr int gaps = 50;
+
+            for (int g = 0; g < gaps; ++g)
+            {
+                rec.push (ch, free - g + 1);   // one more than the space left: dropped
+                rec.push (ch, 1);
+            }
+
+            expectEquals ((int) rec.overflows(), gaps);
+            const auto lost = rec.samplesDropped();
+
+            rec.setWriterPausedForTest (false);
+            std::this_thread::sleep_for (std::chrono::milliseconds (300));   // the FIFO drains, every gap within a second
+            rec.stop();
+
+            std::lock_guard<std::mutex> g (c.lock);
+            expectEquals (c.errors, 0);
+            expect (c.warnings.size() >= 1 && c.warnings.size() <= 2, "reports: " + juce::String (c.warnings.size()));
+            expect (c.warnings[c.warnings.size() - 1].contains (" " + juce::String ((juce::int64) std::llround ((double) lost * 1000.0 / 48000.0)) + " ms"),
+                    "the last report has the total: " + c.warnings.joinIntoString ("|"));
         }
 
         beginTest ("recordingOffset adds the latencies and clamps at zero");

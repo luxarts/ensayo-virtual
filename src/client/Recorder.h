@@ -20,7 +20,7 @@ public:
     // localWav receives the full take as 32-bit float (crash-safe copy, flushed every segment).
     juce::Result start (const Id& take, int channels, const juce::File& localWav);
     // Audio thread. When the FIFO is full the block is dropped and counted; the writer later puts exactly that many
-    // samples of silence in its place, so the take keeps every device sample position (alignment) and onError says
+    // samples of silence in its place, so the take keeps every device sample position (alignment) and onWarning says
     // how much was lost. The take goes on.
     void push (const float* const* channels, int n) noexcept;
     void stop();                                                    // message thread; flushes, joins, fires onFinished
@@ -46,9 +46,11 @@ public:
     std::function<void (int64_t fromPeak, const std::vector<Peak>&)> onPeaks;          // about every 100 ms
     std::function<void (const float* const* channels, int numChannels, int n)> onLiveAudio;   // every chunk drained
     std::function<void (int segments, int64_t samples)> onFinished;
-    // Writer thread: a local WAV failure (the take goes on), a segment encode failure (the recording stops) or an
-    // overflow filled with silence (the take goes on).
+    // Writer thread: a local WAV failure (the take goes on) or a segment encode failure (the recording stops).
     std::function<void (const juce::String&)> onError;
+    // Writer thread: audio lost to an overflow and filled with silence (the take goes on). Coalesced: at most one
+    // report per second, each with the running total lost in the take; one more at the end if any is still unreported.
+    std::function<void (const juce::String&)> onWarning;
 
 private:
     struct Writer;
