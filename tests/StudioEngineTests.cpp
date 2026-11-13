@@ -598,8 +598,12 @@ public:
 
             auto& dm = engine.getDeviceManager();
             dm.closeAudioDevice();
+            const auto capturedAtStop = engine.getRecorder().samplesCaptured();
             dm.restartLastAudioDevice();
             pumpMessages (100);
+
+            // The take ends at the last aligned sample: nothing captured after the stop (the latencies may differ).
+            expectEquals (engine.getRecorder().samplesCaptured(), capturedAtStop, "samples captured after the device stopped");
 
             const auto error = engine.takeDeviceError();
             expect (error.contains (juce::String (juce::CharPointer_UTF8 ("reinici\xc3\xb3"))), "no restart error: " + error);

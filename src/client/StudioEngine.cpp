@@ -620,7 +620,9 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     else if (recording.load())
     {
         // The device came back in the middle of a take (driver reset, buffer change): samples were lost and the
-        // timeline is no longer aligned. The owner stops the take on this error and keeps what was recorded.
+        // timeline is no longer aligned. The owner stops the take on this error and keeps what was recorded; nothing
+        // more is captured (no callback runs here either).
+        captureEnabled.store (false);
         audioDeviceError (restartedDuringTake());
     }
     else
@@ -653,7 +655,12 @@ void StudioEngine::audioDeviceStopped()
     plugin.release();
 
     if (recording.load())
+    {
+        // No callback runs now, so no push is in flight: the take ends at the last aligned sample instead of going on
+        // after a restart, shifted by whatever the new latencies are, until the owner stops it.
+        captureEnabled.store (false);
         audioDeviceError (restartedDuringTake());
+    }
 }
 
 juce::String StudioEngine::restartedDuringTake()
