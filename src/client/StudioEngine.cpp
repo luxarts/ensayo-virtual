@@ -580,6 +580,12 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     {
         audioDeviceError ("El dispositivo debe correr a 48000 Hz (actual: " + juce::String (rate, 0) + " Hz)");
     }
+    else if (recording.load())
+    {
+        // The device came back in the middle of a take (driver reset, buffer change): samples were lost and the
+        // timeline is no longer aligned. The owner stops the take on this error and keeps what was recorded.
+        audioDeviceError (restartedDuringTake());
+    }
     else
     {
         const juce::ScopedLock sl (errorLock);
@@ -608,6 +614,14 @@ void StudioEngine::audioDeviceStopped()
 {
     blockSupported.store (false);
     plugin.release();
+
+    if (recording.load())
+        audioDeviceError (restartedDuringTake());
+}
+
+juce::String StudioEngine::restartedDuringTake()
+{
+    return juce::String (juce::CharPointer_UTF8 ("el dispositivo de audio se detuvo o se reinici\xc3\xb3 durante la toma"));
 }
 
 void StudioEngine::audioDeviceError (const juce::String& message)

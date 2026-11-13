@@ -102,6 +102,7 @@ private:
     void audioDeviceAboutToStart (juce::AudioIODevice*) override;
     void audioDeviceStopped() override;
     void audioDeviceError (const juce::String&) override;
+    static juce::String restartedDuringTake();         // the error set when the device stops or restarts mid-take
 
     void applyRequests() noexcept;                                                    // audio thread
     void requestPlay (bool) noexcept;                                                 // message thread

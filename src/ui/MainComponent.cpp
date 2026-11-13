@@ -1387,10 +1387,17 @@ void MainComponent::timerCallback()
                      && engine.getDeviceManager().getCurrentAudioDevice()->isPlaying();
 
         // Spec §8: a device error while recording stops the take and keeps what was recorded.
-        if (session.isRecording())
-            session.stopTake();
+        juce::String outcome;
 
-        setStatus ("Error de audio: " + error, true, true);
+        if (session.isRecording())
+        {
+            if (session.stopTake())
+                outcome = ES (" (se conserva lo grabado)");
+            else if (session.getTakeError().isNotEmpty())
+                outcome = ". " + session.getTakeError();
+        }
+
+        setStatus ("Error de audio: " + error + outcome, true, true);
     }
 
     pollCalibration();

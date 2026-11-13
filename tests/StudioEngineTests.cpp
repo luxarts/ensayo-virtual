@@ -531,6 +531,47 @@ public:
             expect (! engine.isRecording());
         }
 
+        beginTest ("a device stop and restart during a take is reported; stopping keeps what was recorded");
+        {
+            const auto dir = studioTestDir().getChildFile ("restart");
+            const Id host = newId(), track = newId();
+            auto project = makeProject ("Song", host, "Lucas");
+            expect (applyOp (project, Ops::addTrack (track, "Voice", TrackKind::voice), host).ok);
+
+            StudioEngine engine;
+            engine.setMetronome (false, false);
+            engine.setProject (std::make_shared<const Project> (project));
+            engine.useFakeDevice (256, TestSignal::sine440);
+            pumpMessages (20);
+            expect (engine.takeDeviceError().isEmpty());
+
+            Collected c;
+            c.attach (engine);
+            expect (engine.startRecording (*project.findTrack (track), newId(), dir.getChildFile ("take.wav")).wasOk());
+            pumpMessages (400);
+
+            auto& dm = engine.getDeviceManager();
+            dm.closeAudioDevice();
+            dm.restartLastAudioDevice();
+            pumpMessages (100);
+
+            const auto error = engine.takeDeviceError();
+            expect (error.contains (juce::String (juce::CharPointer_UTF8 ("reinici\xc3\xb3"))), "no restart error: " + error);
+            expect (engine.isRecording(), "the engine leaves stopping the take to its owner");
+
+            const auto rec = engine.stopRecording();
+            expect (rec.has_value(), "what was recorded before the restart is kept");
+
+            if (rec.has_value())
+                expect (rec->samples >= 48000 / 4, "only " + juce::String (rec->samples) + " samples kept");
+
+            // Outside a take, a restart is not an error.
+            dm.closeAudioDevice();
+            dm.restartLastAudioDevice();
+            pumpMessages (50);
+            expect (engine.takeDeviceError().isEmpty());
+        }
+
         beginTest ("loopback refuses a round trip shorter than the block");
         {
             StudioEngine engine;
