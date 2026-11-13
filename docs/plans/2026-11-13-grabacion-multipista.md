@@ -46,9 +46,9 @@
 
 Execution phases (tasks in a phase are independent and run in parallel, each in its own worktree cut from the same base commit; the coordinator merges them before the next phase):
 
-- **Phase A:** T1, T2, T3
-- **Phase B:** T4, T5, T6, T7
-- **Phase C:** T8, T9
+- **Phase A:** T1, T2 (T2 only needs `Id` from T1's header; it copies `core/Project.h` verbatim and never calls `Project.cpp` functions)
+- **Phase B:** T3, T4, T5, T7 (all on top of merged T1 + T2)
+- **Phase C:** T6, T8, T9 (T6 and T8 need T3; T8 also T7)
 - **Phase D:** T10, then T11
 
 ---
