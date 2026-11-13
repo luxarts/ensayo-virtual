@@ -60,6 +60,9 @@ set(ENSAYO_CORE_SOURCES
     src/client/HeadlessClient.cpp
     # T5
     src/client/ProjectClient.cpp
+    # T7
+    src/client/Recorder.cpp
+    src/client/LatencyCalibrator.cpp
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
@@ -119,6 +122,9 @@ set(ENSAYO_TEST_SOURCES
     tests/ProjectHostTests.cpp
     # T5
     tests/ProjectClientTests.cpp
+    # T7
+    tests/RecorderTests.cpp
+    tests/LatencyCalibratorTests.cpp
 )
 
 set(ENSAYO_MODULES
