@@ -147,8 +147,12 @@ token recibido en `welcome` y `have = {take: segmentos que ya tiene, ...}`):
   así que después de uno corto no se acepta otro), SHA-1 y audio; guarda `takes/<take>/<index>.flac`, responde
   `segment_ok {take, index}` y lo reenvía a los demás. Si no, `segment_bad {take, index, expected, reason}`.
 - Descarga: al conectarse, el host le envía al cliente los segmentos que no tenga según `have` y después, en
-  vivo, cada segmento nuevo que reciba de cualquiera. Si un segmento guardado no se puede leer, el host corta la
-  conexión de datos (el cliente reconecta y vuelve a pedir desde lo que tiene).
+  vivo, cada segmento nuevo que reciba de cualquiera. Si falla el envío (conexión caída), el host corta la
+  conexión de datos (el cliente reconecta y vuelve a pedir desde lo que tiene). Si un segmento guardado no se
+  puede leer (archivo faltante o dañado), la conexión sigue: el host no le envía nada más de esa toma a ese
+  cliente (ni de la descarga inicial ni en vivo, para que nunca falte un índice), le manda
+  `take_damaged {take, message}` ("La toma de <autor> está dañada en el anfitrión; no se puede descargar
+  completa"), que el cliente muestra como aviso, y sigue con las demás tomas.
 - `take_complete {take}` (en la conexión de control) cuando el autor terminó de subir todos los segmentos; el
   host aplica `update_take` con `complete: true` y los `samples`/`segments` que ya tiene.
 

@@ -1331,6 +1331,8 @@ struct ProjectClient::Impl
         if (type == "segment_ok")       handleSegmentOk (gen, m["take"].toString(), (int) readInteger (m["index"], 0, INT_MAX).value_or (-1));
         else if (type == "segment_bad") handleSegmentBad (gen, m);
         else if (type == "error")       post (gen, [this, m] { hostError = m["message"].toString(); });
+        else if (type == "take_damaged")
+            post (gen, [this, m] { if (owner.onWarning != nullptr) owner.onWarning (m["message"].toString()); });
 
         return 0;
     }

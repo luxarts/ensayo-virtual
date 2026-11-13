@@ -845,6 +845,7 @@ void MainComponent::wireSession()
         setStatus (message, true, ! session.isConnected());
     };
 
+    session.onWarning = [this] (const juce::String& message) { setStatus (message, true, ! session.isConnected()); };
     session.onRejected = [this] (const juce::String& reason) { setStatus (ES ("Operaci\xC3\xB3n rechazada: ") + reason, true, false); };
     session.onImportProgress = [this] (const juce::String& name, float fraction)
     {

@@ -24,6 +24,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -303,6 +304,7 @@ struct ProjectHost::Impl
             std::string line;                                   // empty for a catch-up item
             std::shared_ptr<const juce::MemoryBlock> payload;   // raw bytes after the line (segments)
             Id catchUpTake;                                     // catch-up: stream stored segments [from, to)
+            Id liveTake;                                        // live segment forward: the take it belongs to
             int from = 0, to = 0, channels = 1;
             bool closeAfter = false;                            // close the connection once this is written
         };
@@ -404,6 +406,16 @@ struct ProjectHost::Impl
 
         void send (const juce::var& message)   { send (lineOf (message)); }
 
+        // A live segment of `take`: skipped by the writer if that take is damaged for this connection.
+        void sendSegment (const Id& take, const std::string& line, std::shared_ptr<const juce::MemoryBlock> payload)
+        {
+            Item item;
+            item.line = line;
+            item.payload = std::move (payload);
+            item.liveTake = take;
+            enqueue (std::move (item));
+        }
+
         void sendAndClose (const juce::var& message)
         {
             Item item;
@@ -437,13 +449,31 @@ struct ProjectHost::Impl
                 if (item.catchUpTake.isNotEmpty())
                 {
                     for (int index = item.from; index < item.to && ! dead.load (std::memory_order_acquire); ++index)
-                        if (! sendStoredSegment (item.catchUpTake, index, item.channels))
+                    {
+                        const auto sent = sendStoredSegment (item.catchUpTake, index, item.channels);
+
+                        if (sent == Stored::sent)
+                            continue;
+
+                        if (sent == Stored::writeFailed)
                         {
-                            // A gap would leave the client's cache stuck below it: drop the connection so the client
-                            // reconnects and asks again from its own count.
-                            markDead();
-                            break;
+                            markDead();   // the connection itself failed; the client reconnects and asks again
                         }
+                        else
+                        {
+                            // The file is unreadable and will stay so: reconnecting would hit it forever. Nothing more
+                            // of this take goes to this connection (a gap would never be filled), the client is told,
+                            // and the catch-up goes on with the next take.
+                            damagedTakes.insert (item.catchUpTake);
+                            reportDamagedTake (item.catchUpTake);
+                        }
+
+                        break;
+                    }
+                }
+                else if (item.liveTake.isNotEmpty() && damagedTakes.count (item.liveTake) > 0)
+                {
+                    // A live segment after the damaged one: skipped so the client never sees an index gap.
                 }
                 else
                 {
@@ -459,8 +489,10 @@ struct ProjectHost::Impl
             writerDone.store (true, std::memory_order_release);
         }
 
-        // Catch-up: reads takes/<take>/<index>.flac and sends it like a live segment. False when it cannot be read.
-        bool sendStoredSegment (const Id& take, int index, int channels)
+        enum class Stored { sent, unreadable, writeFailed };
+
+        // Catch-up: reads takes/<take>/<index>.flac and sends it like a live segment.
+        Stored sendStoredSegment (const Id& take, int index, int channels)
         {
             const auto file = host.segmentFile (take, index);
             juce::MemoryBlock bytes;
@@ -468,7 +500,7 @@ struct ProjectHost::Impl
             if (! file.loadFileAsData (bytes) || bytes.getSize() == 0)
             {
                 host.log ("no se pudo leer " + file.getFullPathName());
-                return false;
+                return Stored::unreadable;
             }
 
             int64_t samples = 0;
@@ -481,7 +513,7 @@ struct ProjectHost::Impl
                 if (flacReader == nullptr)
                 {
                     host.log ("segmento ilegible " + file.getFullPathName());
-                    return false;
+                    return Stored::unreadable;
                 }
 
                 samples = flacReader->lengthInSamples;
@@ -493,7 +525,32 @@ struct ProjectHost::Impl
                                                 { "sha1", Sha1::of (bytes.getData(), bytes.getSize()) } }));
 
             return writeAll (line.data(), line.size())
-                && writeAll (static_cast<const char*> (bytes.getData()), bytes.getSize());
+                    && writeAll (static_cast<const char*> (bytes.getData()), bytes.getSize())
+                 ? Stored::sent : Stored::writeFailed;
+        }
+
+        // Writer thread: tells the client a take cannot be downloaded completely (`take_damaged`).
+        void reportDamagedTake (const Id& take)
+        {
+            juce::String author;
+            const auto p = host.project.load();
+
+            if (const auto* t = p->findTake (take))
+                for (const auto& u : p->users)
+                    if (u.id == t->author)
+                        author = u.name;
+
+            if (author.isEmpty())
+                author = "otro usuario";
+
+            const auto text = "La toma de " + author
+                            + juce::String (juce::CharPointer_UTF8 (" est\xc3\xa1 da\xc3\xb1""ada en el anfitri\xc3\xb3n; "
+                                                                    "no se puede descargar completa"));
+            host.log ("toma " + take + " incompleta para " + name + ": " + text);
+            const auto line = lineOf (object ({ { "t", "take_damaged" }, { "take", take }, { "message", text } }));
+
+            if (! writeAll (line.data(), line.size()))
+                markDead();
         }
 
         // Writes the whole buffer; a peer that accepts no byte for maxWriteStallMs in a row is marked dead.
@@ -651,6 +708,7 @@ struct ProjectHost::Impl
         const int64_t acceptedMs = nowMs();
         bool fromLoopback = false;                // peer address is 127.0.0.0/8 or ::1; fixed after construction
         std::vector<char> pending;             // reader thread only
+        std::set<Id> damagedTakes;             // writer thread only: takes this connection gets nothing more of
         Kind kindForReader = Kind::unidentified;   // reader thread's own copy of `kind`
 
         // Identity: written once by the reader thread under stateLock; read by others under stateLock.
@@ -1346,7 +1404,7 @@ struct ProjectHost::Impl
 
         for (auto& o : datas)
             if (o.get() != &c)
-                o->send (line, payload);
+                o->sendSegment (take->id, line, payload);
 
         c.send (object ({ { "t", "segment_ok" }, { "take", take->id }, { "index", index } }));
         return true;

@@ -134,6 +134,7 @@ void SessionController::createClient (const SessionIdentity& identity)
     };
     client->onError            = [this] (const juce::String& message) { if (onError) onError (message); };
     client->onRejected         = [this] (const juce::String& reason) { if (onRejected) onRejected (reason); };
+    client->onWarning          = [this] (const juce::String& message) { if (onWarning) onWarning (message); };
     client->onOpRejected       = [this] (int seq, const juce::String& reason)
     {
         if (importWait && importWait->seq == seq)
@@ -260,6 +261,7 @@ void SessionController::leave()
         client->onDisconnected = nullptr;
         client->onError = nullptr;
         client->onRejected = nullptr;
+        client->onWarning = nullptr;
         client->onOpRejected = nullptr;
         client->disconnect();
         client = nullptr;

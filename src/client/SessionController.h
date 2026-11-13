@@ -77,6 +77,9 @@ public:
 
     std::function<void()> onConnected, onProjectChanged, onTransfersChanged, onPresenceChanged;
     std::function<void (const juce::String&)> onDisconnected, onError, onRejected;
+    // Message thread: a non-fatal problem to show (a take the host cannot send completely, recorded audio lost to an
+    // overflow and filled with silence). The session and the take go on.
+    std::function<void (const juce::String&)> onWarning;
     std::function<void (const juce::String& name, float fraction)> onImportProgress;     // 0..1 while segments are queued
     std::function<void (const juce::String& name, const juce::Result&)> onImportFinished; // ok = queued and finished
     std::function<void (float fraction)> onExportProgress;

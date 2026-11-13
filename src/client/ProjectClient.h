@@ -61,6 +61,9 @@ public:
     std::function<void()> onConnected, onProjectChanged, onPresenceChanged, onTransfersChanged;
     std::function<void (const juce::String&)> onRejected, onError, onDisconnected;   // message thread
     std::function<void (int seq, const juce::String& reason)> onOpRejected;           // message thread, before onRejected
+    // Message thread: something the user should know that does not stop the session (a take the host cannot send
+    // completely: `take_damaged`).
+    std::function<void (const juce::String&)> onWarning;
 
     // Test hooks.
     int64_t bytesDownloaded() const noexcept;      // any thread: segment payload bytes received since the last connect()

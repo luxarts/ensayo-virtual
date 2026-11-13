@@ -401,6 +401,7 @@ struct HeadlessRun
         session.onDisconnected = nullptr;
         session.onError = nullptr;
         session.onRejected = nullptr;
+        session.onWarning = nullptr;
         session.onImportProgress = nullptr;
         session.onImportFinished = nullptr;
         session.onExportProgress = nullptr;
@@ -627,6 +628,7 @@ int runHeadless (const HeadlessOptions& o)
     session.onRejected = [&] (const juce::String& reason) { ++rejections; headlessPrint ("rejected " + reason); };
     session.onDisconnected = [&] (const juce::String& reason) { markFailed ("disconnected: " + reason); };
     session.onError = [&] (const juce::String& message) { markFailed (message); };
+    session.onWarning = [&] (const juce::String& message) { headlessPrint ("warning " + message); };
     session.onImportFinished = [&] (const juce::String&, const juce::Result& r) { importResult = r; };
     session.onTakeAborted = [&] (const juce::String& reason) { markFailed (reason); };
 

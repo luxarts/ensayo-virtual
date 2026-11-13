@@ -517,19 +517,58 @@ public:
         expectEquals ((int) onlyLast["index"], 2);
         expect (dData.waitFor ("segment", 300).isVoid());
 
-        // A stored segment that cannot be read closes the data connection (the client reconnects and asks again)
-        // instead of silently skipping to the next take and leaving a gap.
+        beginTest ("an unreadable stored segment is reported, its take is skipped and the connection stays up");
+
+        // take2 (one stored segment) and take3 (one stored segment) come after `take` in the catch-up order.
+        const auto take2 = newId(), take3 = newId();
+        a.send (opMessage (2, Ops::addTake (take2, 1)));
+        a.send (opMessage (3, Ops::addTake (take3, 1)));
+
+        for (const auto& t : { take2, take3 })
         {
-            const auto stored = dir.getChildFile ("takes").getChildFile (take).getChildFile ("1.flac");
-            const auto aside = stored.getSiblingFile ("1.flac.aside");
-            expect (stored.moveFileTo (aside));
+            expect (a.waitFor ("applied", 3000, [&] (const juce::var& m)
+                               { return m["op"]["op"].toString() == "add_take" && m["op"]["take"].toString() == t; }).isObject());
+            aData.upload (t, 0, 48000, 1, flacs[0]);
+            expect (aData.waitFor ("segment_ok", 5000, [&] (const juce::var& m) { return m["take"].toString() == t; }).isObject());
+        }
+
+        {
+            const auto takesDir = dir.getChildFile ("takes");
+            const auto stored = takesDir.getChildFile (take).getChildFile ("1.flac");
+            const auto stored2 = takesDir.getChildFile (take2).getChildFile ("0.flac");
+            expect (stored.moveFileTo (stored.getSiblingFile ("1.flac.aside")));
+            expect (stored2.moveFileTo (stored2.getSiblingFile ("0.flac.aside")));
 
             Client eData (22206);
             expect (eData.dataHello (c));
-            const auto first = eData.waitFor ("segment", 5000);
+
+            // `take`: segment 0, then the report instead of 1 and 2 (no gap is ever sent).
+            const auto first = eData.waitFor ("segment", 5000, [&] (const juce::var& m) { return m["take"].toString() == take; });
             expectEquals ((int) first["index"], 0);
-            expect (eData.waitForClose (5000), "the data connection stayed open after an unreadable segment");
-            expect (aside.moveFileTo (stored));
+            const auto damaged = eData.waitFor ("take_damaged", 5000, [&] (const juce::var& m) { return m["take"].toString() == take; });
+            expect (damaged.isObject(), "no take_damaged for the unreadable segment");
+            expect (damaged["message"].toString().contains ("Lucas"), damaged["message"].toString());
+            expect (damaged["message"].toString().contains ("no se puede descargar completa"), damaged["message"].toString());
+            expect (eData.waitFor ("take_damaged", 5000, [&] (const juce::var& m) { return m["take"].toString() == take2; }).isObject());
+
+            // The takes after the damaged ones still arrive.
+            const auto third = eData.waitFor ("segment", 5000, [&] (const juce::var& m) { return m["take"].toString() == take3; });
+            expectEquals ((int) third["index"], 0);
+
+            // Live: take2's next segment is not forwarded to this connection (it would be a gap); take3's is.
+            aData.upload (take2, 1, 48000, 1, flacs[1]);
+            expect (aData.waitFor ("segment_ok", 5000, [&] (const juce::var& m) { return m["take"].toString() == take2; }).isObject());
+            aData.upload (take3, 1, 48000, 1, flacs[1]);
+            expect (aData.waitFor ("segment_ok", 5000, [&] (const juce::var& m) { return m["take"].toString() == take3; }).isObject());
+
+            const auto live = eData.waitFor ("segment", 5000);
+            expectEquals (live["take"].toString(), take3);
+            expectEquals ((int) live["index"], 1);
+            expect (eData.waitFor ("segment", 300).isVoid());
+            expect (! eData.waitForClose (500), "the data connection was closed after an unreadable segment");
+
+            expect (stored.getSiblingFile ("1.flac.aside").moveFileTo (stored));
+            expect (stored2.getSiblingFile ("0.flac.aside").moveFileTo (stored2));
         }
 
         beginTest ("take_complete applies update_take complete:true");
