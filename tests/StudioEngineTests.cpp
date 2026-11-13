@@ -49,9 +49,11 @@ private:
 // Counts reads made through a source after it was destroyed (the swap test destroys sources while playing).
 std::atomic<int> readsAfterDestruction { 0 };
 
+// sign -1 serves the phase-inverted sine: swapping between the two without a fade would step by up to 1.0.
 class PoisonedSineTakes : public SineTakes
 {
 public:
+    explicit PoisonedSineTakes (float signToUse = 1.0f) : sign (signToUse) {}
     ~PoisonedSineTakes() override { alive.store (false); }
 
     void read (const Id& take, int channel, int64_t offset, int n, float* dest) const noexcept override
@@ -60,9 +62,13 @@ public:
             ++readsAfterDestruction;
 
         SineTakes::read (take, channel, offset, n, dest);
+
+        for (int i = 0; i < n; ++i)
+            dest[i] *= sign;
     }
 
 private:
+    const float sign;
     std::atomic<bool> alive { true };
 };
 
@@ -613,7 +619,8 @@ public:
             SineProject sp;
             expect (sp.ok);
             readsAfterDestruction = 0;
-            auto current = std::make_unique<PoisonedSineTakes>();
+            float sign = 1.0f;
+            auto current = std::make_unique<PoisonedSineTakes> (sign);
             current->add (sp.take, sp.length);
 
             StudioEngine engine;
@@ -624,19 +631,35 @@ public:
             engine.useFakeDevice (64, TestSignal::silence);
             OutputCapture out (48000 * 6);
             out.attach (*engine.getFakeDevice());
+
+            // Swaps to the other phase; the previous source is destroyed right after the call returns.
+            const auto swap = [&]
+            {
+                sign = -sign;
+                auto next = std::make_unique<PoisonedSineTakes> (sign);
+                next->add (sp.take, sp.length);
+                engine.setSampleSource (next.get());
+                current = std::move (next);
+            };
+
             engine.play();
             pumpMessages (100);
 
-            for (int i = 0; i < 50; ++i)
+            for (int i = 0; i < 50; ++i)                 // while playing
             {
-                auto next = std::make_unique<PoisonedSineTakes>();
-                next->add (sp.take, sp.length);
-                engine.setSampleSource (next.get());
-                current = std::move (next);              // destroys the previous source right after the call
+                swap();
                 pumpMessages (i % 2 == 0 ? 3 : 15);
             }
 
-            pumpMessages (50);
+            for (int i = 0; i < 10; ++i)                 // play() and a swap within the same block
+            {
+                engine.stop();
+                pumpMessages (40);
+                engine.play();
+                swap();
+                pumpMessages (40);
+            }
+
             engine.stop();
             pumpMessages (50);
             engine.getFakeDevice()->onOutputBlock = nullptr;
@@ -644,8 +667,8 @@ public:
 
             std::lock_guard<std::mutex> g (out.lock);
             const auto step = maxStepOf (out.L), bound = noClickBound();
-            logMessage ("50 swaps: reads after destruction " + juce::String (readsAfterDestruction.load()) + ", peak "
-                        + juce::String (peakOfVector (out.L), 4) + ", max step " + juce::String (step, 6)
+            logMessage ("60 phase-inverting swaps: reads after destruction " + juce::String (readsAfterDestruction.load())
+                        + ", peak " + juce::String (peakOfVector (out.L), 4) + ", max step " + juce::String (step, 6)
                         + " (bound " + juce::String (bound, 6) + ")");
             expectEquals (readsAfterDestruction.load(), 0);
             expect (peakOfVector (out.L) > 0.45f, "the sine played");

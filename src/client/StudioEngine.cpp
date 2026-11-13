@@ -170,6 +170,7 @@ void StudioEngine::setSampleSource (const SampleSource* s) noexcept
 
     // Fade the master to silence first (the callback reports it; immediately when the transport is stopped). If no
     // callback answers (device stopped), swap anyway: the hand-off below is what makes the swap safe.
+    holdReached.store (false);                       // only a block that saw this hold may report silence
     holdRequested.store (true);
     const auto deadline = juce::Time::getMillisecondCounter() + 250;
 
@@ -715,7 +716,7 @@ int StudioEngine::runTransport (float* L, float* R, int n) noexcept
     int captureFrom = capturing ? 0 : -1;
     int done = 0;
     const auto* src = source.load();                 // read under inRender: see setSampleSource
-    const bool hold = holdRequested.load();
+    const bool hold = blockHold;
 
     while (running && done < n)
     {
@@ -839,6 +840,7 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
 
     // inRender brackets every use of the sample source (hand-off with setSampleSource).
     inRender.store (true);
+    blockHold = holdRequested.load();
 
     if (calibrator.isRunning())
     {
@@ -852,7 +854,7 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
         captureFrom = runTransport (L, R, n);
     }
 
-    holdReached.store (! running || fadeIndex == 0);
+    holdReached.store (blockHold && (! running || fadeIndex == 0));   // silent under a hold this block saw
     inRender.store (false);
 
     // 6. Recording: the selected inputs, from the first sample of playback (count-in included).

@@ -44,7 +44,7 @@ public:
     void setMetronome (bool click, bool countIn) noexcept;
 
     void setSampleSource (const SampleSource*) noexcept;                     // the project's TakeCache or nullptr
-    // setSampleSource: when it returns the callback no longer references the previous source (it may be destroyed).
+    // setSampleSource: message thread only (it waits for the audio thread). When it returns the callback no longer references the previous source (it may be destroyed).
     // While playing, the master fades out, the source is swapped in silence and the master fades back in; the
     // timeline keeps advancing meanwhile, so a running take stays aligned.
     void setProject (std::shared_ptr<const Project>);
@@ -179,7 +179,8 @@ private:
 
     // Sample source swap: the message thread asks for silence (hold), the callback fades the master to 0 and reports
     // it, the pointer is swapped with the inRender hand-off, then the hold is released and the master fades back in.
-    std::atomic<bool> holdRequested { false }, holdReached { true }, inRender { false };
+    std::atomic<bool> holdRequested { false }, holdReached { false }, inRender { false };
+    bool blockHold = false;                                    // audio thread: the hold as loaded for this block
 
     // Calibration: requested by the message thread, started by the callback once the transport is stopped.
     std::atomic<bool> calibrationRequested { false };
