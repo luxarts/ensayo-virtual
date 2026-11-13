@@ -118,7 +118,7 @@ FakeAudioDevice::FakeAudioDevice (int blockSizeToUse, TestSignal signalToUse, Fa
     : juce::AudioIODevice (FakeAudioDeviceType::deviceName(), FakeAudioDeviceType::typeName()),
       requestedBlockSize (blockSizeToUse > 0 ? blockSizeToUse : 128),
       signal (signalToUse),
-      latency { juce::jmax (0, latencyToUse.input), juce::jmax (0, latencyToUse.output) },
+      latency { juce::jmax (0, latencyToUse.input), juce::jmax (0, latencyToUse.output), juce::jmax (0, latencyToUse.hidden) },
       blockSize (requestedBlockSize)
 {
 }
@@ -154,7 +154,7 @@ juce::String FakeAudioDevice::open (const juce::BigInteger& inputChannels, const
         return lastError;
     }
 
-    if (signal == TestSignal::loopback && latency.input + latency.output < size)
+    if (signal == TestSignal::loopback && latency.input + latency.output + latency.hidden < size)
     {
         lastError = "Loopback needs input + output latency >= the block size (" + juce::String (size) + ")";
         return lastError;
@@ -175,7 +175,7 @@ juce::String FakeAudioDevice::open (const juce::BigInteger& inputChannels, const
     outL.assign ((size_t) blockSize, 0.0f);
     outR.assign ((size_t) blockSize, 0.0f);
 
-    const auto pastSize = signal == TestSignal::loopback ? (size_t) (latency.input + latency.output + blockSize) : 0;
+    const auto pastSize = signal == TestSignal::loopback ? (size_t) (latency.input + latency.output + latency.hidden + blockSize) : 0;
     pastL.assign (pastSize, 0.0f);
     pastR.assign (pastSize, 0.0f);
     sampleIndex = 0;
@@ -289,7 +289,7 @@ void FakeAudioDevice::fillInputs (double qpcMs) noexcept
         {
             // Output sample k comes back as input sample k + delay; open() guarantees delay >= n, so every source
             // sample was produced by an earlier block.
-            const int64_t delay = latency.input + latency.output;
+            const int64_t delay = latency.input + latency.output + latency.hidden;
             const auto size = (int64_t) pastL.size();
 
             for (int i = 0; i < n; ++i)

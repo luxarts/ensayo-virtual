@@ -44,10 +44,14 @@ public:
     void setMetronome (bool click, bool countIn) noexcept;
 
     void setSampleSource (const SampleSource*) noexcept;                     // the project's TakeCache or nullptr
+    // setSampleSource: when it returns the callback no longer references the previous source (it may be destroyed).
+    // While playing, the master fades out, the source is swapped in silence and the master fades back in; the
+    // timeline keeps advancing meanwhile, so a running take stays aligned.
     void setProject (std::shared_ptr<const Project>);
     void setSolo (std::set<Id>);
 
-    // Transport (message thread). Position in timeline samples.
+    // Transport (message thread). Position in timeline samples. play(), stop() and setPosition() are no-ops while
+    // recording: a take ends only with stopRecording(), which also stops the transport.
     void play();
     void stop();
     void setPosition (int64_t);
@@ -64,7 +68,8 @@ public:
     Recorder& getRecorder() noexcept;
 
     void setPreviewBuffer (JitterBuffer*) noexcept;    // live listening; nullptr = off
-    // Encodes the recorder's live audio into 128-sample Opus frames and passes datagrams here (any thread).
+    // Encodes the recorder's live audio into 128-sample Opus frames and passes datagrams here. Invoked on the
+    // Recorder's writer thread; set it before startRecording() and never reassign it while a take is running.
     std::function<void (const uint8_t* packet, size_t len)> onPreviewPacket;
 
     void startCalibration();
@@ -95,6 +100,7 @@ private:
     void audioDeviceError (const juce::String&) override;
 
     void applyRequests() noexcept;                                                    // audio thread
+    void requestPlay (bool) noexcept;                                                 // message thread
     void startRunning() noexcept;                                                     // audio thread
     // Audio thread: plays the transport into L/R ([0, n)); returns the block index where capture starts, or -1.
     int runTransport (float* L, float* R, int n) noexcept;
@@ -137,7 +143,7 @@ private:
     uint32_t seenSeek = 0, seenRecord = 0;
     int64_t position = 0;
     bool running = false;
-    int fadeIndex = 0, fadeDirection = 0;                      // 0..transportFadeSamples; +1 in, -1 out, 0 idle
+    int fadeIndex = 0;                                         // 0..transportFadeSamples (gain 0 → 1)
     bool stopPending = false, jumpPending = false, captureOnJump = false, countInOnJump = false;
     int64_t jumpTarget = 0;
     bool capturing = false;                                    // pushing to the recorder
@@ -162,9 +168,18 @@ private:
     std::atomic<JitterBuffer*> previewBuffer { nullptr };
     std::atomic<bool> inPreview { false };
     JitterBuffer* lastPreviewBuffer = nullptr;                 // audio thread
+    // Packet-loss concealment per decoder: only after a real frame, for at most maxConcealedFrames, then silence.
+    struct PreviewDecoderState { bool primed = false; int lost = 0; };
+    static constexpr int maxConcealedFrames = 18;              // 48 ms of 128-sample frames
+    PreviewDecoderState monoState, stereoState;
+    int previewKind = 0;                                       // channels of the stream being decoded, 0 = none
     std::vector<float> previewL, previewR, previewInterleaved;
     std::vector<uint8_t> previewPacket;
     int previewFill = 0;
+
+    // Sample source swap: the message thread asks for silence (hold), the callback fades the master to 0 and reports
+    // it, the pointer is swapped with the inRender hand-off, then the hold is released and the master fades back in.
+    std::atomic<bool> holdRequested { false }, holdReached { true }, inRender { false };
 
     // Calibration: requested by the message thread, started by the callback once the transport is stopped.
     std::atomic<bool> calibrationRequested { false };

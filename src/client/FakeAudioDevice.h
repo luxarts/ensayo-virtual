@@ -9,7 +9,8 @@ namespace ensayo
 // click: +1.0 impulse every 250 ms on both inputs. loopback: input = output delayed by the latencies below
 // (input channel 0 = output L, channel 1 = output R; the first samples are 0).
 enum class TestSignal { silence, sine440, click, loopback };
-struct FakeLatency { int input = 0, output = 0; };              // reported AND applied in loopback mode
+struct FakeLatency { int input = 0, output = 0;                 // reported AND applied in loopback mode
+                     int hidden = 0; };                          // applied in loopback but not reported (what calibration finds)
 struct ClickEvent { int64_t sampleIndex; double qpcMs; };   // qpcMs = juce::Time::getMillisecondCounterHiRes()
 
 // A std::function that may be (re)assigned from any thread while the device thread invokes it.
@@ -72,7 +73,7 @@ public:
     static constexpr int clickPeriodSamples = sampleRate / 4;   // 250 ms
 
     // juce::AudioIODevice overrides: names "Fake In/Out L/R", sample rates {48000}, buffer sizes {64,128,256,512,1024},
-    // latencies = the FakeLatency values. Loopback needs input + output latency >= the block size (a real round trip
+    // latencies = the FakeLatency values. Loopback needs input + output + hidden latency >= the block size (a real round trip
     // always spans at least one block); open() fails otherwise.
     juce::StringArray getOutputChannelNames() override;
     juce::StringArray getInputChannelNames() override;

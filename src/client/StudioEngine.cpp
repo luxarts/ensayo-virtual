@@ -163,7 +163,26 @@ void StudioEngine::setMetronome (bool click, bool countIn) noexcept
     countInOn.store (countIn);
 }
 
-void StudioEngine::setSampleSource (const SampleSource* s) noexcept   { source.store (s); }
+void StudioEngine::setSampleSource (const SampleSource* s) noexcept
+{
+    if (source.load() == s)
+        return;
+
+    // Fade the master to silence first (the callback reports it; immediately when the transport is stopped). If no
+    // callback answers (device stopped), swap anyway: the hand-off below is what makes the swap safe.
+    holdRequested.store (true);
+    const auto deadline = juce::Time::getMillisecondCounter() + 250;
+
+    while (! holdReached.load() && juce::Time::getMillisecondCounter() < deadline)
+        std::this_thread::yield();
+
+    source.store (s);
+
+    while (inRender.load())                          // a block that loaded the previous source is still running
+        std::this_thread::yield();
+
+    holdRequested.store (false);
+}
 
 void StudioEngine::setProject (std::shared_ptr<const Project> p)
 {
@@ -179,18 +198,23 @@ void StudioEngine::setProject (std::shared_ptr<const Project> p)
 void StudioEngine::setSolo (std::set<Id> solo)    { renderer.setSolo (std::move (solo)); }
 
 //==============================================================================
-void StudioEngine::play()
+void StudioEngine::requestPlay (bool shouldPlay) noexcept
 {
     const juce::SpinLock::ScopedLockType sl (requestLock);
-    requests.play = true;
-    wantPlaying.store (true);
+    requests.play = shouldPlay;
+    wantPlaying.store (shouldPlay);
+}
+
+void StudioEngine::play()
+{
+    if (! recording.load())                          // a take ends only with stopRecording()
+        requestPlay (true);
 }
 
 void StudioEngine::stop()
 {
-    const juce::SpinLock::ScopedLockType sl (requestLock);
-    requests.play = false;
-    wantPlaying.store (false);
+    if (! recording.load())
+        requestPlay (false);
 }
 
 void StudioEngine::setPosition (int64_t target)
@@ -295,7 +319,7 @@ std::optional<RecordingResult> StudioEngine::stopRecording()
         return std::nullopt;
 
     disableCapture();                                // the callback no longer pushes: Recorder::stop may run
-    stop();
+    requestPlay (false);
     recorder.stop();                                 // drains the FIFO; onFinished has fired when it returns
     restoreRecorderCallbacks();
     recording.store (false);
@@ -403,33 +427,97 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
     {
         lastPreviewBuffer = buffer;
         previewFill = 0;
+        monoState = {};
+        stereoState = {};
+        previewKind = 0;
     }
+
+    // Half-cosine over one frame: the first frame after silence fades in, the last concealed frame fades out.
+    const auto ramp = [] (float* dl, float* dr, bool in) noexcept
+    {
+        for (int i = 0; i < previewFrame; ++i)
+        {
+            const auto c = (float) std::cos (juce::MathConstants<double>::pi * (i + 1) / previewFrame);
+            const auto g = in ? 0.5f - 0.5f * c : 0.5f + 0.5f * c;
+            dl[i] *= g;
+            dr[i] *= g;
+        }
+    };
+
+    // One 128-sample frame: a real payload (48 B mono, 96 B stereo), else concealment, else silence.
+    const auto decodeFrame = [&] (JitterBuffer& jb, float* dl, float* dr) noexcept
+    {
+        int len = 0;
+        const bool popped = jb.pop (previewPacket.data(), len);
+        const int kind = ! popped ? 0
+                       : len == codedBytesMono (FrameSize::f128) ? 1
+                       : len == codedBytesStereo (FrameSize::f128) ? 2 : 0;
+
+        if (kind != 0)
+        {
+            if (kind != previewKind)                 // another decoder: it starts unprimed
+            {
+                monoState = {};
+                stereoState = {};
+                previewKind = kind;
+            }
+
+            auto& state = kind == 1 ? monoState : stereoState;
+
+            if (kind == 1)
+            {
+                previewMono.decode (previewPacket.data(), len, dl);
+                std::copy (dl, dl + previewFrame, dr);
+            }
+            else
+            {
+                previewStereo.decode (previewPacket.data(), len, previewInterleaved.data());
+                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
+            }
+
+            if (! state.primed)
+                ramp (dl, dr, true);
+
+            state.primed = true;
+            state.lost = 0;
+            return;
+        }
+
+        auto& state = previewKind == 1 ? monoState : stereoState;
+
+        if (previewKind != 0 && state.primed && state.lost < maxConcealedFrames)
+        {
+            if (previewKind == 1)
+            {
+                previewMono.decode (nullptr, 0, dl);
+                std::copy (dl, dl + previewFrame, dr);
+            }
+            else
+            {
+                previewStereo.decode (nullptr, 0, previewInterleaved.data());
+                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
+            }
+
+            if (++state.lost == maxConcealedFrames)  // a dead stream: fade the last concealed frame out
+            {
+                ramp (dl, dr, false);
+                state = {};
+                previewKind = 0;
+            }
+
+            return;
+        }
+
+        std::fill (dl, dl + previewFrame, 0.0f);
+        std::fill (dr, dr + previewFrame, 0.0f);
+    };
 
     if (buffer != nullptr && previewFill + n <= (int) previewL.size())   // always true: sized block + 128
     {
         // Whole 128-sample frames are decoded until the block can be served; the remainder (< 128) waits.
         while (previewFill < n)
         {
-            int len = 0;
-            float* dl = previewL.data() + previewFill;
-            float* dr = previewR.data() + previewFill;
-
-            if (buffer->pop (previewPacket.data(), len) && len == codedBytesMono (FrameSize::f128))
-            {
-                previewMono.decode (previewPacket.data(), len, dl);
-                std::copy (dl, dl + previewFrame, dr);
-            }
-            else if (len == codedBytesStereo (FrameSize::f128))
-            {
-                previewStereo.decode (previewPacket.data(), len, previewInterleaved.data());
-                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
-            }
-            else
-            {
-                std::fill (dl, dl + previewFrame, 0.0f);       // nothing arrived, or a payload of another size
-                std::fill (dr, dr + previewFrame, 0.0f);
-            }
-
+            decodeFrame (*buffer, previewL.data() + previewFill, previewR.data() + previewFill);
             previewFill += previewFrame;
         }
 
@@ -448,7 +536,7 @@ void StudioEngine::startCalibration()
     if (recording.load() || isCalibrating())
         return;
 
-    stop();
+    requestPlay (false);
     calibrationRequested.store (true);
 }
 
@@ -529,8 +617,7 @@ void StudioEngine::startRunning() noexcept
 {
     running = true;
     renderer.snapRamps();
-    fadeIndex = 0;
-    fadeDirection = 1;
+    fadeIndex = 0;                                   // fades in from silence
     stopPending = false;
 }
 
@@ -553,6 +640,8 @@ void StudioEngine::applyRequests() noexcept
         seenSeek = r.seekSerial;                     // the take's start supersedes earlier seeks
         recordPointAudio = r.recordPoint;
         countInStartAudio = r.recordStart;
+        capturing = false;                           // nothing of a previous take may leak into this one
+        countInActive = false;
 
         if (! running)
         {
@@ -568,7 +657,6 @@ void StudioEngine::applyRequests() noexcept
             captureOnJump = true;
             countInOnJump = r.countIn;
             stopPending = false;
-            fadeDirection = -1;
         }
     }
     else if (r.seekSerial != seenSeek)
@@ -584,7 +672,6 @@ void StudioEngine::applyRequests() noexcept
             jumpPending = true;
             jumpTarget = r.seekTarget;
             captureOnJump = false;
-            fadeDirection = -1;
         }
     }
 
@@ -593,22 +680,14 @@ void StudioEngine::applyRequests() noexcept
     if (r.play)
     {
         if (! running)
-        {
             startRunning();
-        }
-        else if (stopPending)
-        {
-            stopPending = false;
-
-            if (! jumpPending)
-                fadeDirection = 1;
-        }
+        else
+            stopPending = false;                     // a stop fade turns back into a fade-in
     }
     else if (running && ! stopPending)
     {
         stopPending = true;
         captureOnJump = false;
-        fadeDirection = -1;
     }
 }
 
@@ -635,20 +714,25 @@ int StudioEngine::runTransport (float* L, float* R, int n) noexcept
 {
     int captureFrom = capturing ? 0 : -1;
     int done = 0;
+    const auto* src = source.load();                 // read under inRender: see setSampleSource
+    const bool hold = holdRequested.load();
 
     while (running && done < n)
     {
+        // The master fades out for a stop, a jump or a source swap (hold), and in otherwise.
+        const bool cut = stopPending || jumpPending;
+        const int direction = cut || hold ? -1 : 1;
         int len = n - done;
 
-        if (fadeDirection < 0)
-            len = std::min (len, fadeIndex);         // stop exactly where the fade-out reaches 0
+        if (cut)
+            len = std::min (len, fadeIndex);         // the stop or the jump happens exactly where the fade reaches 0
 
         if (len > 0)
         {
             float* sl = scratchL.data() + done;
             float* sr = scratchR.data() + done;
 
-            if (const auto* src = source.load (std::memory_order_acquire))
+            if (src != nullptr)
             {
                 renderer.render (*src, position, len, sl, sr);
             }
@@ -665,14 +749,14 @@ int StudioEngine::runTransport (float* L, float* R, int n) noexcept
                 const float g = fadeTable[(size_t) fadeIndex];
                 L[done + i] += g * sl[i];
                 R[done + i] += g * sr[i];
-                fadeIndex = juce::jlimit (0, transportFadeSamples, fadeIndex + fadeDirection);
+                fadeIndex = juce::jlimit (0, transportFadeSamples, fadeIndex + direction);
             }
 
-            position += len;
+            position += len;                         // a hold keeps the timeline (and a take) running in silence
             done += len;
         }
 
-        if (fadeDirection < 0 && fadeIndex == 0)
+        if (cut && fadeIndex == 0)
         {
             if (jumpPending)
             {
@@ -693,11 +777,6 @@ int StudioEngine::runTransport (float* L, float* R, int n) noexcept
             {
                 stopPending = false;
                 running = false;
-                fadeDirection = 0;
-            }
-            else
-            {
-                fadeDirection = 1;
             }
         }
     }
@@ -758,6 +837,9 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
         calibrationRequested.store (false);
     }
 
+    // inRender brackets every use of the sample source (hand-off with setSampleSource).
+    inRender.store (true);
+
     if (calibrator.isRunning())
     {
         // 4. Calibration owns the output: the click train only (transport requests wait).
@@ -769,6 +851,9 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
         applyRequests();
         captureFrom = runTransport (L, R, n);
     }
+
+    holdReached.store (! running || fadeIndex == 0);
+    inRender.store (false);
 
     // 6. Recording: the selected inputs, from the first sample of playback (count-in included).
     inPush.store (true);

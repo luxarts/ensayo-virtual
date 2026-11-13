@@ -46,6 +46,57 @@ private:
     std::map<Id, int64_t> takes;
 };
 
+// Counts reads made through a source after it was destroyed (the swap test destroys sources while playing).
+std::atomic<int> readsAfterDestruction { 0 };
+
+class PoisonedSineTakes : public SineTakes
+{
+public:
+    ~PoisonedSineTakes() override { alive.store (false); }
+
+    void read (const Id& take, int channel, int64_t offset, int n, float* dest) const noexcept override
+    {
+        if (! alive.load())
+            ++readsAfterDestruction;
+
+        SineTakes::read (take, channel, offset, n, dest);
+    }
+
+private:
+    std::atomic<bool> alive { true };
+};
+
+// One imported track, hard left (the left channel carries the full 0.5 sine), one region over the whole take.
+struct SineProject
+{
+    static constexpr int64_t length = 10 * 48000;
+    Id host = newId(), take = newId(), track = newId();
+    Project project = makeProject ("Song", host, "Lucas");
+    bool ok = true;
+
+    SineProject()
+    {
+        ok = apply (Ops::addTake (take, 1))
+          && apply (Ops::updateTake (take, 10, length, true))
+          && apply (Ops::addTrack (track, "Sine", TrackKind::imported))
+          && apply (Ops::setMix (track, std::nullopt, -1.0f, std::nullopt))
+          && apply (Ops::addRegion (track, { newId(), take, 0, 0, length }));
+    }
+
+    bool apply (const juce::var& op) { return applyOp (project, op, host).ok; }
+    std::shared_ptr<const Project> snapshot() const { return std::make_shared<const Project> (project); }
+};
+
+float peakOfVector (const std::vector<float>& x)
+{
+    float m = 0.0f;
+
+    for (auto v : x)
+        m = std::max (m, std::abs (v));
+
+    return m;
+}
+
 float maxStepOf (const std::vector<float>& x)
 {
     float m = 0.0f;
@@ -232,11 +283,22 @@ class StudioEngineTests : public juce::UnitTest
 public:
     StudioEngineTests() : juce::UnitTest ("StudioEngine", "EnsayoVirtual") {}
 
-    // Loopback alignment: records the click track coming back through the fake device and checks every recorded click
-    // sits where the timeline put it.
-    void alignment (int blockSize, FakeLatency latency)
+    struct AlignCase
     {
-        const auto dir = studioTestDir().getChildFile ("align" + juce::String (blockSize));
+        juce::String name;
+        int block = 256;
+        FakeLatency latency;
+        int calibration = 0;
+        int64_t expectedOffset = 0;      // hard-coded by the caller, never recomputed here
+        bool fromPlaying = false;        // record while the transport is already playing (capture starts mid-block)
+        bool interfere = false;          // call stop(), play() and setPosition() during the take
+    };
+
+    // Loopback alignment: records the click track coming back through the fake device and checks every recorded click
+    // sits exactly (0 samples) where the timeline put it.
+    void alignment (const AlignCase& t)
+    {
+        const auto dir = studioTestDir().getChildFile ("align-" + t.name);
         dir.deleteRecursively();
         ClickProject p (dir.getChildFile ("cache"));
         expect (p.ok, "fixture");
@@ -244,45 +306,79 @@ public:
         StudioEngine engine;
         engine.setMonitor (0.0f, 0.0f);          // no feedback through the loopback
         engine.setMetronome (false, true);
-        engine.setCalibration (0);
+        engine.setCalibration (t.calibration);
         engine.setSampleSource (&p.cache);
         engine.setProject (p.snapshot());
-        engine.useFakeDevice (blockSize, TestSignal::loopback, latency);
+        engine.useFakeDevice (t.block, TestSignal::loopback, t.latency);
         expectEquals (engine.takeDeviceError(), juce::String());
         expect (engine.getFakeDevice() != nullptr);
         engine.setChannels (0, 1, 0);
-        engine.setPosition (48000);
-        pumpMessages (30);
+
+        if (t.fromPlaying)
+        {
+            engine.setPosition (10000);
+            engine.play();
+            pumpMessages (300);
+            expect (engine.isPlaying() && engine.getPosition() > 10000, "playing before the take");
+        }
+        else
+        {
+            engine.setPosition (48000);
+            pumpMessages (30);
+        }
 
         Collected c;
         c.attach (engine);
         const Id take = newId();
+        const auto pointBefore = engine.getPosition();
         const auto result = engine.startRecording (p.voice(), take, dir.getChildFile ("take.wav"));
         expect (result.wasOk(), result.getErrorMessage());
         expect (engine.isRecording());
 
-        expect (waitFor ([&] { return engine.getPosition() >= 48000 + 3 * 48000; }, 10000), "recording did not advance");
+        if (t.interfere)
+        {
+            expect (waitFor ([&] { return engine.getPosition() >= pointBefore + 48000; }, 6000));
+            const auto before = engine.getPosition();
+            engine.stop();
+            pumpMessages (100);
+            expect (engine.isPlaying(), "stop() is a no-op during a take");
+            engine.play();
+            engine.setPosition (0);
+            pumpMessages (100);
+            const auto after = engine.getPosition();
+            logMessage ("during the take: position " + juce::String (before) + " -> " + juce::String (after));
+            expect (after > before + 4800, "the timeline kept running through stop(), play() and setPosition()");
+        }
+
+        expect (waitFor ([&] { return engine.getPosition() >= pointBefore + 3 * 48000; }, 10000), "recording did not advance");
         const auto rec = engine.stopRecording();
         expect (rec.has_value(), "no recording result");
         expect (! engine.isRecording());
+        expectEquals (c.errors.load(), 0);
 
         if (! rec.has_value())
             return;
 
-        const auto expectedOffset = recordingOffset (96000, latency.input, latency.output, 0);
-        expectEquals (rec->region.start, (int64_t) 48000);
-        expectEquals (rec->region.offset, expectedOffset);
+        const auto start = rec->region.start;
+
+        if (t.fromPlaying)
+            expect (start > 10000, "record point taken from the playing transport");
+        else
+            expectEquals (start, (int64_t) 48000);
+
+        expectEquals (rec->region.offset, t.expectedOffset);
         expect (rec->region.take == take && rec->take == take && rec->channels == 1);
-        expectEquals (rec->region.length, rec->samples - expectedOffset);
+        expectEquals (rec->region.length, rec->samples - t.expectedOffset);
 
         const auto samples = c.decodeTake();
         expectEquals ((int64_t) samples.size(), rec->samples);
 
-        // Reference: timeline click T lands at take sample offset + (T - 48000).
+        // Reference: timeline click T lands at take sample offset + (T - start).
         std::vector<int64_t> reference;
+        const int64_t period = ClickProject::clickPeriod;
 
-        for (int64_t t = 48000; t < 48000 + rec->region.length; t += ClickProject::clickPeriod)
-            reference.push_back (rec->region.offset + t - 48000);
+        for (int64_t at = ((start + period - 1) / period) * period; at < start + rec->region.length; at += period)
+            reference.push_back (rec->region.offset + at - start);
 
         std::vector<int64_t> inRegion;
 
@@ -291,7 +387,7 @@ public:
                 inRegion.push_back (at);
 
         juce::String errors;
-        int worst = 0;
+        int64_t worst = 0;
 
         for (auto at : inRegion)
         {
@@ -300,15 +396,91 @@ public:
             for (auto r : reference)
                 best = std::min (best, std::abs (at - r));
 
-            worst = std::max (worst, (int) std::min<int64_t> (best, 1 << 30));
+            worst = std::max (worst, best);
             errors << " " << juce::String (best);
         }
 
-        logMessage ("block " + juce::String (blockSize) + " latency " + juce::String (latency.input) + "+"
-                    + juce::String (latency.output) + ": " + juce::String ((int) inRegion.size()) + " clicks of "
+        logMessage (t.name + ": block " + juce::String (t.block) + " latency " + juce::String (t.latency.input) + "+"
+                    + juce::String (t.latency.output) + "+" + juce::String (t.latency.hidden) + " calibration "
+                    + juce::String (t.calibration) + ", start " + juce::String (start) + ", offset "
+                    + juce::String (rec->region.offset) + ": " + juce::String ((int) inRegion.size()) + " clicks of "
                     + juce::String ((int) reference.size()) + ", errors:" + errors);
+        expect (! reference.empty());
         expectEquals ((int) inRegion.size(), (int) reference.size(), "clicks detected in the region");
-        expect (worst <= 1, "worst alignment error " + juce::String (worst));
+        expect (worst == 0, "worst alignment error " + juce::String (worst));
+    }
+
+    // Streams a stereo 440 Hz sine (amplitude 0.5) as 128-sample Opus packets into the preview jitter buffer at the
+    // device's pace and checks what reaches the output: the level of the source (within 15 %) and no step above
+    // 1.5 x the source's own largest step, including the stream's start, an optional lost packet mid-stream and the
+    // end of the stream (concealment, then a faded cut).
+    void previewReceive (bool dropOne)
+    {
+        StudioEngine engine;
+        engine.setMonitor (0.0f, 0.0f);
+        engine.useFakeDevice (256, TestSignal::silence);
+        OutputCapture out (48000 * 3);
+        out.attach (*engine.getFakeDevice());
+
+        const double blockMs = 128000.0 / sampleRate;
+        JitterBuffer rx (codedBytesStereo (FrameSize::f128), blockMs);
+        rx.setAutoSize (false);
+        rx.setSizeBlocks (8);
+
+        OpusMode mode (FrameSize::f128);
+        OpusEncoder encoder (mode, 2);
+        std::vector<float> pcm (256);
+        std::vector<uint8_t> coded (128);
+        constexpr int blocks = 300, prefill = 8, dropped = 150;
+
+        const auto push = [&] (int b)
+        {
+            for (int i = 0; i < 128; ++i)
+                pcm[(size_t) (2 * i)] = pcm[(size_t) (2 * i + 1)] = sineAt (b * 128 + i);
+
+            const int n = encoder.encode (pcm.data(), coded.data(), (int) coded.size());
+
+            if (! (dropOne && b == dropped))
+                rx.push ((uint16_t) b, coded.data(), n, juce::Time::getMillisecondCounterHiRes());
+        };
+
+        for (int b = 0; b < prefill; ++b)
+            push (b);
+
+        engine.setPreviewBuffer (&rx);
+        const double startMs = juce::Time::getMillisecondCounterHiRes();
+
+        for (int b = prefill; b < blocks; ++b)
+        {
+            while (juce::Time::getMillisecondCounterHiRes() < startMs + (b - prefill) * blockMs)
+                juce::Thread::sleep (1);
+
+            push (b);
+        }
+
+        const auto stats = rx.getStats();
+        pumpMessages (150);                          // the stream ends: concealment, then a faded cut
+        engine.setPreviewBuffer (nullptr);
+        engine.getFakeDevice()->onOutputBlock = nullptr;
+
+        std::vector<float> pure (48000);
+
+        for (size_t i = 0; i < pure.size(); ++i)
+            pure[i] = sineAt ((int64_t) i);
+
+        const auto bound = 1.5f * maxStepOf (pure);
+        std::lock_guard<std::mutex> g (out.lock);
+        const auto peak = peakOfVector (out.L), step = maxStepOf (out.L);
+        logMessage (juce::String (dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
+                    + juce::String ((int) stats.underruns) + ", output peak " + juce::String (peak, 4) + ", max step "
+                    + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
+
+        if (! dropOne)
+            expectEquals ((int) stats.underruns, 0, "the stream was paced without gaps");
+
+        expect (peak >= 0.425f && peak <= 0.575f, "output peak " + juce::String (peak, 4));
+        expect (step <= bound, "click in the preview: step " + juce::String (step, 6));
+        expect (out.L.back() == 0.0f, "silent after the stream ended");
     }
 
     void runTest() override
@@ -316,12 +488,42 @@ public:
         studioTestDir().deleteRecursively();
 
         beginTest ("loopback alignment, block 256");
-        alignment (256, { 200, 264 });
+        alignment ({ "b256", 256, { 200, 264 }, 0, 96000 + 200 + 264 });
 
         beginTest ("loopback alignment, blocks 64 and 1024");
-        alignment (64, { 200, 264 });
+        alignment ({ "b64", 64, { 200, 264 }, 0, 96000 + 200 + 264 });
         // A real round trip spans at least one block: at 1024 the fake device needs latencies that add up to >= 1024.
-        alignment (1024, { 1224, 1288 });
+        alignment ({ "b1024", 1024, { 1224, 1288 }, 0, 96000 + 1224 + 1288 });
+
+        beginTest ("loopback alignment with a calibration of 37 samples");
+        // The device hides 37 samples of its round trip; the calibration supplies them.
+        alignment ({ "cal37", 256, { 200, 264, 37 }, 37, 96000 + 200 + 264 + 37 });
+
+        beginTest ("loopback alignment when recording from a playing transport");
+        alignment ({ "playing", 256, { 200, 264 }, 0, 96000 + 200 + 264, true });
+
+        beginTest ("stop, play and setPosition during a take change neither the position nor the alignment");
+        alignment ({ "interfere", 256, { 200, 264 }, 0, 96000 + 200 + 264, false, true });
+
+        beginTest ("a take shorter than the offset yields no region and an error");
+        {
+            const auto dir = studioTestDir().getChildFile ("short");
+            ClickProject p (dir.getChildFile ("cache"));
+            StudioEngine engine;
+            engine.setMetronome (false, true);           // count-in: 96000 samples at 120 BPM
+            engine.setProject (p.snapshot());
+            engine.useFakeDevice (256, TestSignal::silence);
+            pumpMessages (20);
+
+            Collected c;
+            c.attach (engine);
+            expect (engine.startRecording (p.voice(), newId(), dir.getChildFile ("take.wav")).wasOk());
+            pumpMessages (200);
+            const auto rec = engine.stopRecording();
+            expect (! rec.has_value(), "no region for a take shorter than the offset");
+            expectEquals (c.errors.load(), 1);
+            expect (! engine.isRecording());
+        }
 
         beginTest ("loopback refuses a round trip shorter than the block");
         {
@@ -345,24 +547,33 @@ public:
             expect (trip.has_value() && std::abs (*trip - 464) <= 1, "round trip");
         }
 
+        beginTest ("calibration finds latency the device does not report");
+        {
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::loopback, { 200, 264, 37 });
+            engine.setChannels (0, 1, 0);
+            pumpMessages (20);
+            engine.startCalibration();
+            expect (waitFor ([&] { return ! engine.isCalibrating(); }, 9000), "calibration did not finish");
+            const auto trip = engine.calibrationRoundTrip();
+            logMessage ("calibration round trip with 37 hidden: " + (trip.has_value() ? juce::String (*trip) : juce::String ("none")));
+            expect (trip.has_value() && *trip == 501, "round trip");
+            expectEquals (trip.has_value() ? LatencyCalibrator::calibrationFor (*trip, 200, 264) : -1, 37);
+        }
+
         beginTest ("play, seek and stop are click-free at the output");
         {
-            const Id host = newId(), take = newId(), track = newId();
-            auto project = makeProject ("Song", host, "Lucas");
-            const int64_t length = 10 * 48000;
-            expect (applyOp (project, Ops::addTake (take, 1), host).ok
-                    && applyOp (project, Ops::updateTake (take, 10, length, true), host).ok
-                    && applyOp (project, Ops::addTrack (track, "Sine", TrackKind::imported), host).ok
-                    && applyOp (project, Ops::setMix (track, std::nullopt, -1.0f, std::nullopt), host).ok   // hard left
-                    && applyOp (project, Ops::addRegion (track, { newId(), take, 0, 0, length }), host).ok);
+            SineProject sp;
+            expect (sp.ok);
             SineTakes sines;
-            sines.add (take, length);
+            sines.add (sp.take, sp.length);
 
             StudioEngine engine;
             engine.setMonitor (0.0f, 0.0f);
             engine.setMetronome (false, false);
             engine.setSampleSource (&sines);
-            engine.setProject (std::make_shared<const Project> (project));
+            engine.setProject (sp.snapshot());
             engine.setPosition (12345);
             engine.useFakeDevice (256, TestSignal::silence);
             OutputCapture out (48000 * 4);
@@ -395,6 +606,50 @@ public:
             expect (peak > 0.45f, "the sine played");
             expect (step <= bound, "click at the output: step " + juce::String (step, 6));
             expect (out.L.back() == 0.0f && out.R.back() == 0.0f, "silent after stop");
+        }
+
+        beginTest ("swapping the sample source while playing is safe and click-free");
+        {
+            SineProject sp;
+            expect (sp.ok);
+            readsAfterDestruction = 0;
+            auto current = std::make_unique<PoisonedSineTakes>();
+            current->add (sp.take, sp.length);
+
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.setMetronome (false, false);
+            engine.setSampleSource (current.get());
+            engine.setProject (sp.snapshot());
+            engine.useFakeDevice (64, TestSignal::silence);
+            OutputCapture out (48000 * 6);
+            out.attach (*engine.getFakeDevice());
+            engine.play();
+            pumpMessages (100);
+
+            for (int i = 0; i < 50; ++i)
+            {
+                auto next = std::make_unique<PoisonedSineTakes>();
+                next->add (sp.take, sp.length);
+                engine.setSampleSource (next.get());
+                current = std::move (next);              // destroys the previous source right after the call
+                pumpMessages (i % 2 == 0 ? 3 : 15);
+            }
+
+            pumpMessages (50);
+            engine.stop();
+            pumpMessages (50);
+            engine.getFakeDevice()->onOutputBlock = nullptr;
+            engine.setSampleSource (nullptr);
+
+            std::lock_guard<std::mutex> g (out.lock);
+            const auto step = maxStepOf (out.L), bound = noClickBound();
+            logMessage ("50 swaps: reads after destruction " + juce::String (readsAfterDestruction.load()) + ", peak "
+                        + juce::String (peakOfVector (out.L), 4) + ", max step " + juce::String (step, 6)
+                        + " (bound " + juce::String (bound, 6) + ")");
+            expectEquals (readsAfterDestruction.load(), 0);
+            expect (peakOfVector (out.L) > 0.45f, "the sine played");
+            expect (step <= bound, "click at a swap: step " + juce::String (step, 6));
         }
 
         beginTest ("the metronome sounds only at the output, never in the take");
@@ -518,41 +773,11 @@ public:
             expect (wellFormed, "preview packets");
         }
 
-        beginTest ("live preview: received packets are added to the output");
-        {
-            StudioEngine engine;
-            engine.setMonitor (0.0f, 0.0f);
-            engine.useFakeDevice (256, TestSignal::silence);
-            JitterBuffer rx (codedBytesStereo (FrameSize::f128), 128000.0 / sampleRate);
-            rx.setAutoSize (false);
-            engine.setPreviewBuffer (&rx);
-            pumpMessages (20);
-            engine.takeMeters();
+        beginTest ("live preview: received packets are added to the output without clicks");
+        previewReceive (false);
 
-            OpusMode mode (FrameSize::f128);
-            OpusEncoder encoder (mode, 2);
-            std::vector<float> pcm (256);
-            std::vector<uint8_t> coded (128);
-            const double startMs = juce::Time::getMillisecondCounterHiRes();
-
-            for (int b = 0; b < 150; ++b)
-            {
-                for (int i = 0; i < 128; ++i)
-                    pcm[(size_t) (2 * i)] = pcm[(size_t) (2 * i + 1)] = sineAt (b * 128 + i);
-
-                const int n = encoder.encode (pcm.data(), coded.data(), (int) coded.size());
-                rx.push ((uint16_t) b, coded.data(), n, startMs + b * 128000.0 / sampleRate);
-
-                if ((b + 1) % 6 == 0)
-                    juce::Thread::sleep (16);
-            }
-
-            pumpMessages (50);
-            const auto meters = engine.takeMeters();
-            engine.setPreviewBuffer (nullptr);
-            logMessage ("preview output peak " + juce::String (meters.output, 4));
-            expect (meters.output > 0.3f && meters.output < 1.0f, "preview output peak " + juce::String (meters.output));
-        }
+        beginTest ("live preview: a lost packet is concealed without a click");
+        previewReceive (true);
     }
 };
 
