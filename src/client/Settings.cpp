@@ -1,5 +1,6 @@
 #include "Settings.h"
 #include "core/Project.h"
+#include <regex>
 
 namespace ensayo
 {
@@ -23,6 +24,20 @@ bool readBool (const juce::var& v, const char* name, bool fallback)
 juce::String readString (const juce::var& v, const char* name, const juce::String& fallback)
 {
     return v.getProperty (name, fallback).toString();
+}
+
+// The user id out of a settings file that no longer parses (truncated write, stray bytes): losing it would make every
+// take recorded under it someone else's. Empty when no well-formed id is found.
+Id recoverUserId (const juce::String& corrupt)
+{
+    static const std::regex pattern (R"re("userId"\s*:\s*"([0-9a-f]{32})")re");
+    const auto text = corrupt.toStdString();
+    std::smatch match;
+
+    if (std::regex_search (text, match, pattern))
+        return juce::String (match[1].str());
+
+    return {};
 }
 }
 
@@ -128,6 +143,8 @@ AppSettings loadSettings (const juce::File& file, juce::String* warning, bool* k
     if (keepFile != nullptr)
         *keepFile = false;
 
+    Id recoveredId;
+
     if (file.existsAsFile())
     {
         juce::var parsed;
@@ -136,6 +153,7 @@ AppSettings loadSettings (const juce::File& file, juce::String* warning, bool* k
         // written. If it cannot be moved it is never overwritten: the defaults stay in memory only.
         if (juce::JSON::parse (file.loadFileAsString(), parsed).failed() || ! parsed.isObject())
         {
+            recoveredId = recoverUserId (file.loadFileAsString());
             auto bad = file.getSiblingFile (file.getFileName() + ".bad");
 
             for (int n = 1; bad.exists() && n < 1000; ++n)
@@ -155,7 +173,7 @@ AppSettings loadSettings (const juce::File& file, juce::String* warning, bool* k
                                                                      "se usan valores por defecto y no se guardar\xc3\xa1n cambios"));
 
                 AppSettings s;
-                s.userId = newId();
+                s.userId = recoveredId.isNotEmpty() ? recoveredId : newId();
                 return s;
             }
 
@@ -168,7 +186,7 @@ AppSettings loadSettings (const juce::File& file, juce::String* warning, bool* k
 
     if (s.userId.isEmpty())
     {
-        s.userId = newId();
+        s.userId = recoveredId.isNotEmpty() ? recoveredId : newId();
         saveSettings (s, file);   // best effort: the id must survive the next load
     }
 

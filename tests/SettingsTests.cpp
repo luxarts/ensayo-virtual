@@ -134,6 +134,38 @@ public:
             dir.deleteRecursively();
         }
 
+        beginTest ("a corrupt settings file keeps its userId when the id can still be read");
+        {
+            const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ensayo-settings-recover");
+            dir.deleteRecursively();
+            dir.createDirectory();
+            const auto file = dir.getChildFile ("settings.json");
+            const Id id = newId();
+
+            file.replaceWithText ("{\n  \"name\": \"Ana\",\n  \"userId\" :  \"" + id + "\",\n  \"bufferSize\": 2");   // cut short
+            const auto recovered = loadSettings (file);
+            expectEquals (recovered.userId, id);
+            expectEquals (fromJson (file.loadFileAsString()).userId, id, "the recovered id is saved with the defaults");
+
+            // Held open (cannot be moved aside): the id is still recovered in memory.
+            file.replaceWithText ("garbage \"userId\":\"" + id + "\" garbage");
+            {
+                const auto handle = CreateFileW (file.getFullPathName().toWideCharPointer(), GENERIC_READ, FILE_SHARE_READ,
+                                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                expect (handle != INVALID_HANDLE_VALUE);
+                bool keepFile = false;
+                expectEquals (loadSettings (file, nullptr, &keepFile).userId, id);
+                expect (keepFile);
+                CloseHandle (handle);
+            }
+
+            // No readable id (wrong length, upper case): a new one.
+            file.replaceWithText ("{ \"userId\": \"" + id.toUpperCase() + "\", broken");
+            const auto fresh = loadSettings (file);
+            expect (isValidId (fresh.userId) && fresh.userId != id);
+            dir.deleteRecursively();
+        }
+
         beginTest ("calibration map round trip and key format");
         {
             expectEquals (calibrationKey ("MiniFuse ASIO Driver", 256), juce::String ("MiniFuse ASIO Driver@256"));
