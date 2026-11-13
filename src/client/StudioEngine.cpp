@@ -159,6 +159,8 @@ struct StudioEngine::RemoteSlotMix
     std::vector<float> L, R;                         // decoded and not played yet: [0, fill)
     int fill = 0;
     float gain = 1.0f;                               // participant gain reached at the end of the last block
+    int tailCount = 0;                               // [0, tailCount) of L/R is a previous sender's faded tail...
+    float tailGain = 1.0f;                           // ...played at that sender's gain, not ramped to the new one
 };
 
 //==============================================================================
@@ -738,8 +740,11 @@ void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
                     m.mono.reset();
                     m.stereo.reset();
 
-                    if (m.fill == 0)
-                        m.gain = target;
+                    // What is still decoded belongs to the previous sender: it keeps its gain while the new stream
+                    // (faded in) starts at its own.
+                    m.tailCount = m.fill;
+                    m.tailGain = m.gain;
+                    m.gain = target;
                 }
 
                 const int expected = m.channels == 1 ? codedBytesMono (FrameSize::f128) : codedBytesStereo (FrameSize::f128);
@@ -798,12 +803,13 @@ void StudioEngine::mixRemote (float* L, float* R, int n) noexcept
 
         for (int i = 0; i < count; ++i)
         {
-            const float g = g0 + (g1 - g0) * (float) (i + 1) / (float) n;
+            const float g = i < m.tailCount ? m.tailGain : g0 + (g1 - g0) * (float) (i + 1) / (float) n;
             L[i] += g * m.L[(size_t) i];
             R[i] += g * m.R[(size_t) i];
         }
 
         m.gain = g1;
+        m.tailCount = std::max (0, m.tailCount - count);
         m.fill -= count;
         std::copy (m.L.begin() + count, m.L.begin() + count + m.fill, m.L.begin());
         std::copy (m.R.begin() + count, m.R.begin() + count + m.fill, m.R.begin());
@@ -899,6 +905,7 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
         m->channels = 0;
         m->primed = false;
         m->lost = 0;
+        m->tailCount = 0;
     }
 
     // Chat send: the frame being built when the device stopped is dropped (the clock moves on to the next frame) and
