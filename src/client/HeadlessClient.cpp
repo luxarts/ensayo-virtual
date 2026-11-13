@@ -686,6 +686,18 @@ int runHeadless (const HeadlessOptions& o)
         const auto peaks = engine.takePeaks();
         const double t = (juce::Time::getMillisecondCounterHiRes() - sessionStartMs) / 1000.0;
 
+        // What the server says it receives from this client (-1 until the first stats message).
+        juce::int64 serverPacketsFromMe = -1, serverWrongFrameFromMe = -1;
+
+        for (const auto& st : s.stats)
+        {
+            if (st.id == s.clientId && st.packets != ~0u)
+            {
+                serverPacketsFromMe = (juce::int64) st.packets;
+                serverWrongFrameFromMe = (juce::int64) st.wrongFrame;
+            }
+        }
+
         juce::String line;
         line << "{\"t\":" << juce::String (t, 3)
              << ",\"pingMs\":" << s.pingMs
@@ -699,6 +711,9 @@ int runHeadless (const HeadlessOptions& o)
              << ",\"peakInstrument\":" << juce::String (peaks.instrument, 3)
              << ",\"peakReceived\":" << juce::String (peaks.received, 3)
              << ",\"peakOutput\":" << juce::String (peaks.output, 3)
+             << ",\"mixPackets\":" << (juce::int64) client.getMixPacketsReceived()
+             << ",\"serverPacketsFromMe\":" << serverPacketsFromMe
+             << ",\"serverWrongFrameFromMe\":" << serverWrongFrameFromMe
              << "}\n";
         o.statsLog.appendText (line);
     };

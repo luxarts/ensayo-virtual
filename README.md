@@ -53,6 +53,13 @@ cmake --build build --config Debug --target EnsayoTests -- /m
 .\tests\integration\run-all.ps1                                # dos instancias reales, latencia, backing track, capturas
 ```
 
+Para aislar la red sin la app (UDP puro en el puerto 22140, con Ensayo Virtual cerrado):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\udp-test.ps1 -Listen              # en el host
+powershell -ExecutionPolicy Bypass -File tools\udp-test.ps1 -Send <IP del host>  # en el invitado
+```
+
 `run-all.ps1` levanta `EnsayoServer.exe` y dos clientes headless con dispositivo de audio falso,
 mide la latencia ida con clicks (emitidos en A, detectados en la salida de B), prueba el servidor
 embebido, la subida y reproducción del backing track, la pérdida de paquetes simulada, y genera
@@ -134,6 +141,10 @@ servidor quedan en `%TEMP%\EnsayoVirtual\`.
 | `No se encontraron drivers ASIO` | Instalar el driver ASIO de la interfaz. |
 | `Error de audio: ...` | Otro programa (DAW) usa el driver, o se desconectó la interfaz. Cerrarlo y **Reintentar**. |
 | `Sin audio del servidor` | No llegan paquetes UDP: revisar firewall/puerto 22140 UDP en el host. |
+| `El host no recibe tu audio: el UDP a ... no llega` | Tu UDP no sale o no llega al host (TCP sí): permití Ensayo Virtual en el firewall de Windows **y en el antivirus** de tu PC (redes públicas y privadas). Probalo sin la app con `tools\udp-test.ps1`. |
+| `El host recibe tu audio pero el suyo no llega a esta PC` | La vuelta está bloqueada en tu PC: mismo arreglo (firewall/antivirus de esta PC). |
+| `No llega el audio de <nombre>` (en el host) | El UDP de esa persona no alcanza tu servidor; el problema está en su PC o su red. Ella ve "El host no recibe tu audio". |
+| `<nombre> usa otro tamaño de buffer` / `tu buffer no coincide` | Bloques de 64 vs 128: salir y volver a entrar (la app ajusta el buffer al unirse) o igualar el Buffer en el lobby. |
 | Nadie puede unirse desde afuera | Abrir el puerto 22140 TCP y UDP en el router del host, o usar `EnsayoServer.exe` en un VPS. |
 | Latencia alta / cortes | Bajar el buffer ASIO a 64 o 128; usar cable, no Wi-Fi; elegir un host cercano. |
 | `Falta tools\yt-dlp.exe` | Falta la carpeta `tools` junto al exe (está en el zip del release; o correr `tools\fetch-tools.ps1`). |

@@ -209,6 +209,7 @@ public:
 
         if (! resolve (server))
         {
+            owner.udpFailure.store (UdpFailure::resolve);
             WSACleanup();
             return;
         }
@@ -217,6 +218,7 @@ public:
 
         if (sock == INVALID_SOCKET)
         {
+            owner.udpFailure.store (UdpFailure::socket);
             WSACleanup();
             return;
         }
@@ -246,6 +248,7 @@ public:
 
         if (::bind (sock, (const sockaddr*) &local, sizeof (local)) != 0)
         {
+            owner.udpFailure.store (UdpFailure::bind);
             closeSocket();
             WSACleanup();
             return;
@@ -286,6 +289,7 @@ public:
                     continue;
 
                 const auto arrival = juce::Time::getMillisecondCounterHiRes();
+                owner.mixPacketsReceived.fetch_add (1, std::memory_order_relaxed);
                 owner.trackPosition.store (view.trackPosition, std::memory_order_relaxed);
                 owner.buffer->push (view.seq, view.voice, view.voiceLen, arrival);
             }
@@ -705,6 +709,8 @@ void SessionClient::connect (const juce::String& host, int port, const juce::var
     serverUdpPort = 0;
     clientId.store (0);
     trackPosition.store (0);
+    mixPacketsReceived.store (0);
+    udpFailure.store (UdpFailure::none);
     buffer->reset();
 
     writer = std::make_unique<WriterThread> (*this);
@@ -924,6 +930,9 @@ std::vector<ParticipantStats> SessionClient::parseStats (const juce::var& list)
             s.late = (uint32_t) (juce::int64) item["late"];
             s.voicePeak = (float) (double) item["voicePeak"];
             s.instrumentPeak = (float) (double) item["instrumentPeak"];
+            // Absent (older server) → treated as "unknown", which the UI must not read as "no packets".
+            s.packets = item.hasProperty ("packets") ? (uint32_t) (juce::int64) item["packets"] : ~0u;
+            s.wrongFrame = (uint32_t) (juce::int64) item["wrongFrame"];
             result.push_back (s);
         }
     }

@@ -42,6 +42,12 @@ public:
     JitterBuffer& receiveBuffer() noexcept override;
     uint32_t getClientId() const noexcept override;
     uint32_t getTrackPosition() const noexcept override;
+
+    // Diagnostics (any thread). Mix datagrams received from the server since the last join, and why the UDP socket
+    // could not be set up (none = it is running or not started yet).
+    enum class UdpFailure { none, resolve, socket, bind };
+    uint32_t getMixPacketsReceived() const noexcept   { return mixPacketsReceived.load (std::memory_order_relaxed); }
+    UdpFailure getUdpFailure() const noexcept         { return udpFailure.load (std::memory_order_relaxed); }
     // UDP receive thread: blocking recvfrom → mix packets → receiveBuffer().push (seq, payload, arrival), stores trackPosition.
     // UDP send thread: woken by sendAudio (SetEvent, the audio thread's one non-blocking kernel call) and drains the queue.
     // Control thread: StreamingSocket read loop; ping every 1 s; reconnect is not attempted. Writer thread: every socket write.
@@ -76,7 +82,8 @@ private:
     std::unique_ptr<JitterBuffer> buffer;
     PacketQueue outgoing;
     void* sendWake = nullptr;   // Win32 auto-reset event: set by sendAudio, waited on by the UDP send thread; lives with the client
-    std::atomic<uint32_t> clientId { 0 }, trackPosition { 0 };
+    std::atomic<uint32_t> clientId { 0 }, trackPosition { 0 }, mixPacketsReceived { 0 };
+    std::atomic<UdpFailure> udpFailure { UdpFailure::none };
 
     juce::StreamingSocket socket;
     std::unique_ptr<WriterThread> writer;           // the only thread that writes to the socket

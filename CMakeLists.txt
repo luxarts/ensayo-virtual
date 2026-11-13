@@ -65,6 +65,7 @@ set(ENSAYO_UI_SOURCES
     src/ui/LobbyView.cpp
     src/ui/SessionView.cpp
     src/ui/MainComponent.cpp
+    src/ui/AudioDiagnosis.cpp
     # T10
     src/ui/Screenshot.cpp
 )
@@ -96,6 +97,7 @@ set(ENSAYO_TEST_SOURCES
     # T8-tests
     tests/HeadlessClientTests.cpp
     tests/UiTests.cpp
+    tests/AudioDiagnosisTests.cpp
     # T10-tests
     tests/ScreenshotTests.cpp
 )

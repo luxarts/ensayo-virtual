@@ -749,6 +749,8 @@ void ServerHost::housekeeping()
             o->setProperty ("late", (juce::int64) s.late);
             o->setProperty ("voicePeak", s.voicePeak);
             o->setProperty ("instrumentPeak", s.instrumentPeak);
+            o->setProperty ("packets", (juce::int64) s.packets);
+            o->setProperty ("wrongFrame", (juce::int64) s.wrongFrame);
             array.add (juce::var (o));
         }
 
