@@ -25,6 +25,15 @@ public:
     uint32_t overflows() const noexcept;
     int64_t samplesCaptured() const noexcept;
 
+    // Caller contract: push() must not race start() or stop(). The caller stops feeding (the engine stops capture in
+    // its callback) before stop(); if it does not, samplesCaptured() can exceed the finished sample count by at most
+    // one block. A local WAV failure is reported once through onError but the take continues (the WAV is only a backup);
+    // a segment encoding failure stops the recording (further pushes are dropped) and fires onFinished.
+
+    // Test hooks (no effect unless called): pause the writer; force WAV writes / segment encoding to fail.
+    void setFailWavWritesForTest (bool fail) noexcept;
+    void setFailEncodeForTest (bool fail) noexcept;
+
     // Test hook: while true the writer thread does not drain the FIFO (ignored once stop() was called).
     void setWriterPausedForTest (bool paused) noexcept;
 
@@ -41,7 +50,7 @@ private:
 
     std::unique_ptr<Writer> writer;
     std::thread thread;
-    std::atomic<bool> capturing { false }, stopRequested { false }, paused { false };
+    std::atomic<bool> capturing { false }, stopRequested { false }, paused { false }, failWav { false }, failEncode { false };
     std::atomic<uint32_t> overflowCount { 0 };
     std::atomic<int64_t> captured { 0 };
     juce::WaitableEvent wake;

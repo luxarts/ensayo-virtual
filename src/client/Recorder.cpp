@@ -28,7 +28,6 @@ struct Recorder::Writer
     std::vector<Peak> peaks;
     int64_t peaksSentFrom = 0;
     bool peaksDirty = false;
-    bool failed = false;
 };
 
 Recorder::Recorder() = default;
@@ -136,33 +135,50 @@ void Recorder::setWriterPausedForTest (bool p) noexcept
         wake.signal();
 }
 
+void Recorder::setFailWavWritesForTest (bool fail) noexcept { failWav.store (fail); }
+void Recorder::setFailEncodeForTest (bool fail) noexcept { failEncode.store (fail); }
+
 void Recorder::writerLoop()
 {
     auto& w = *writer;
     auto lastPublish = juce::Time::getMillisecondCounter();
+    int64_t emittedSamples = 0;
+    bool encodeFailed = false, wavFailed = false;
 
-    auto fail = [this, &w] (const juce::String& message)
+    // The WAV is only a backup copy: a failure is reported once, the file is closed and the take carries on.
+    auto failWavCopy = [&] (const juce::String& what)
     {
-        if (w.failed)
+        if (wavFailed)
             return;
 
-        w.failed = true;
-        capturing.store (false, std::memory_order_release);   // further pushes are dropped
+        wavFailed = true;
+        w.wav.reset();
 
         if (onError)
-            onError (message);
+            onError ("The local backup copy failed (" + what + " " + wavFile.getFullPathName() + "); the take is still being uploaded");
+    };
+
+    // The segments are what gets uploaded: if one cannot be encoded the recording stops.
+    auto failEncoding = [&]
+    {
+        encodeFailed = true;
+        capturing.store (false, std::memory_order_release);   // further pushes are dropped
+        w.segmentFill = 0;                                    // the unencodable samples are discarded
+
+        if (onError)
+            onError ("Segment encoding failed; the recording was stopped");
     };
 
     auto cutSegment = [&] (int count)
     {
-        if (count <= 0)
+        if (count <= 0 || encodeFailed)
             return;
 
-        const auto flac = encodeSegment (w.segment, count);
+        const auto flac = failEncode.load() ? juce::MemoryBlock() : encodeSegment (w.segment, count);
 
         if (flac.getSize() == 0)
         {
-            fail ("segment encoding failed");
+            failEncoding();
             return;
         }
 
@@ -170,10 +186,11 @@ void Recorder::writerLoop()
             onSegment (w.segmentsCut, flac, count);
 
         ++w.segmentsCut;
+        emittedSamples += count;
         w.segmentFill = 0;
 
-        if (! w.wav->flush())
-            fail ("cannot flush " + wavFile.getFullPathName());
+        if (w.wav != nullptr && (failWav.load() || ! w.wav->flush()))
+            failWavCopy ("cannot flush");
     };
 
     auto addPeaks = [&] (int n)
@@ -236,18 +253,15 @@ void Recorder::writerLoop()
 
         fifo->finishedRead (n1 + n2);
 
-        if (! w.wav->writeFromAudioSampleBuffer (w.chunk, 0, ready))
-        {
-            fail ("cannot write " + wavFile.getFullPathName());
-            return false;
-        }
+        if (w.wav != nullptr && (failWav.load() || ! w.wav->writeFromAudioSampleBuffer (w.chunk, 0, ready)))
+            failWavCopy ("cannot write");
 
         if (onLiveAudio)
             onLiveAudio (w.chunk.getArrayOfReadPointers(), numChannels, ready);
 
         addPeaks (ready);
 
-        for (int done = 0; done < ready;)
+        for (int done = 0; done < ready && ! encodeFailed;)
         {
             const int take = std::min (ready - done, segmentSamples - w.segmentFill);
 
@@ -262,7 +276,7 @@ void Recorder::writerLoop()
         }
 
         w.samples += ready;
-        return true;
+        return ! encodeFailed;
     };
 
     for (;;)
@@ -271,9 +285,9 @@ void Recorder::writerLoop()
         const bool stopping = stopRequested.load (std::memory_order_acquire);   // read before draining: that drain is final
 
         if (stopping || ! paused.load())
-            while (! w.failed && drainChunk()) {}
+            while (drainChunk()) {}
 
-        if (w.failed)
+        if (encodeFailed)
             break;
 
         const auto now = juce::Time::getMillisecondCounter();
@@ -288,11 +302,11 @@ void Recorder::writerLoop()
             break;
     }
 
-    cutSegment (w.segmentFill);              // the partial last segment (or what preceded a failed write)
+    cutSegment (w.segmentFill);              // the partial last segment; never retried after an encode failure
     publishPeaks();
     w.wav.reset();                           // closes the file and finalises the header
 
     if (onFinished)
-        onFinished (w.segmentsCut, w.samples);
+        onFinished (w.segmentsCut, emittedSamples);
 }
 }

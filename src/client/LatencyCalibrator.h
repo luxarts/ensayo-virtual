@@ -10,7 +10,7 @@ class LatencyCalibrator
 {
 public:
     static constexpr int clicks = 8, periodSamples = 24000;   // a click every 0.5 s
-    void start() noexcept;                                     // message thread
+    void start() noexcept;                                     // message thread; ignored while a run is in progress
     // Audio thread: writes the click train to out (both channels), scans `in` for each click (threshold 0.1 after
     // 20 ms of quiet), records the round trip in samples. Done after `clicks` clicks or 6 s.
     void process (const float* in, float* outL, float* outR, int n) noexcept;

@@ -7,7 +7,9 @@ namespace ensayo
 {
 void LatencyCalibrator::start() noexcept
 {
-    running.store (false, std::memory_order_release);
+    if (isRunning())
+        return;                              // the audio thread owns the state while a run is in progress
+
     detected.store (0);
     position = 0;
     lastClickAt = -1;

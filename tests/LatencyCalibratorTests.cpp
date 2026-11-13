@@ -112,6 +112,34 @@ public:
             expect (std::all_of (l.begin(), l.end(), [] (float v) { return v == 0.0f; }));
         }
 
+        beginTest ("start while a run is in progress is ignored");
+        {
+            LatencyCalibrator cal;
+            std::vector<float> in (128, 0.0f), l (128), r (128);
+            cal.start();
+            int64_t pos = 0;
+
+            for (; pos < 20000; pos += 128)
+                cal.process (in.data(), l.data(), r.data(), 128);
+
+            cal.start();                       // must not rewind the click train (first click was at 12000)
+            std::vector<int64_t> at;
+
+            while (cal.isRunning() && pos < 7 * 48000)
+            {
+                cal.process (in.data(), l.data(), r.data(), 128);
+
+                for (int i = 0; i < 128; ++i)
+                    if (l[(size_t) i] != 0.0f)
+                        at.push_back (pos + i);
+
+                pos += 128;
+            }
+
+            expectEquals ((int) at.size(), 7);
+            expectEquals (at.empty() ? (int64_t) 0 : at[0], (int64_t) 36000);
+        }
+
         beginTest ("a hot input is not mistaken for clicks and calibrationFor subtracts the known latencies");
         {
             LatencyCalibrator cal;
