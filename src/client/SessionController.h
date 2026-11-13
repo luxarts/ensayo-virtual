@@ -5,6 +5,7 @@
 #include "server/ProjectHost.h"
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -67,6 +68,16 @@ public:
     // instrument tracks; re-checked on every project change (a deleted track disarms the monitor).
     void setArmedTrack (const Id& track);
 
+    // Personal level (linear gain, muted) of another user's voice chat and live instrument. Kept across sessions and
+    // applied to the engine by the user's current clientId, again on every presence change (a reconnect gets a new
+    // clientId). Users without an entry play at 1.0.
+    struct ParticipantMix { float gain = 1.0f; bool muted = false; };
+    void setParticipantMix (const Id& user, ParticipantMix);
+    struct ClientGain { uint32_t clientId = 0; float gain = 1.0f; bool muted = false; };
+    // Every online, non-zero clientId in the presence with the mix of its user (1.0 and unmuted when none is set), so a
+    // clientId reused by someone else never keeps the previous user's level.
+    static std::vector<ClientGain> clientGains (const std::vector<Presence>&, const std::map<Id, ParticipantMix>&);
+
     // Import: decode + resample + segments on a thread, then a new `imported` track with one region at 0. The track name
     // (trackName, else the file name) is trimmed and cut to 64 characters. The take starts only once the host applied
     // the track: a rejected add_track or a lost connection ends the import with an error and nothing recorded.
@@ -102,6 +113,7 @@ private:
     void createClient (const SessionIdentity&);
     void refreshEngine();
     void applyArmed();
+    void applyParticipantGains();
     void attachLiveAudio();                         // engine <-> client: chat sink, remote streams, chat on
     void detachLiveAudio();                         // chat off and remote streams gone before the client changes
     void post (std::function<void()>);
@@ -118,6 +130,7 @@ private:
     const SampleSource* engineSource = nullptr;
     bool everConnected = false;
     Id armedTrack;
+    std::map<Id, ParticipantMix> participantMixes;
     std::vector<Id> resumedTakes;
 
     // Take being recorded here.

@@ -62,6 +62,22 @@ public:
 
     void testParsing()
     {
+        beginTest ("participant mixes map to the current clientIds; a reused clientId gets the new user's level");
+        {
+            const Id ana = newId(), beto = newId(), carla = newId();
+            std::map<Id, SessionController::ParticipantMix> mixes { { ana, { 0.5f, false } }, { beto, { 2.0f, true } } };
+            const std::vector<Presence> presence { { ana, "Ana", true, 7 }, { beto, "Beto", false, 0 }, { carla, "Carla", true, 9 },
+                                                  { newId(), "Sin UDP", true, 0 } };
+            const auto gains = SessionController::clientGains (presence, mixes);
+            expectEquals ((int) gains.size(), 2);
+            expect (gains[0].clientId == 7 && gains[0].gain == 0.5f && ! gains[0].muted);
+            expect (gains[1].clientId == 9 && gains[1].gain == 1.0f && ! gains[1].muted, "no entry: unity, so 9 forgets any older user");
+
+            // Beto reconnects with Ana's old clientId: the level follows the user, not the number.
+            const auto after = SessionController::clientGains ({ { beto, "Beto", true, 7 } }, mixes);
+            expect (after.size() == 1 && after[0].clientId == 7 && after[0].gain == 2.0f && after[0].muted);
+        }
+
         beginTest ("parseHeadlessOptions: every v2 option");
         {
             const auto user = newId();

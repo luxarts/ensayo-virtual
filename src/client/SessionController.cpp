@@ -124,7 +124,12 @@ void SessionController::createClient (const SessionIdentity& identity)
     };
 
     client->onTransfersChanged = [this] { if (onTransfersChanged) onTransfersChanged(); };
-    client->onPresenceChanged  = [this] { if (onPresenceChanged) onPresenceChanged(); };
+    client->onPresenceChanged  = [this]
+    {
+        applyParticipantGains();
+
+        if (onPresenceChanged) onPresenceChanged();
+    };
     client->onDisconnected     = [this] (const juce::String& reason)
     {
         if (importWait)
@@ -176,6 +181,39 @@ void SessionController::applyArmed()
         kind = track->kind;
 
     engine.setArmed (kind);
+}
+
+void SessionController::setParticipantMix (const Id& user, ParticipantMix mix)
+{
+    participantMixes[user] = mix;
+    applyParticipantGains();
+}
+
+std::vector<SessionController::ClientGain> SessionController::clientGains (const std::vector<Presence>& presence,
+                                                                           const std::map<Id, ParticipantMix>& mixes)
+{
+    std::vector<ClientGain> out;
+
+    for (const auto& p : presence)
+    {
+        if (! p.online || p.clientId == 0)
+            continue;
+
+        const auto it = mixes.find (p.user);
+        const auto mix = it != mixes.end() ? it->second : ParticipantMix();
+        out.push_back ({ p.clientId, mix.gain, mix.muted });
+    }
+
+    return out;
+}
+
+void SessionController::applyParticipantGains()
+{
+    if (client == nullptr)
+        return;
+
+    for (const auto& g : clientGains (client->presence(), participantMixes))
+        engine.setParticipantGain (g.clientId, g.gain, g.muted);
 }
 
 void SessionController::attachLiveAudio()
