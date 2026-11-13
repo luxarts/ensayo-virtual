@@ -1085,6 +1085,79 @@ public:
         beginTest ("received streams: off and on again during the faded tail (64-sample blocks) plays the tail out");
         remoteReceive (RemoteEnd::offAndOn, 64);
 
+        beginTest ("calibration keeps the other participants out of the output; they sound again afterwards");
+        {
+            StudioEngine engine;
+            engine.setMonitor (0.0f, 0.0f);
+            engine.useFakeDevice (256, TestSignal::loopback, { 200, 264 });
+            engine.setChannels (0, 1, 0);
+            OutputCapture out (48000 * 12);
+            out.attach (*engine.getFakeDevice());
+
+            RemoteStreamTable table;
+
+            for (auto& slot : table.slots())
+            {
+                slot.buffer.setAutoSize (false);
+                slot.buffer.setSizeBlocks (8);
+            }
+
+            OpusMode mode (FrameSize::f128);
+            RemoteSender voice (mode, 3, StreamKind::voice, 440.0);
+
+            for (int b = 0; b < 8; ++b)
+                voice.send (table);
+
+            engine.setRemoteStreams (&table);
+            const double blockMs = 128000.0 / sampleRate;
+            const double startMs = juce::Time::getMillisecondCounterHiRes();
+            size_t calibrationStart = 0, calibrationEnd = 0;
+            bool started = false;
+
+            for (int b = 0; b < (int) (10.0 * sampleRate / 128); ++b)
+            {
+                while (juce::Time::getMillisecondCounterHiRes() < startMs + b * blockMs)
+                    juce::Thread::sleep (1);
+
+                if (! started && b * 128.0 / sampleRate >= 0.5)
+                {
+                    started = true;
+                    engine.startCalibration();
+                    pumpMessages (5);
+                    std::lock_guard<std::mutex> g (out.lock);
+                    calibrationStart = out.L.size();
+                }
+
+                if (started && calibrationEnd == 0 && ! engine.isCalibrating())
+                {
+                    std::lock_guard<std::mutex> g (out.lock);
+                    calibrationEnd = out.L.size();
+                }
+
+                if (calibrationEnd > 0 && b * 128.0 / sampleRate >= calibrationEnd / sampleRate + 1.0)
+                    break;
+
+                voice.send (table);
+            }
+
+            engine.setRemoteStreams (nullptr);
+            engine.getFakeDevice()->onOutputBlock = nullptr;
+            const auto trip = engine.calibrationRoundTrip();
+
+            std::lock_guard<std::mutex> g (out.lock);
+            const auto before = toneAmplitude (out.L, 4800, 4800 + 9600, 440.0);
+            const auto during = toneAmplitude (out.L, calibrationStart + 4800, calibrationEnd - 4800, 440.0);
+            const auto after = toneAmplitude (out.L, calibrationEnd + 4800, std::min (out.L.size(), calibrationEnd + 4800 + 24000), 440.0);
+            logMessage ("remote voice before / during / after calibration: " + juce::String (before, 4) + " / "
+                        + juce::String (during, 4) + " / " + juce::String (after, 4) + "; round trip "
+                        + (trip.has_value() ? juce::String (*trip) : juce::String ("none")));
+            expect (calibrationEnd > calibrationStart + 48000, "calibration window");
+            expect (before > 0.4f, "the stream plays before");
+            expect (during < 0.005f, "no remote audio while calibrating");
+            expect (after > 0.4f, "the stream plays again after");
+            expect (trip.has_value() && std::abs (*trip - 464) <= 1, "round trip");
+        }
+
         beginTest ("received streams: two senders are mixed with independent participant gains");
         {
             StudioEngine engine;

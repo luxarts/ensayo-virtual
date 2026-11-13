@@ -1150,7 +1150,9 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
     inRender.store (true);
     blockHold = holdRequested.load();
 
-    if (calibrator.isRunning())
+    const bool calibratingBlock = calibrator.isRunning();
+
+    if (calibratingBlock)
     {
         // 5. Calibration owns the output: the click train only (transport requests wait).
         calibrator.process (voice, L, R, n);
@@ -1191,7 +1193,18 @@ void StudioEngine::audioDeviceIOCallbackWithContext (const float* const* inputs,
 
     // 8. Voice chat: the own inputs out, the other participants' streams in (output only, never recorded).
     sendChat (sentVoice, sentL, sentR, n);
-    mixRemote (L, R, n);
+    // While calibrating the output is the click train only: the others' streams still run (buffers drain, fades
+    // follow) but into scratch, so they cannot leak into the loopback and spoil the measured round trip.
+    if (calibratingBlock)
+    {
+        std::fill (scratchL.begin(), scratchL.begin() + n, 0.0f);
+        std::fill (scratchR.begin(), scratchR.begin() + n, 0.0f);
+        mixRemote (scratchL.data(), scratchR.data(), n);
+    }
+    else
+    {
+        mixRemote (L, R, n);
+    }
 
     // 9. Meters.
     const float voicePeak = peakOf (sentVoice, n);
