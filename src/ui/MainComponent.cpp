@@ -183,7 +183,11 @@ MainComponent::MainComponent()
     wireDaw();
 
     engine.setChannels (settings.micChannel, settings.instrumentChannel, settings.outputPair);
-    applyMonitorFromSettings();
+    applyOwnAudioFromSettings();
+
+    for (const auto& [user, level] : settings.participants)
+        session.setParticipantMix (user, { dbToGain (level.gainDb), level.muted });
+
     session.setMetronome (click, countIn);
 
     scanPlugins();
@@ -208,12 +212,15 @@ MainComponent::MainComponent()
 
     showLobby();
     startTimer (50);
+    meterTimer.onTick = [this] { pollMeters(); };
+    meterTimer.startTimerHz (30);
     setSize (1100, 760);
 }
 
 MainComponent::~MainComponent()
 {
     stopTimer();
+    meterTimer.stopTimer();
     pluginWindow = nullptr;
     importer.cancel();
     importer.onProgress = nullptr;
@@ -376,10 +383,11 @@ void MainComponent::applyLobbyToSettings()
     settings.role = LobbyView::roleFromId (lobby.roleBox.getSelectedId());
 }
 
-void MainComponent::applyMonitorFromSettings()
+void MainComponent::applyOwnAudioFromSettings()
 {
-    engine.setMonitor (settings.monitorVoiceMuted ? 0.0f : dbToGain (settings.monitorVoiceDb),
-                       settings.monitorInstrumentMuted ? 0.0f : dbToGain (settings.monitorInstrumentDb));
+    engine.setMonitor (dbToGain (settings.monitorVoiceDb), dbToGain (settings.monitorInstrumentDb));
+    engine.setSendGains (dbToGain (settings.sendVoiceDb), dbToGain (settings.sendInstrumentDb));
+    engine.setMicMuted (settings.micMuted);
 }
 
 void MainComponent::openAudioFromSettings()
@@ -918,13 +926,27 @@ void MainComponent::wireDaw()
             c->sendOp (op);
     };
 
+    // Play records when an own track is armed; Pausa ends a take, otherwise it pauses where the cursor is.
     daw.onPlay = [this]
     {
-        if (demoMode) { demoState.playing = true; daw.setState (demoState); return; }
-        if (! session.isRecording()) engine.play();
+        if (demoMode)
+        {
+            demoState.playing = true;
+            demoState.recording = demoState.armedTrack.isNotEmpty();
+            daw.setState (demoState);
+            return;
+        }
+
+        if (session.isRecording())
+            return;
+
+        if (armedTrack.isNotEmpty())
+            startTake();
+        else
+            engine.play();
     };
 
-    daw.onStop = [this]
+    daw.onPause = [this]
     {
         if (demoMode) { demoState.playing = false; demoState.recording = false; daw.setState (demoState); return; }
 
@@ -933,8 +955,6 @@ void MainComponent::wireDaw()
         else
             engine.stop();
     };
-
-    daw.onRecord = [this] { recordOrStop(); };
 
     daw.onHome = [this]
     {
@@ -965,11 +985,26 @@ void MainComponent::wireDaw()
     daw.onClick = [this] (bool on) { click = on; session.setMetronome (click, countIn); if (demoMode) demoState.click = on; };
     daw.onCountIn = [this] (bool on) { countIn = on; session.setMetronome (click, countIn); if (demoMode) demoState.countIn = on; };
 
-    daw.onListen = [this] (bool on)
+    daw.onMine = [this] (const OwnAudio& mine)
     {
-        listen = on;
+        if (demoMode) { demoState.mine = mine; return; }
 
-        if (demoMode) demoState.listen = on;   // the voice chat is always on in a session; the toggle goes away
+        settings.monitorVoiceDb = mine.voiceMonitorDb;
+        settings.monitorInstrumentDb = mine.instrumentMonitorDb;
+        settings.sendVoiceDb = mine.voiceSendDb;
+        settings.sendInstrumentDb = mine.instrumentSendDb;
+        settings.micMuted = mine.micMuted;
+        applyOwnAudioFromSettings();
+        markSettingsDirty();
+    };
+
+    daw.onParticipant = [this] (const Id& user, const ParticipantLevel& level)
+    {
+        if (demoMode) { demoState.participants[user] = level; return; }
+
+        settings.participants[user] = { level.gainDb, level.muted };
+        session.setParticipantMix (user, { dbToGain (level.gainDb), level.muted });
+        markSettingsDirty();
     };
 
     daw.onCopyLink = [this]
@@ -1005,28 +1040,8 @@ void MainComponent::addTrack (TrackKind kind)
     daw.onOp (Ops::addTrack (newId(), name, kind));
 }
 
-void MainComponent::recordOrStop()
+void MainComponent::startTake()
 {
-    if (demoMode)
-    {
-        demoState.recording = ! demoState.recording;
-        demoState.playing = demoState.recording;
-        daw.setState (demoState);
-        return;
-    }
-
-    if (session.isRecording())
-    {
-        stopTake();
-        return;
-    }
-
-    if (armedTrack.isEmpty())
-    {
-        setStatus (ES ("Arm\xC3\xA1 una pista propia (\xE2\x97\x8FR) para grabar"), true, false);
-        return;
-    }
-
     if (const auto result = session.startTake (armedTrack); result.failed())
         setStatus (result.getErrorMessage(), true, false);
     else
@@ -1143,7 +1158,6 @@ void MainComponent::leaveSession()
     armedTrack.clear();
     solo.clear();
     engine.setSolo ({});
-    listen = false;
     showLobby();
     setConnecting (false);
 
@@ -1268,7 +1282,11 @@ DawState MainComponent::buildState() const
     s.solo = solo;
     s.click = click;
     s.countIn = countIn;
-    s.listen = listen;
+    s.mine = { settings.monitorVoiceDb, settings.monitorInstrumentDb, settings.sendVoiceDb, settings.sendInstrumentDb, settings.micMuted };
+
+    for (const auto& [user, level] : settings.participants)
+        s.participants[user] = { level.gainDb, level.muted };
+
     return s;
 }
 
@@ -1309,6 +1327,14 @@ void MainComponent::refreshSessionView()
     if (! inSession)
         return;
 
+    // A deleted track disarms (whoever deleted it).
+    if (! demoMode && armedTrack.isNotEmpty())
+        if (const auto p = session.project(); p != nullptr && p->findTrack (armedTrack) == nullptr && ! session.isRecording())
+        {
+            armedTrack.clear();
+            session.setArmedTrack ({});
+        }
+
     daw.setState (buildState());
     updateSessionStatus();
 }
@@ -1333,7 +1359,9 @@ void MainComponent::showDemoSession()
     p->bpm = 92.0;
     p->beatsPerBar = 4;
     p->version = 128;
-    p->users = { { other, ES ("Mart\xC3\xADn") }, { me, settings.name.isNotEmpty() ? settings.name : juce::String ("Lucas") } };
+    const Id third = newId();
+    p->users = { { other, ES ("Mart\xC3\xADn") }, { me, settings.name.isNotEmpty() ? settings.name : juce::String ("Lucas") },
+                 { third, ES ("Sof\xC3\xAD" "a") } };
     p->takes = { { guitarTake, me, 2, 12, 560000, true }, { voiceTake, me, 1, 8, 360000, true },
                  { importedTake, me, 2, 40, 1900000, true }, { liveTake, other, 1, 3, 150000, false } };
     p->tracks.push_back ({ guitar, ES ("Guitarra r\xC3\xADtmica"), me, TrackKind::instrument, -3.0f, -0.2f, false,
@@ -1352,6 +1380,10 @@ void MainComponent::showDemoSession()
     s.link = SessionLink { "192.168.1.10", defaultPort, "DEMO42" }.toString();
     s.online[me] = true;
     s.online[other] = true;
+    s.online[third] = true;
+    s.participants[other] = { -4.5f, false };
+    s.participants[third] = { 0.0f, true };
+    s.mine = { -3.0f, 0.0f, 0.0f, -2.5f, false };
     s.takeAvailability[importedTake] = 0.64f;
     s.live.push_back ({ other, liveTake, bass, 5 * (int64_t) sampleRate, demoPeaks (400, 1.3f) });
     s.playhead = 5 * (int64_t) sampleRate;
@@ -1363,7 +1395,41 @@ void MainComponent::showDemoSession()
     demoLastMs = juce::Time::getMillisecondCounter();
 
     showSession();
+
+    // Meters: my armed guitar shows its input, the other user's bass clipped a moment ago (its light stays on).
+    demoMeterTick (true);
     setStatus (ES ("Sesi\xC3\xB3n de demostraci\xC3\xB3n"));
+}
+
+void MainComponent::demoMeterTick (bool withClip)
+{
+    const auto* p = demoProject.get();
+
+    if (p == nullptr || p->tracks.size() < 4)
+        return;
+
+    const float t = (float) (juce::Time::getMillisecondCounter() % 100000) * 0.001f;
+    const auto wobble = [t] (float base, float speed) { return base * (0.75f + 0.25f * std::abs (std::sin (t * speed))); };
+    std::vector<std::pair<Id, float>> peaks {
+        { p->tracks[1].id, wobble (0.22f, 3.1f) },
+        { p->tracks[2].id, withClip ? 1.08f : wobble (0.5f, 2.3f) },
+        { p->tracks[3].id, wobble (0.6f, 1.7f) } };
+    daw.setMeterLevels (peaks, wobble (0.42f, 4.2f));   // tracks[0]: my armed guitar's input
+}
+
+void MainComponent::pollMeters()
+{
+    if (! inSession)
+        return;
+
+    if (demoMode)
+    {
+        demoMeterTick (false);
+        return;
+    }
+
+    static_assert (DawView::clipLevel == StudioEngine::clipLevel);
+    daw.setMeterLevels (engine.takeTrackMeters(), engine.takeArmedInputPeak());
 }
 
 void MainComponent::demoTick()

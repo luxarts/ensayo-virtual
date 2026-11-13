@@ -91,7 +91,7 @@ private:
     void removePlugin();
     void togglePluginEditor();
     void updatePluginButtons();
-    void applyMonitorFromSettings();
+    void applyOwnAudioFromSettings();         // monitor, send gains and mic mute to the engine
     void chooseProjectToOpen();
     void createProject();
     void joinFromLinkField();
@@ -104,7 +104,7 @@ private:
     void abandonConnection (const juce::String& message);
     void showLobby();
     void showSession();
-    void recordOrStop();
+    void startTake();                         // on the armed track, with the count-in
     void stopTake();
     void addTrack (TrackKind);
     void chooseImportFile();
@@ -116,6 +116,8 @@ private:
 
     // Demo.
     void demoTick();
+    void demoMeterTick (bool withClip);
+    void pollMeters();                        // 30 Hz: engine meters to the DawView
 
     void markSettingsDirty();
     void saveSettingsNow();
@@ -152,13 +154,17 @@ private:
     // Local session state (not part of the project).
     Id armedTrack;
     std::set<Id> solo;
-    bool click = true, countIn = true, listen = false;
+    bool click = true, countIn = true;
     juce::String lastSyncNote;
 
     // Demo state.
     std::shared_ptr<Project> demoProject;
     DawState demoState;
     juce::uint32 demoLastMs = 0;
+
+    // The meters refresh at 30 Hz, apart from the 50 ms session refresh.
+    struct CallbackTimer : juce::Timer { std::function<void()> onTick; void timerCallback() override { if (onTick) onTick(); } };
+    CallbackTimer meterTimer;
 
     static bool testMode;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)

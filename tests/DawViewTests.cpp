@@ -129,18 +129,21 @@ public:
             view.setSize (1100, 760);
             view.setState (f.state (f.guest));
 
-            for (const char* name : { "daw.project", "daw.link", "daw.copy", "daw.users", "daw.listen", "daw.editor", "daw.leave",
-                                      "transport.home", "transport.play", "transport.stop", "transport.record", "transport.time",
+            for (const char* name : { "daw.project", "daw.link", "daw.copy", "daw.users", "daw.editor", "daw.leave",
+                                      "transport.home", "transport.play", "transport.time",
                                       "transport.bpm", "transport.meter", "transport.click", "transport.countin",
                                       "edit.split", "edit.delete", "daw.export", "timeline",
-                                      "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube" })
+                                      "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
+                                      "mine", "mine.voiceMonitor", "mine.instrumentMonitor", "mine.voiceSend", "mine.instrumentSend",
+                                      "mine.voiceMonitor.text", "mine.instrumentSend.text", "mine.micMute",
+                                      "people", "people.1.name", "people.1.gain", "people.1.gain.text", "people.1.mute" })
             {
                 auto* c = find (view, name);
                 expect (c != nullptr && shownWithin (view, c) && ! c->getBounds().isEmpty(), juce::String ("missing ") + name);
             }
 
             for (int n = 1; n <= 3; ++n)
-                for (const char* part : { "color", "name", "author", "kind", "mute", "solo", "volume", "pan" })
+                for (const char* part : { "color", "name", "author", "kind", "mute", "solo", "volume", "pan", "delete", "meter" })
                 {
                     const auto name = "track." + juce::String (n) + "." + part;
                     auto* c = find (view, name);
@@ -158,6 +161,12 @@ public:
             expect (! find (view, "track.3.pan")->isEnabled());
             expect (find (view, "track.1.mute")->isEnabled());
             expect (find (view, "track.1.volume")->isEnabled());
+
+            for (const char* gone : { "daw.listen", "transport.stop", "transport.record", "people.2.name" })
+                expect (find (view, gone) == nullptr, juce::String ("still there: ") + gone);
+
+            expectEquals (dynamic_cast<juce::Label*> (find (view, "people.1.name"))->getText(), juce::String ("Lucas"));
+            expectEquals (dynamic_cast<juce::Button*> (find (view, "transport.play"))->getButtonText(), ES ("\xE2\x96\xB6 Play"));
 
             // As host I can edit every track but arm only my own (spec 7): the guest's tracks show the lock.
             view.setState (f.state (f.host));
@@ -312,22 +321,267 @@ public:
                     expectEquals (view.sampleToX (view.xToSample (x)), x);
             }
 
-            Id armed; bool soloed = false; int plays = 0, stops = 0, records = 0;
+            Id armed; bool soloed = false;
             view.onArm = [&] (const Id& id) { armed = id; };
             view.onSolo = [&] (const Id&, bool on) { soloed = on; };
-            view.onPlay = [&] { ++plays; }; view.onStop = [&] { ++stops; }; view.onRecord = [&] { ++records; };
             click (find (view, "track.2.arm"));
             expect (armed == f.t2);
             click (find (view, "track.1.solo"));
             expect (soloed);
+        }
 
-            expect (view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey)));
+        beginTest ("Play/Pausa, Space, W and the arrows; the cursor keys do nothing during a take; R is gone");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            int plays = 0, pauses = 0, homes = 0;
+            std::vector<int64_t> seeks;
+            view.onPlay = [&] { ++plays; };
+            view.onPause = [&] { ++pauses; };
+            view.onHome = [&] { ++homes; };
+            view.onSeek = [&] (int64_t at) { seeks.push_back (at); };
+
+            auto s = f.state (f.guest);
+            s.playhead = 10 * 48000;
+            view.setState (s);
+            auto* play = dynamic_cast<juce::Button*> (find (view, "transport.play"));
+
+            click (play);
             expectEquals (plays, 1);
-            auto s = f.state (f.guest); s.playing = true; view.setState (s);
+            expect (view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey)));
+            expectEquals (plays, 2);
+
+            s.playing = true;
+            view.setState (s);
+            expectEquals (play->getButtonText(), ES ("\xE2\x9D\x9A\xE2\x9D\x9A Pausa"));
             view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey));
-            expectEquals (stops, 1);
-            view.keyPressed (juce::KeyPress ('r'));
-            expectEquals (records, 1);
+            click (play);
+            expectEquals (pauses, 2);
+            expectEquals (plays, 2);
+
+            expect (view.keyPressed (juce::KeyPress ('w')));
+            expect (view.keyPressed (juce::KeyPress ('W')));
+            expectEquals (homes, 2);
+
+            // Project at 120 bpm, 4/4 by default: a bar is 2 s.
+            const auto bar = (int64_t) std::llround (f.project->beatsPerBar * 60.0 / f.project->bpm * 48000.0);
+            view.keyPressed (juce::KeyPress (juce::KeyPress::rightKey));
+            view.keyPressed (juce::KeyPress (juce::KeyPress::leftKey));
+            view.keyPressed (juce::KeyPress (juce::KeyPress::rightKey, juce::ModifierKeys::shiftModifier, 0));
+            view.keyPressed (juce::KeyPress (juce::KeyPress::leftKey, juce::ModifierKeys::shiftModifier, 0));
+            expect (seeks == std::vector<int64_t> { 11 * 48000, 9 * 48000, 10 * 48000 + bar, 10 * 48000 - bar });
+
+            s.playhead = 20000;   // never before 0
+            view.setState (s);
+            view.keyPressed (juce::KeyPress (juce::KeyPress::leftKey));
+            expectEquals (seeks.back(), (int64_t) 0);
+
+            // R no longer records.
+            const auto before = plays + pauses;
+            expect (! view.keyPressed (juce::KeyPress ('r')));
+            expectEquals (plays + pauses, before);
+
+            // During a take (count-in included): Space and the button end it, W and the arrows do nothing.
+            s.playing = false;
+            s.recording = true;
+            view.setState (s);
+            expectEquals (play->getButtonText(), ES ("\xE2\x9D\x9A\xE2\x9D\x9A Pausa"));
+            seeks.clear();
+            homes = 0;
+            view.keyPressed (juce::KeyPress ('w'));
+            view.keyPressed (juce::KeyPress (juce::KeyPress::leftKey));
+            view.keyPressed (juce::KeyPress (juce::KeyPress::rightKey, juce::ModifierKeys::shiftModifier, 0));
+            expectEquals (homes, 0);
+            expect (seeks.empty());
+            view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey));
+            click (play);
+            expectEquals (pauses, 4);
+        }
+
+        beginTest ("the shortcuts leave a focused text field alone");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            view.setState (f.state (f.guest));
+            int homes = 0, plays = 0;
+            view.onHome = [&] { ++homes; };
+            view.onPlay = [&] { ++plays; };
+            view.addToDesktop (0);
+            view.setVisible (true);
+            auto* youtube = dynamic_cast<juce::TextEditor*> (find (view, "tracks.youtube"));
+            youtube->grabKeyboardFocus();
+            pumpMessages (100);
+
+            if (youtube->hasKeyboardFocus (false))
+            {
+                expect (! view.keyPressed (juce::KeyPress ('w')));
+                expect (! view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey)));
+                expectEquals (homes + plays, 0);
+            }
+            else
+            {
+                logMessage ("no keyboard focus without a foreground window: focus check skipped");
+            }
+
+            view.removeFromDesktop();
+        }
+
+        beginTest ("the delete button: author or host, confirmation, delete_track, disarm; not while recording on it");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            std::vector<juce::var> ops;
+            juce::String asked;
+            bool answer = true;
+            Id armed = f.t1;
+            view.onOp = [&] (const juce::var& op) { ops.push_back (op); };
+            view.onArm = [&] (const Id& id) { armed = id; };
+            view.confirm = [&] (const juce::String& question, std::function<void()> yes) { asked = question; if (answer) yes(); };
+
+            auto s = f.state (f.guest);
+            s.armedTrack = f.t1;
+            view.setState (s);
+            auto* del1 = find (view, "track.1.delete");
+            auto* del3 = find (view, "track.3.delete");
+            expect (del1->isEnabled());
+            expect (! del3->isEnabled(), "the guest cannot delete the host's track");
+            expect (dynamic_cast<juce::SettableTooltipClient*> (del3)->getTooltip().contains ("autor"));
+
+            answer = false;
+            click (del1);
+            expectEquals (asked, ES ("\xC2\xBF" "Borrar la pista \xC2\xABVoz gu\xC3\xAD" "a\xC2\xBB? Sus regiones desaparecen del proyecto."));
+            expect (ops.empty(), "no answer, no op");
+            expect (armed == f.t1);
+
+            answer = true;
+            click (del1);
+            expectEquals ((int) ops.size(), 1);
+            expectEquals (opName (ops[0]), juce::String ("delete_track"));
+            expectEquals (ops[0]["track"].toString(), f.t1);
+            expect (armed.isEmpty(), "deleting the armed track disarms it");
+
+            // Host: any track.
+            view.setState (f.state (f.host));
+            expect (find (view, "track.1.delete")->isEnabled());
+            expect (find (view, "track.3.delete")->isEnabled());
+
+            // Not while recording on that track (me or someone else); other tracks stay deletable.
+            s = f.state (f.guest);
+            s.armedTrack = f.t2;
+            s.recording = true;
+            view.setState (s);
+            expect (! find (view, "track.2.delete")->isEnabled());
+            expect (dynamic_cast<juce::SettableTooltipClient*> (find (view, "track.2.delete"))->getTooltip().contains ("graba"));
+            expect (find (view, "track.1.delete")->isEnabled());
+
+            s = f.state (f.host);
+            s.live.push_back ({ f.guest, newId(), f.t1, 0, {} });
+            view.setState (s);
+            expect (! find (view, "track.1.delete")->isEnabled());
+            expect (find (view, "track.3.delete")->isEnabled());
+
+            // Read-only: nothing.
+            s = f.state (f.host);
+            s.readOnly = true;
+            view.setState (s);
+            ops.clear();
+            expect (! find (view, "track.3.delete")->isEnabled());
+            expect (dynamic_cast<juce::SettableTooltipClient*> (find (view, "track.3.delete"))->getTooltip().contains ("lectura"));
+            click (find (view, "track.3.delete"));
+            expect (ops.empty());
+        }
+
+        beginTest ("meters: armed own input vs playback, 1.5 s hold, -inf, clip latched until clicked");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            auto s = f.state (f.guest);
+            s.armedTrack = f.t1;   // my voice track
+            view.setState (s);
+
+            expectEquals (view.getMeterText (f.t1), ES ("-\xE2\x88\x9E"));
+            view.setMeterLevels ({ { f.t1, 0.9f }, { f.t2, 0.5f }, { f.t3, 0.25f } }, 0.1f, 1000.0);
+            expectWithinAbsoluteError (view.getMeterHold (f.t1), 0.1f, 1e-6f);   // the armed input, not the playback
+            expectWithinAbsoluteError (view.getMeterHold (f.t2), 0.5f, 1e-6f);
+            expectEquals (view.getMeterText (f.t3), juce::String ("-12.0"));
+            expect (! view.isClipLatched (f.t2));
+
+            // Hold: a lower peak keeps the number for 1.5 s, then it follows.
+            view.setMeterLevels ({ { f.t2, 0.2f } }, 0.0f, 2400.0);
+            expectWithinAbsoluteError (view.getMeterHold (f.t2), 0.5f, 1e-6f);
+            view.setMeterLevels ({ { f.t2, 0.2f } }, 0.0f, 2600.0);
+            expectWithinAbsoluteError (view.getMeterHold (f.t2), 0.2f, 1e-6f);
+
+            // A clip on the playback of another track, and on my armed input.
+            view.setMeterLevels ({ { f.t3, 1.0f } }, 1.3f, 2700.0);
+            expect (view.isClipLatched (f.t3));
+            expect (view.isClipLatched (f.t1));
+            expect (! view.isClipLatched (f.t2));
+            view.setMeterLevels ({}, 0.0f, 9000.0);
+            expect (view.isClipLatched (f.t3), "the latch stays on");
+            expectEquals (view.getMeterText (f.t3), ES ("-\xE2\x88\x9E"));
+
+            auto* meter = find (view, "track.3.meter");
+            meter->mouseDown (mouse (*meter, { 5.0f, 5.0f }, { 5.0f, 5.0f }, false));
+            expect (! view.isClipLatched (f.t3), "a click clears it");
+            expect (view.isClipLatched (f.t1), "only that meter");
+
+            // When the armed track is not mine (the host arming is impossible, but the state may say so) it shows playback.
+            s = f.state (f.host);
+            s.armedTrack = f.t1;
+            view.setState (s);
+            view.setMeterLevels ({ { f.t1, 0.3f } }, 0.9f, 20000.0);
+            expectWithinAbsoluteError (view.getMeterHold (f.t1), 0.3f, 1e-6f);
+            render (view);
+        }
+
+        beginTest ("Mi audio and Participantes emit their levels; double click returns to 0 dB");
+        {
+            Fixture f;
+            DawView view;
+            view.setSize (1100, 760);
+            auto s = f.state (f.guest);
+            s.mine = { -6.0f, 3.0f, -1.5f, 0.0f, false };
+            s.participants[f.host] = { -9.0f, true };
+            view.setState (s);
+
+            auto slider = [&] (const char* n) { return dynamic_cast<juce::Slider*> (find (view, n)); };
+            expectWithinAbsoluteError (slider ("mine.voiceMonitor")->getValue(), -6.0, 1e-6);
+            expectWithinAbsoluteError (slider ("mine.instrumentMonitor")->getMaximum(), 6.0, 1e-6);
+            expectWithinAbsoluteError (slider ("mine.voiceMonitor")->getMinimum(), -60.0, 1e-6);
+            expectWithinAbsoluteError (slider ("people.1.gain")->getMaximum(), 12.0, 1e-6);
+            expectWithinAbsoluteError (slider ("people.1.gain")->getValue(), -9.0, 1e-6);
+            expect (dynamic_cast<juce::Button*> (find (view, "people.1.mute"))->getToggleState());
+            expectEquals (dynamic_cast<juce::Label*> (find (view, "mine.voiceMonitor.text"))->getText(), juce::String ("-6.0 dB"));
+            expect (slider ("mine.voiceSend")->isDoubleClickReturnEnabled() && slider ("mine.voiceSend")->getDoubleClickReturnValue() == 0.0);
+            expect (slider ("people.1.gain")->getDoubleClickReturnValue() == 0.0);
+
+            std::vector<OwnAudio> mine;
+            std::vector<std::pair<Id, ParticipantLevel>> people;
+            view.onMine = [&] (const OwnAudio& m) { mine.push_back (m); };
+            view.onParticipant = [&] (const Id& u, const ParticipantLevel& l) { people.push_back ({ u, l }); };
+
+            slider ("mine.instrumentSend")->setValue (-12.0, juce::sendNotificationSync);
+            expect (mine.size() == 1 && mine.back().instrumentSendDb == -12.0f && mine.back().voiceMonitorDb == -6.0f);
+            click (find (view, "mine.micMute"));
+            expect (mine.size() == 2 && mine.back().micMuted);
+            slider ("mine.voiceMonitor")->setValue (-60.0, juce::sendNotificationSync);
+            expectEquals (dynamic_cast<juce::Label*> (find (view, "mine.voiceMonitor.text"))->getText(), ES ("-\xE2\x88\x9E dB"));
+
+            slider ("people.1.gain")->setValue (4.0, juce::sendNotificationSync);
+            expect (people.size() == 1 && people.back().first == f.host && people.back().second.gainDb == 4.0f && people.back().second.muted);
+            click (find (view, "people.1.mute"));
+            expect (people.size() == 2 && ! people.back().second.muted);
+
+            // Only online users other than me; nobody online shows the empty text.
+            s.online[f.host] = false;
+            view.setState (s);
+            expect (find (view, "people.1.name") == nullptr);
+            render (view);
         }
 
         beginTest ("rename, tempo and pan edits emit the right ops and respect the host");
@@ -543,19 +797,14 @@ public:
             expect (lock->getTooltip().contains ("lectura"));
             expect (shownWithin (view, find (view, "track.1.lock")));
 
-            // Read-only blocks starting a take, but a take already running can always be stopped.
-            int records = 0;
-            view.onRecord = [&] { ++records; };
-            auto* record = find (view, "transport.record");
-            expect (! record->isEnabled());
-            view.keyPressed (juce::KeyPress ('r'));
-            expectEquals (records, 0);
-
+            // A take already running can always be stopped.
+            int pauses = 0;
+            view.onPause = [&] { ++pauses; };
             s.recording = true;
             view.setState (s);
-            expect (record->isEnabled(), "the record button must stay usable to stop the take");
-            view.keyPressed (juce::KeyPress ('r'));
-            expectEquals (records, 1);
+            expect (find (view, "transport.play")->isEnabled());
+            view.keyPressed (juce::KeyPress (juce::KeyPress::spaceKey));
+            expectEquals (pauses, 1);
         }
 
         beginTest ("renders empty, one-track and twelve-track projects");
@@ -614,8 +863,10 @@ public:
             live.peaks = Peaks().peaksFor ({});
             live.peaks.resize (400);
             s.live.push_back (live);
+            s.participants[f.guest] = { -4.5f, false };
             view.setState (s);
             view.selectRegion (f.r3);
+            view.setMeterLevels ({ { f.t2, 0.2f }, { f.t3, 1.05f } }, 0.4f);
 
             const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory)
                                   .getChildFile ("EnsayoVirtual").getChildFile ("tests").getChildFile ("dawview").getChildFile ("daw.png");

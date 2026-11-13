@@ -83,14 +83,17 @@ namespace
         "status.text", "status.retry" };
 
     const char* const sessionNames[] = {
-        "daw.project", "daw.link", "daw.copy", "daw.users", "daw.listen", "daw.editor", "daw.leave",
-        "transport.home", "transport.play", "transport.stop", "transport.record", "transport.time",
+        "daw.project", "daw.link", "daw.copy", "daw.users", "daw.editor", "daw.leave",
+        "transport.home", "transport.play", "transport.time",
         "transport.bpm", "transport.meter", "transport.click", "transport.countin",
         "edit.split", "edit.delete", "daw.export", "timeline",
         "tracks.addVoice", "tracks.addInstrument", "tracks.import", "tracks.youtube",
         "track.1.name", "track.2.name", "track.3.name", "track.4.name",
         "track.1.arm", "track.2.arm", "track.3.lock",
         "track.1.mute", "track.1.solo", "track.1.volume", "track.1.pan",
+        "track.1.delete", "track.1.meter", "track.4.delete", "track.4.meter",
+        "mine.voiceMonitor", "mine.instrumentMonitor", "mine.voiceSend", "mine.instrumentSend", "mine.micMute",
+        "people.1.name", "people.1.gain", "people.1.mute", "people.2.name",
         "status.text", "status.sync", "status.ping", "status.transfers", "status.device", "status.cpu", "status.retry" };
 }
 
@@ -223,11 +226,13 @@ public:
                 expect (main.getDaw().getState().project->tracks[1].kind == TrackKind::instrument);
                 expect (findByName (main, "track.2.arm") != nullptr);
 
-                // No device in test mode: Grabar explains instead of recording.
-                main.getDaw().onRecord();
-                expect (statusText (main).contains (ES ("Arm\xC3\xA1")), "status: " + statusText (main));
+                // Play without an armed track only plays; with my track armed it records (no device in test mode:
+                // it explains instead).
+                main.getDaw().onPlay();
+                expect (! main.getSession().isRecording());
+                main.getDaw().onPause();
                 main.getDaw().onArm (main.getDaw().getState().project->tracks[0].id);
-                main.getDaw().onRecord();
+                main.getDaw().onPlay();
                 expect (statusText (main).contains ("dispositivo"), "status: " + statusText (main));
                 expect (! main.getSession().isRecording());
 

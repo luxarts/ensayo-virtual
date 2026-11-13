@@ -8,7 +8,7 @@ namespace ensayo
 namespace
 {
     constexpr int topBarHeight = 44, transportHeight = 46, columnHeaderHeight = 22, rowHeight = 64;
-    constexpr int headerWidth = 330, scrollBarWidth = 10, footerHeight = 84, edgeZone = 6, regionInset = 6;
+    constexpr int headerWidth = 366, sideWidth = 236, meterWidth = 30, scrollBarWidth = 10, footerHeight = 84, edgeZone = 6, regionInset = 6;
     constexpr int64_t minRegionLength = 480;
 
     const juce::Colour backgroundColour (0xff1c2128), barColour (0xff171b20), transportColour (0xff20262d),
@@ -58,6 +58,70 @@ namespace
     }
 
     juce::String dbText (double db) { return juce::String (db, 1) + " dB"; }
+
+    // Personal faders: their minimum is silence.
+    juce::String faderText (double db) { return db <= (double) minFaderDb ? ES ("-\xE2\x88\x9E dB") : dbText (db); }
+
+    juce::String peakText (float peak)
+    {
+        const float db = peak > 0.0f ? juce::Decibels::gainToDecibels (peak, -200.0f) : -200.0f;
+        return db < -99.9f ? ES ("-\xE2\x88\x9E") : (db >= 0.05f ? "+" : "") + juce::String (db, 1);
+    }
+
+    constexpr double meterHoldMs = 1500.0;
+
+    struct MeterState
+    {
+        float level = 0.0f;       // bar, with a fall
+        float hold = 0.0f;        // number: highest peak in the last meterHoldMs
+        double holdUntilMs = 0.0;
+        bool clip = false;        // latched until the meter is clicked
+
+        void push (float peak, double nowMs, float clipLevel)
+        {
+            peak = std::isfinite (peak) ? juce::jmax (0.0f, peak) : 0.0f;
+            level = juce::jmax (peak, level * 0.8f);
+
+            if (level < 1.0e-5f)
+                level = 0.0f;
+
+            if (peak >= hold)
+            {
+                hold = peak;
+                holdUntilMs = nowMs + meterHoldMs;
+            }
+            else if (nowMs >= holdUntilMs)
+            {
+                hold = peak;
+            }
+
+            if (peak >= clipLevel)
+                clip = true;
+        }
+    };
+
+    void styleFader (juce::Slider& s, const juce::String& n, double lo, double hi)
+    {
+        s.setName (n);
+        s.setSliderStyle (juce::Slider::LinearHorizontal);
+        s.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        s.setRange (lo, hi, 0.1);
+        s.setDoubleClickReturnValue (true, 0.0);
+        s.setWantsKeyboardFocus (false);
+        s.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff11151a));
+        s.setColour (juce::Slider::trackColourId, juce::Colour (0xff3b82f6));
+        s.setColour (juce::Slider::thumbColourId, juce::Colour (0xffdde3ea));
+    }
+
+    void styleSmallLabel (juce::Label& l, const juce::String& n, juce::Colour colour)
+    {
+        l.setName (n);
+        l.setFont (juce::Font (juce::FontOptions (11.5f)));
+        l.setColour (juce::Label::textColourId, colour);
+        l.setInterceptsMouseClicks (false, false);
+        l.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2));
+        l.setMinimumHorizontalScale (0.8f);
+    }
 }
 
 //==============================================================================
@@ -107,6 +171,56 @@ struct DawView::Impl
     };
 
     //==========================================================================
+    struct TrackMeter : juce::Component, public juce::SettableTooltipClient
+    {
+        Impl& impl;
+        Id trackId;
+
+        TrackMeter (Impl& i, const juce::String& n) : impl (i)
+        {
+            setName (n);
+            setTooltip (ES ("Pico en dBFS. Clic: apaga el testigo de clip"));
+            setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        }
+
+        void mouseDown (const juce::MouseEvent&) override
+        {
+            if (auto it = impl.meters.find (trackId); it != impl.meters.end() && it->second.clip)
+            {
+                it->second.clip = false;
+                repaint();
+            }
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            const auto it = impl.meters.find (trackId);
+            const auto m = it != impl.meters.end() ? it->second : MeterState();
+            auto r = getLocalBounds();
+            g.setColour (juce::Colour (0xff101418));
+            g.fillRoundedRectangle (r.toFloat(), 2.0f);
+
+            auto text = r.removeFromBottom (14);
+            g.setColour (m.clip ? juce::Colour (0xffff6b5e) : juce::Colour (0xffc3ccd6));
+            g.setFont (plainFont (10.0f));
+            g.drawText (peakText (m.hold), text, juce::Justification::centred, false);
+
+            auto bar = r.reduced (9, 3);
+            const auto led = bar.removeFromTop (5);
+            g.setColour (m.clip ? juce::Colour (0xffff3b30) : juce::Colour (0xff3a2626));
+            g.fillRect (led);
+            bar.removeFromTop (2);
+
+            g.setColour (juce::Colour (0xff1d2329));
+            g.fillRect (bar);
+            const float db = juce::Decibels::gainToDecibels (m.level, -60.0f);
+            const float fraction = juce::jlimit (0.0f, 1.0f, (db + 60.0f) / 60.0f);
+            const int h = juce::roundToInt ((float) bar.getHeight() * fraction);
+            g.setColour (db > -6.0f ? juce::Colours::orange : juce::Colour (0xff4caf50));
+            g.fillRect (bar.removeFromBottom (h));
+        }
+    };
+
     struct TrackHeader : juce::Component, private juce::Timer
     {
         Impl& impl;
@@ -115,13 +229,20 @@ struct DawView::Impl
         double sentVolume = 0.0, sentPan = 0.0;   // what the project last said (or what we last emitted)
         Swatch swatch;
         juce::Label name, author, kind, lock, volumeText, panLabel;
-        juce::TextButton mute, solo, arm;
+        juce::TextButton mute, solo, arm, remove;
         juce::Slider volume, pan;
+        TrackMeter meter;
 
-        TrackHeader (Impl& i, int number) : impl (i)
+        TrackHeader (Impl& i, int number) : impl (i), meter (i, "track." + juce::String (number) + ".meter")
         {
             const auto prefix = "track." + juce::String (number);
             setName (prefix);
+            addAndMakeVisible (meter);
+
+            styleButton (remove, prefix + ".delete", ES ("\xC3\x97"));
+            remove.setColour (juce::TextButton::textColourOffId, juce::Colour (0xffe08a80));
+            remove.onClick = [this] { impl.askDeleteTrack (trackId); };
+            addAndMakeVisible (remove);
 
             swatch.setName (prefix + ".color");
             addAndMakeVisible (swatch);
@@ -289,7 +410,7 @@ struct DawView::Impl
             const bool editable = impl.canEdit (t);              // false while I am recording
             // Spec 7: only the author records on a track (the host may edit any track but not arm it); read-only
             // locks everything.
-            const bool mine = ! impl.state.readOnly && t.author == impl.state.me;
+            const bool own = ! impl.state.readOnly && t.author == impl.state.me;
             const auto colour = authorColour (p, t.author);
 
             swatch.colour = colour;
@@ -305,8 +426,8 @@ struct DawView::Impl
             mute.setToggleState (t.muted, juce::dontSendNotification);
             solo.setToggleState (impl.state.solo.count (t.id) > 0, juce::dontSendNotification);
             arm.setToggleState (impl.state.armedTrack == t.id, juce::dontSendNotification);
-            arm.setVisible (mine && t.kind != TrackKind::imported);
-            lock.setVisible (! mine);
+            arm.setVisible (own && t.kind != TrackKind::imported);
+            lock.setVisible (! own);
             lock.setTooltip (impl.state.readOnly ? ES ("S\xC3\xB3lo lectura: el host est\xC3\xA1 desconectado")
                                                  : ES ("S\xC3\xB3lo su autor puede grabar en esta pista"));
 
@@ -324,14 +445,25 @@ struct DawView::Impl
             pan.setColour (juce::Slider::trackColourId, colour.withAlpha (0.5f));
             pan.setColour (juce::Slider::thumbColourId, colour.brighter (0.3f));
             arm.setEnabled (! impl.state.readOnly);
+
+            remove.setEnabled (impl.canDeleteTrack (t));
+            remove.setTooltip (impl.deleteTooltip (t));
+
+            if (meter.trackId != t.id)
+            {
+                meter.trackId = t.id;
+                meter.repaint();
+            }
         }
 
         void resized() override
         {
             swatch.setBounds (0, 0, 5, getHeight());
-            name.setBounds (10, 6, 150, 22);
-            author.setBounds (162, 6, 80, 22);
-            kind.setBounds (242, 6, 84, 22);
+            name.setBounds (10, 6, 140, 22);
+            author.setBounds (152, 6, 76, 22);
+            kind.setBounds (228, 6, 68, 22);
+            remove.setBounds (300, 6, 26, 22);
+            meter.setBounds (getWidth() - meterWidth - 5, 3, meterWidth, getHeight() - 7);
 
             const int y = 36, h = 22;
             mute.setBounds (10, y, 24, h);
@@ -705,6 +837,250 @@ struct DawView::Impl
     };
 
     //==========================================================================
+    // A caption, its value and a horizontal dB slider, stacked (40 px).
+    struct Fader
+    {
+        juce::Label caption, value;
+        juce::Slider slider;
+
+        void setup (juce::Component& parent, const juce::String& name, const juce::String& text, double maxDb)
+        {
+            styleSmallLabel (caption, name + ".caption", juce::Colour (0xffc3ccd6));
+            caption.setText (text, juce::dontSendNotification);
+            styleSmallLabel (value, name + ".text", juce::Colour (0xffdde3ea));
+            value.setJustificationType (juce::Justification::centredRight);
+            styleFader (slider, name, (double) minFaderDb, maxDb);
+
+            for (auto* c : std::initializer_list<juce::Component*> { &caption, &value, &slider })
+                parent.addAndMakeVisible (*c);
+        }
+
+        void showValue() { value.setText (faderText (slider.getValue()), juce::dontSendNotification); }
+
+        void set (float db)
+        {
+            if (! slider.isMouseButtonDown())
+                slider.setValue (db, juce::dontSendNotification);
+
+            showValue();
+        }
+
+        void layout (juce::Rectangle<int> r)
+        {
+            auto top = r.removeFromTop (17);
+            value.setBounds (top.removeFromRight (64));
+            caption.setBounds (top);
+            slider.setBounds (r.removeFromTop (22));
+        }
+    };
+
+    static void paintPanel (juce::Graphics& g, juce::Component& c, const juce::String& title)
+    {
+        g.fillAll (transportColour);
+        g.setColour (lineColour);
+        g.fillRect (0, 0, 1, c.getHeight());
+        g.fillRect (0, c.getHeight() - 1, c.getWidth(), 1);
+        g.setColour (juce::Colour (0xffe8edf2));
+        g.setFont (boldFont (13.0f));
+        g.drawText (title, 12, 4, c.getWidth() - 20, 22, juce::Justification::centredLeft, false);
+    }
+
+    struct MinePanel : juce::Component
+    {
+        Impl& impl;
+        Fader voiceMonitor, instrumentMonitor, voiceSend, instrumentSend;
+        juce::ToggleButton micMute;
+
+        explicit MinePanel (Impl& i) : impl (i)
+        {
+            setName ("mine");
+            const auto maxDb = (double) maxOwnFaderDb;
+            voiceMonitor.setup (*this, "mine.voiceMonitor", ES ("Voz \xE2\x80\x93 monitor"), maxDb);
+            instrumentMonitor.setup (*this, "mine.instrumentMonitor", ES ("Instrumento \xE2\x80\x93 monitor"), maxDb);
+            voiceSend.setup (*this, "mine.voiceSend", ES ("Voz \xE2\x80\x93 env\xC3\xADo"), maxDb);
+            instrumentSend.setup (*this, "mine.instrumentSend", ES ("Instrumento \xE2\x80\x93 env\xC3\xADo"), maxDb);
+            voiceMonitor.slider.setTooltip (ES ("Cu\xC3\xA1nto te escuch\xC3\xA1s (s\xC3\xB3lo con una pista de voz propia armada)"));
+            instrumentMonitor.slider.setTooltip (ES ("Cu\xC3\xA1nto te escuch\xC3\xA1s (s\xC3\xB3lo con una pista de instrumento propia armada)"));
+            voiceSend.slider.setTooltip (ES ("Ganancia del micr\xC3\xB3" "fono antes de grabar y del chat de voz: queda en la toma"));
+            instrumentSend.slider.setTooltip (ES ("Ganancia del instrumento antes de grabar: queda en la toma"));
+
+            for (auto* f : { &voiceMonitor, &instrumentMonitor, &voiceSend, &instrumentSend })
+                f->slider.onValueChange = [this, f] { f->showValue(); emit(); };
+
+            micMute.setName ("mine.micMute");
+            micMute.setButtonText (ES ("Silenciar mi micr\xC3\xB3" "fono"));
+            micMute.setWantsKeyboardFocus (false);
+            micMute.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffdde3ea));
+            micMute.setTooltip (ES ("Deja de enviar tu voz al chat; no cambia la grabaci\xC3\xB3n ni el monitor"));
+            micMute.onClick = [this] { emit(); };
+            addAndMakeVisible (micMute);
+        }
+
+        OwnAudio current() const
+        {
+            return { (float) voiceMonitor.slider.getValue(), (float) instrumentMonitor.slider.getValue(),
+                     (float) voiceSend.slider.getValue(), (float) instrumentSend.slider.getValue(), micMute.getToggleState() };
+        }
+
+        void emit()
+        {
+            impl.state.mine = current();
+
+            if (impl.v.onMine)
+                impl.v.onMine (impl.state.mine);
+        }
+
+        void update (const OwnAudio& m)
+        {
+            voiceMonitor.set (m.voiceMonitorDb);
+            instrumentMonitor.set (m.instrumentMonitorDb);
+            voiceSend.set (m.voiceSendDb);
+            instrumentSend.set (m.instrumentSendDb);
+            micMute.setToggleState (m.micMuted, juce::dontSendNotification);
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (12, 0).withTrimmedTop (28);
+
+            for (auto* f : { &voiceMonitor, &instrumentMonitor, &voiceSend, &instrumentSend })
+            {
+                f->layout (r.removeFromTop (40));
+                r.removeFromTop (2);
+            }
+
+            micMute.setBounds (r.removeFromTop (26));
+        }
+
+        void paint (juce::Graphics& g) override { paintPanel (g, *this, "Mi audio"); }
+    };
+
+    struct PersonRow : juce::Component
+    {
+        Impl& impl;
+        Id user;
+        Fader fader;
+        juce::TextButton mute;
+
+        PersonRow (Impl& i, int number) : impl (i)
+        {
+            const auto prefix = "people." + juce::String (number);
+            setName (prefix);
+            fader.setup (*this, prefix + ".gain", {}, (double) maxFaderDb);
+            fader.caption.setName (prefix + ".name");
+            fader.caption.setFont (boldFont (12.0f));
+            fader.caption.setColour (juce::Label::textColourId, juce::Colour (0xffe8edf2));
+            fader.slider.onValueChange = [this] { fader.showValue(); emit(); };
+
+            styleButton (mute, prefix + ".mute", "M");
+            mute.setClickingTogglesState (true);
+            mute.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffb03a2e));
+            mute.setTooltip (ES ("Silenciar a este integrante (s\xC3\xB3lo para vos)"));
+            mute.onClick = [this] { emit(); };
+            addAndMakeVisible (mute);
+        }
+
+        void emit()
+        {
+            const ParticipantLevel level { (float) fader.slider.getValue(), mute.getToggleState() };
+            impl.state.participants[user] = level;
+
+            if (impl.v.onParticipant)
+                impl.v.onParticipant (user, level);
+        }
+
+        void update (const Project& p, const Id& id)
+        {
+            user = id;
+            const auto it = impl.state.participants.find (id);
+            const auto level = it != impl.state.participants.end() ? it->second : ParticipantLevel();
+            fader.caption.setText (p.userName (id), juce::dontSendNotification);
+            fader.set (level.gainDb);
+            mute.setToggleState (level.muted, juce::dontSendNotification);
+            fader.slider.setColour (juce::Slider::trackColourId, authorColour (p, id));
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds();
+            mute.setBounds (r.removeFromRight (26).withTrimmedTop (17).withHeight (22));
+            r.removeFromRight (4);
+            fader.layout (r);
+        }
+    };
+
+    struct PeoplePanel : juce::Component
+    {
+        Impl& impl;
+        std::vector<Id> ids;
+        std::vector<std::unique_ptr<PersonRow>> rows;
+        juce::Viewport viewport;
+        juce::Component list;
+
+        explicit PeoplePanel (Impl& i) : impl (i)
+        {
+            setName ("people");
+            viewport.setViewedComponent (&list, false);
+            viewport.setScrollBarsShown (true, false);
+            viewport.setScrollBarThickness (8);
+            addAndMakeVisible (viewport);
+        }
+
+        // One row per online user other than me, in the project's user order.
+        void update()
+        {
+            std::vector<Id> next;
+            const auto* p = impl.currentProject();
+
+            if (p != nullptr)
+                for (const auto& u : p->users)
+                    if (const auto o = impl.state.online.find (u.id); u.id != impl.state.me && o != impl.state.online.end() && o->second)
+                        next.push_back (u.id);
+
+            if (next != ids)
+            {
+                ids = next;
+                rows.clear();
+
+                for (size_t i = 0; i < ids.size(); ++i)
+                {
+                    rows.push_back (std::make_unique<PersonRow> (impl, (int) i + 1));
+                    list.addAndMakeVisible (*rows.back());
+                }
+
+                resized();
+                repaint();
+            }
+
+            if (p != nullptr)
+                for (size_t i = 0; i < rows.size(); ++i)
+                    rows[i]->update (*p, ids[i]);
+        }
+
+        void resized() override
+        {
+            viewport.setBounds (getLocalBounds().withTrimmedTop (28).withTrimmedLeft (12).withTrimmedRight (4).withTrimmedBottom (4));
+            const int rowH = 46, w = juce::jmax (1, viewport.getWidth() - 10);
+            list.setSize (w, juce::jmax (1, (int) rows.size() * rowH));
+
+            for (size_t i = 0; i < rows.size(); ++i)
+                rows[i]->setBounds (0, (int) i * rowH, w, rowH - 4);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            paintPanel (g, *this, "Participantes");
+
+            if (rows.empty())
+            {
+                g.setColour (mutedText);
+                g.setFont (plainFont (12.0f));
+                g.drawText (ES ("Nadie m\xC3\xA1s en la sesi\xC3\xB3n"), 12, 30, getWidth() - 20, 20, juce::Justification::centredLeft, false);
+            }
+        }
+    };
+
+    //==========================================================================
     DawView& v;
     DawState state;
     const PeaksProvider* peaksProvider = nullptr;
@@ -719,8 +1095,8 @@ struct DawView::Impl
     std::vector<std::unique_ptr<TrackHeader>> headers;
     juce::Label projectName, link, bpmLabel, meterLabel, timeLabel;
     UsersStrip users;
-    juce::ToggleButton listen, click, countIn;
-    juce::TextButton copy, editor, leave, home, play, stop, record, split, del, exportMix;
+    juce::ToggleButton click, countIn;
+    juce::TextButton copy, editor, leave, home, play, split, del, exportMix;
     juce::TextButton addVoice, addInstrument, importFile;
     juce::TextEditor youtube;
     juce::Rectangle<int> bpmCaption, meterCaption;
@@ -728,8 +1104,11 @@ struct DawView::Impl
     Body body;
     Timeline timeline;
     Ruler ruler;
+    std::map<Id, MeterState> meters;   // by track id: survives header rebuilds; the clip latches are local
+    MinePanel mine;
+    PeoplePanel people;
 
-    explicit Impl (DawView& owner) : v (owner), timeline (*this), ruler (*this)
+    explicit Impl (DawView& owner) : v (owner), timeline (*this), ruler (*this), mine (*this), people (*this)
     {
         auto label = [this] (juce::Label& l, const juce::String& n, float size, bool bold)
         {
@@ -754,14 +1133,12 @@ struct DawView::Impl
         users.setName ("daw.users");
         users.setInterceptsMouseClicks (false, false);
 
-        for (auto* t : { &listen, &click, &countIn })
+        for (auto* t : { &click, &countIn })
         {
             t->setWantsKeyboardFocus (false);
             t->setColour (juce::ToggleButton::textColourId, juce::Colour (0xffdde3ea));
         }
 
-        listen.setName ("daw.listen");
-        listen.setButtonText ("Escuchar en vivo");
         click.setName ("transport.click");
         click.setButtonText ("Click");
         countIn.setName ("transport.countin");
@@ -769,11 +1146,9 @@ struct DawView::Impl
 
         styleButton (home, "transport.home", "|<");
         styleButton (play, "transport.play", ES ("\xE2\x96\xB6") + " Play");
-        styleButton (stop, "transport.stop", ES ("\xE2\x96\xA0") + " Stop");
-        styleButton (record, "transport.record", ES ("\xE2\x97\x8F") + " Grabar");
-        record.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffb03a2e));
-        record.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-        play.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2f7a4f));
+        play.setClickingTogglesState (false);
+        play.setTooltip (ES ("Barra espaciadora. Con una pista propia armada, Play graba. W: al inicio; "
+                             "\xE2\x86\x90/\xE2\x86\x92: 1 s; May\xC3\xBA" "s+\xE2\x86\x90/\xE2\x86\x92: un comp\xC3\xA1s"));
         styleButton (split, "edit.split", ES ("\xE2\x9C\x82") + " Cortar (S)");
         styleButton (del, "edit.delete", "Borrar (Supr)");
         styleButton (exportMix, "daw.export", ES ("Exportar mezcla\xE2\x80\xA6"));
@@ -817,7 +1192,7 @@ struct DawView::Impl
             }
         };
 
-        for (auto* c : std::initializer_list<juce::Component*> { &users, &listen, &copy, &editor, &leave, &home, &play, &stop, &record,
+        for (auto* c : std::initializer_list<juce::Component*> { &users, &copy, &editor, &leave, &home, &play, &mine, &people,
                                                                  &timeLabel, &bpmLabel, &meterLabel, &click, &countIn, &split, &del,
                                                                  &exportMix, &ruler, &viewport })
             v.addAndMakeVisible (*c);
@@ -833,16 +1208,13 @@ struct DawView::Impl
         editor.onClick = [this] { if (v.onToggleEditor) v.onToggleEditor(); };
         leave.onClick = [this] { if (v.onLeave) v.onLeave(); };
         home.onClick = [this] { if (v.onHome) v.onHome(); };
-        play.onClick = [this] { if (v.onPlay) v.onPlay(); };
-        stop.onClick = [this] { if (v.onStop) v.onStop(); };
-        record.onClick = [this] { if (v.onRecord) v.onRecord(); };
+        play.onClick = [this] { togglePlay(); };
         split.onClick = [this] { v.splitSelectedAtPlayhead(); };
         del.onClick = [this] { v.deleteSelected(); };
         exportMix.onClick = [this] { if (v.onExport) v.onExport(); };
         addVoice.onClick = [this] { if (v.onAddVoice) v.onAddVoice(); };
         addInstrument.onClick = [this] { if (v.onAddInstrument) v.onAddInstrument(); };
         importFile.onClick = [this] { if (v.onImportFile) v.onImportFile(); };
-        listen.onClick = [this] { if (v.onListen) v.onListen (listen.getToggleState()); };
         click.onClick = [this] { if (v.onClick) v.onClick (click.getToggleState()); };
         countIn.onClick = [this] { if (v.onCountIn) v.onCountIn (countIn.getToggleState()); };
 
@@ -860,6 +1232,79 @@ struct DawView::Impl
 
     // While I am recording, editing is locked as well.
     bool canEdit (const Track& t) const { return ! state.recording && canEditBase (t); }
+
+    bool isRecordingOn (const Track& t) const
+    {
+        if (state.recording && state.armedTrack == t.id)
+            return true;
+
+        return std::any_of (state.live.begin(), state.live.end(), [&] (const LiveRegion& l) { return l.track == t.id; });
+    }
+
+    // The author or the host, never in read-only mode nor while someone records on the track.
+    bool canDeleteTrack (const Track& t) const { return canEditBase (t) && ! isRecordingOn (t); }
+
+    juce::String deleteTooltip (const Track& t) const
+    {
+        if (state.readOnly)
+            return ES ("S\xC3\xB3lo lectura: el host est\xC3\xA1 desconectado");
+
+        if (currentProject() == nullptr || ! canEditTrack (*currentProject(), t, state.me))
+            return ES ("S\xC3\xB3lo el autor de la pista o el host pueden borrarla");
+
+        if (isRecordingOn (t))
+            return ES ("No se puede borrar una pista mientras se graba en ella");
+
+        return "Borrar la pista";
+    }
+
+    void askDeleteTrack (const Id& id)
+    {
+        const auto* t = currentProject() != nullptr ? currentProject()->findTrack (id) : nullptr;
+
+        if (t == nullptr || ! canDeleteTrack (*t) || ! v.confirm)
+            return;
+
+        const auto question = ES ("\xC2\xBF" "Borrar la pista \xC2\xAB") + t->name + ES ("\xC2\xBB? Sus regiones desaparecen del proyecto.");
+        v.confirm (question, [safe = juce::Component::SafePointer<DawView> (&v), id]
+        {
+            if (safe != nullptr)
+                safe->impl->deleteTrack (id);
+        });
+    }
+
+    void deleteTrack (const Id& id)
+    {
+        const auto* t = currentProject() != nullptr ? currentProject()->findTrack (id) : nullptr;
+
+        if (t == nullptr || ! canDeleteTrack (*t))   // the state may have changed while the question was open
+            return;
+
+        if (state.armedTrack == id && v.onArm)
+            v.onArm ({});
+
+        if (v.onOp)
+            v.onOp (Ops::deleteTrack (id));
+    }
+
+    void togglePlay()
+    {
+        if (state.playing || state.recording)  { if (v.onPause) v.onPause(); }
+        else                                   { if (v.onPlay) v.onPlay(); }
+    }
+
+    // Seeks by delta samples from the playhead, never before 0; not while recording.
+    void nudge (int64_t delta)
+    {
+        if (! state.recording && v.onSeek)
+            v.onSeek (juce::jmax ((int64_t) 0, state.playhead + delta));
+    }
+
+    // My armed track records an input: its meter shows that input instead of the playback.
+    bool showsArmedInput (const Track& t) const
+    {
+        return t.id == state.armedTrack && t.author == state.me && t.kind != TrackKind::imported;
+    }
 
     int timelineWidth() const { return juce::jmax (1, timeline.getWidth()); }
 
@@ -1180,12 +1625,12 @@ struct DawView::Impl
         meterLabel.setEnabled (hostEditable);
         refreshTempoLabels();
 
-        listen.setToggleState (state.listen, juce::dontSendNotification);
         click.setToggleState (state.click, juce::dontSendNotification);
         countIn.setToggleState (state.countIn, juce::dontSendNotification);
-        play.setToggleState (state.playing, juce::dontSendNotification);
-        record.setButtonText (ES ("\xE2\x97\x8F") + (state.recording ? " Grabando" : " Grabar"));
-        record.setEnabled (! state.readOnly || state.recording);   // a running take can always be stopped
+        const bool running = state.playing || state.recording;
+        play.setToggleState (running, juce::dontSendNotification);
+        play.setButtonText (running ? ES ("\xE2\x9D\x9A\xE2\x9D\x9A Pausa") : ES ("\xE2\x96\xB6 Play"));
+        play.setColour (juce::TextButton::buttonOnColourId, state.recording ? juce::Colour (0xffb03a2e) : juce::Colour (0xff2f7a4f));
         for (auto* b : { &addVoice, &addInstrument, &importFile })
             b->setEnabled (! state.readOnly);
         youtube.setEnabled (! state.readOnly);
@@ -1216,6 +1661,8 @@ struct DawView::Impl
             }
 
         users.repaint();
+        mine.update (state.mine);
+        people.update();
 
         // Headers follow the track list.
         std::vector<Id> ids;
@@ -1291,6 +1738,17 @@ struct DawView::Impl
 //==============================================================================
 DawView::DawView() : impl (std::make_unique<Impl> (*this))
 {
+    confirm = [this] (const juce::String& question, std::function<void()> confirmed)
+    {
+        auto options = juce::MessageBoxOptions::makeOptionsOkCancel (juce::MessageBoxIconType::WarningIcon, "Borrar pista",
+                                                                     question, "Borrar", "Cancelar", this);
+        juce::AlertWindow::showAsync (options, [confirmed = std::move (confirmed)] (int result)
+        {
+            if (result == 1 && confirmed)
+                confirmed();
+        });
+    };
+
     setWantsKeyboardFocus (true);
     setVisible (true);
     setSize (1100, 760);
@@ -1320,7 +1778,7 @@ void DawView::resized()
     auto top = area.removeFromTop (topBarHeight).reduced (10, 7);
     auto bar = area.removeFromTop (transportHeight).reduced (10, 8);
 
-    // Top bar: project, link, copy | who is online | listen, editor, leave
+    // Top bar: project, link, copy | who is online | editor, leave
     impl->projectName.setBounds (top.removeFromLeft (130));
     top.removeFromLeft (6);
     impl->link.setBounds (top.removeFromLeft (215));
@@ -1331,17 +1789,13 @@ void DawView::resized()
     top.removeFromRight (6);
     impl->editor.setBounds (top.removeFromRight (96));
     top.removeFromRight (6);
-    impl->listen.setBounds (top.removeFromRight (140));
-    top.removeFromRight (6);
     impl->users.setBounds (top);
 
     // Transport
     const int gap = 5;
     auto take = [&] (int w, juce::Component& c) { c.setBounds (bar.removeFromLeft (w)); bar.removeFromLeft (gap); };
     take (34, impl->home);
-    take (66, impl->play);
-    take (62, impl->stop);
-    take (88, impl->record);
+    take (92, impl->play);
     take (150, impl->timeLabel);
     impl->bpmCaption = bar.removeFromLeft (30);
     take (44, impl->bpmLabel);
@@ -1354,6 +1808,11 @@ void DawView::resized()
     impl->del.setBounds (bar.removeFromRight (104));
     bar.removeFromRight (gap);
     impl->split.setBounds (bar.removeFromRight (92));
+
+    // Right column: "Mi audio" over "Participantes"
+    auto side = area.removeFromRight (sideWidth);
+    impl->mine.setBounds (side.removeFromTop (238));
+    impl->people.setBounds (side);
 
     // Track area
     auto header = area.removeFromTop (columnHeaderHeight);
@@ -1439,6 +1898,47 @@ bool DawView::deleteSelected()
     return true;
 }
 
+void DawView::setMeterLevels (const std::vector<std::pair<Id, float>>& trackPeaks, float armedInputPeak, double nowMs)
+{
+    if (nowMs < 0.0)
+        nowMs = juce::Time::getMillisecondCounterHiRes();
+
+    const auto* p = impl->currentProject();
+
+    if (p == nullptr)
+        return;
+
+    std::map<Id, float> peaks (trackPeaks.begin(), trackPeaks.end());
+    std::map<Id, MeterState> next;
+
+    for (const auto& t : p->tracks)
+    {
+        auto state = impl->meters.count (t.id) > 0 ? impl->meters[t.id] : MeterState();
+        const auto it = peaks.find (t.id);
+        state.push (impl->showsArmedInput (t) ? armedInputPeak : (it != peaks.end() ? it->second : 0.0f), nowMs, clipLevel);
+        next[t.id] = state;
+    }
+
+    impl->meters = std::move (next);   // deleted tracks drop out
+
+    for (auto& h : impl->headers)
+        h->meter.repaint();
+}
+
+bool DawView::isClipLatched (const Id& track) const
+{
+    const auto it = impl->meters.find (track);
+    return it != impl->meters.end() && it->second.clip;
+}
+
+float DawView::getMeterHold (const Id& track) const
+{
+    const auto it = impl->meters.find (track);
+    return it != impl->meters.end() ? it->second.hold : 0.0f;
+}
+
+juce::String DawView::getMeterText (const Id& track) const { return peakText (getMeterHold (track)); }
+
 void DawView::dragRegion (const Id& region, int dx) { impl->emitEdited (region, Impl::DragMode::move, dx); }
 
 void DawView::dragEdge (const Id& region, bool left, int dx)
@@ -1456,16 +1956,30 @@ bool DawView::keyPressed (const juce::KeyPress& key)
     const auto code = key.getKeyCode();
     const auto letter = juce::CharacterFunctions::toLowerCase ((juce::juce_wchar) code);
 
+    // A text field (YouTube URL, a name or the tempo being edited) keeps its keys.
+    if (dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr)
+        return false;
+
     if (code == juce::KeyPress::spaceKey)
     {
-        if (impl->state.playing)  { if (onStop) onStop(); }
-        else                      { if (onPlay) onPlay(); }
+        impl->togglePlay();
         return true;
     }
 
+    // Cursor moves: never during a take (the record point is fixed).
+    if (code == juce::KeyPress::leftKey || code == juce::KeyPress::rightKey)
+    {
+        const int64_t step = mods.isShiftDown() ? impl->barSamples() : (int64_t) sampleRate;
+        impl->nudge (code == juce::KeyPress::leftKey ? -step : step);
+        return true;
+    }
+
+    if (mods.isShiftDown())
+        return false;
+
+    if (letter == 'w')                      { if (! impl->state.recording && onHome) onHome(); return true; }
     if (code == juce::KeyPress::deleteKey)  { deleteSelected(); return true; }
     if (letter == 's')                      { splitSelectedAtPlayhead(); return true; }
-    if (letter == 'r')                      { if (onRecord && (! impl->state.readOnly || impl->state.recording)) onRecord(); return true; }
 
     return false;
 }
