@@ -132,21 +132,25 @@ Una operación inválida o sin permiso se rechaza con un motivo y no cambia la v
 Se mantiene el canal de control actual (TCP, un objeto JSON por línea, campo `"t"`). `protocol: 2` en el
 saludo; un cliente con otra versión se rechaza con "versión incompatible".
 
-**Control** (cliente → host): `hello {protocol, userId, name, session}` (session `NEW` = crear sobre el
-proyecto que el host tiene abierto, sólo desde 127.0.0.1), `op {seq, op...}`, `rec_start {take, track,
-channels, start}`, `rec_peaks {take, from, peaks:[[min,max]...]}`, `rec_stop {take}`, `listen {enabled}`,
-`ping`. (host → cliente): `welcome {clientId, project, isHost, udpPort}`, `applied {version, by, op}`,
-`rejected {seq, reason}`, `presence {users:[{id,name,online,recordingTrack?}]}`, `rec_start/rec_peaks/rec_stop`
-reenviados, `take_progress {take, segments}`, `pong`, `error {message}`.
+**Control** (cliente → host): `hello {protocol, session, user, name}` (el id del host sólo se acepta desde
+127.0.0.1), `op {seq, op}`, `rec_start {take, track, start}`, `rec_peaks {take, from, peaks:[[min,max]...]}`,
+`rec_stop {take}`, `take_complete {take}`, `listen {enabled}`, `ping {ms}`. (host → cliente):
+`welcome {clientId, token, udpPort, isHost, project}`, `applied {version, by, op}`, `rejected {seq, reason}`,
+`presence {users:[{id, name, online, recording?:{take, track, start}}]}`, `rec_start/rec_peaks/rec_stop`
+reenviados, `pong {ms}`, `error {message}` (y se cierra la conexión).
 
-**Datos** (segunda conexión TCP, mismo puerto, primera línea `data_hello {clientId, token}` con el token
-recibido en `welcome`):
+**Datos** (segunda conexión TCP, mismo puerto, primera línea `data_hello {clientId, token, have}` con el
+token recibido en `welcome` y `have = {take: segmentos que ya tiene, ...}`):
 
 - Subida: línea `segment {take, index, samples, channels, bytes, sha1}` + `bytes` de FLAC. El host verifica
-  SHA-1, guarda `takes/<take>/<index>.flac`, responde `segment_ok {take, index}` y lo reenvía a los demás.
-- Descarga: al conectarse, el host le envía al cliente todos los segmentos que no tenga (el cliente manda
-  `have {take: segmentsCount, ...}`) y después, en vivo, cada segmento nuevo que reciba de cualquiera.
-- `take_complete {take, samples, segments}` cuando el autor terminó (`rec_stop` + último segmento).
+  autor, orden (`index` = segmentos que ya tiene; todos los segmentos menos el último miden exactamente 1 s,
+  así que después de uno corto no se acepta otro), SHA-1 y audio; guarda `takes/<take>/<index>.flac`, responde
+  `segment_ok {take, index}` y lo reenvía a los demás. Si no, `segment_bad {take, index, expected, reason}`.
+- Descarga: al conectarse, el host le envía al cliente los segmentos que no tenga según `have` y después, en
+  vivo, cada segmento nuevo que reciba de cualquiera. Si un segmento guardado no se puede leer, el host corta la
+  conexión de datos (el cliente reconecta y vuelve a pedir desde lo que tiene).
+- `take_complete {take}` (en la conexión de control) cuando el autor terminó de subir todos los segmentos; el
+  host aplica `update_take` con `complete: true` y los `samples`/`segments` que ya tiene.
 
 **Escucha en vivo (UDP)**: el formato de paquete actual (20 bytes de cabecera, Opus custom a 128 muestras;
 campo `voice` = mono, `instrument` = estéreo según la pista). El host reenvía cada paquete del que graba a
