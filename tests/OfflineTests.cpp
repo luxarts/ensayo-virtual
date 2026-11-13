@@ -124,6 +124,30 @@ public:
             expect (tail > 0.4f);
         }
 
+        beginTest ("resampling keeps absolute alignment (impulse lands at round(pos * 48000 / rate))");
+        {
+            for (const double rate : { 44100.0, 96000.0 })
+            {
+                const int pos = 20000;
+                juce::AudioBuffer<float> src (1, 40000);
+                src.clear();
+                src.setSample (0, pos, 0.9f);
+                const auto f = testDir().getChildFile ("impulse" + juce::String ((int) rate) + ".wav");
+                expect (writeWav (f, src, rate, 24));
+                juce::AudioBuffer<float> out;
+                expect (loadAndResample (f, out).wasOk());
+                int peakAt = 0;
+                float peak = 0.0f;
+
+                for (int i = 0; i < out.getNumSamples(); ++i)
+                    if (std::abs (out.getSample (0, i)) > peak) { peak = std::abs (out.getSample (0, i)); peakAt = i; }
+
+                const int expected = (int) std::llround (pos * 48000.0 / rate);
+                logMessage ("impulse " + juce::String ((int) rate) + " Hz: peak at " + juce::String (peakAt) + ", expected " + juce::String (expected));
+                expect (std::abs (peakAt - expected) <= 1);
+            }
+        }
+
         beginTest ("48 kHz mono is not resampled");
         {
             juce::AudioBuffer<float> src (1, 5000);
@@ -210,14 +234,82 @@ public:
             expect (er != nullptr && er->lengthInSamples == 0);
         }
 
-        beginTest ("cancelling at 50 percent deletes the file and fails");
+        beginTest ("stored samples are exactly the dithered 24-bit values (DC +0.75)");
+        {
+            class DcSource : public SampleSource
+            {
+            public:
+                int channels (const Id&) const noexcept override { return 1; }
+                void read (const Id&, int, int64_t, int n, float* dest) const noexcept override { for (int i = 0; i < n; ++i) dest[i] = 0.75f; }
+            } dc;
+
+            auto p = std::make_shared<Project>();
+            Track t; t.id = newId();
+            Region r; r.id = newId(); r.take = "d"; r.length = 9000;
+            t.regions.push_back (r);
+            p->tracks.push_back (t);
+            const int n = 9000;
+
+            Renderer renderer;
+            renderer.prepare (4096);
+            renderer.setProject (p);
+            renderer.snapRamps();
+            std::vector<float> L ((size_t) n), R ((size_t) n);
+
+            for (int pos = 0; pos < n; pos += 4096)
+            {
+                const int b = std::min (4096, n - pos);
+                renderer.render (dc, pos, b, L.data() + pos, R.data() + pos);
+            }
+
+            const auto f = testDir().getChildFile ("dc.wav");
+            expect (exportMix (p, dc, f).wasOk());
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (f.createInputStream().release(), true));
+            expect (rd != nullptr);
+
+            if (rd != nullptr)
+            {
+                juce::AudioBuffer<int> raw (2, n);
+                int* dest[2] = { raw.getWritePointer (0), raw.getWritePointer (1) };
+                expect (rd->read (dest, 2, 0, n, false));
+                juce::Random random (1);
+                const float lsb = 1.0f / 8388608.0f;
+                int mismatches = 0;
+                const auto expectedInt = [&] (float x)
+                {
+                    const float r1 = random.nextFloat(), r2 = random.nextFloat();
+                    const float y = x + (r1 - r2) * lsb;
+                    return std::clamp ((int) std::floor (y / lsb + 0.5f), -8388608, 8388607);
+                };
+
+                for (int i = 0; i < n; ++i)
+                {
+                    const int el = expectedInt (L[(size_t) i]), er = expectedInt (R[(size_t) i]);
+                    if ((raw.getSample (0, i) >> 8) != el || (raw.getSample (1, i) >> 8) != er)
+                        ++mismatches;
+                }
+
+                expectEquals (mismatches, 0);
+            }
+        }
+
+        beginTest ("cancelling at 50 percent keeps an existing target and leaves no partial file");
         {
             const auto project = makeTestProject (100000);
             SineSource source;
             const auto f = testDir().getChildFile ("cancel.wav");
+            const auto fresh = testDir().getChildFile ("cancel-fresh.wav");
+            expect (f.replaceWithText ("previous export"));
             const auto r = exportMix (project, source, f, [] (float p) { return p < 0.5f; });
             expect (r.failed());
-            expect (! f.existsAsFile());
+            expect (f.loadFileAsString() == "previous export");
+            expect (exportMix (project, source, fresh, [] (float p) { return p < 0.5f; }).failed());
+            expect (! fresh.existsAsFile());
+            expectEquals (testDir().findChildFiles (juce::File::findFiles, false, "*.tmp").size(), 0);
+            // A successful export replaces the old file.
+            expect (exportMix (project, source, f).wasOk());
+            expect (f.getSize() > 1000);
         }
 
         testDir().deleteRecursively();

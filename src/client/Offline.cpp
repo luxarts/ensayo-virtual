@@ -4,6 +4,8 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <new>
 
 namespace ensayo
 {
@@ -24,14 +26,14 @@ std::unique_ptr<juce::AudioFormatReader> openReader (const juce::File& file)
 }
 
 // Offline sinc resampling of the whole buffer. The interpolator delays its output by its algorithmic latency
-// (100 input samples), which is skipped, and it is fed trailing zeros so the tail is flushed, not cut.
+// (getBaseLatency() input samples), which is skipped, and it is fed trailing zeros so the tail is flushed, not cut.
 juce::AudioBuffer<float> resample (const juce::AudioBuffer<float>& in, double sourceRate)
 {
     const int channels = in.getNumChannels();
     const int inLength = in.getNumSamples();
     const double ratio = sourceRate / targetRate;
     const int outLength = (int) std::llround ((double) inLength * targetRate / sourceRate);
-    const int skip = (int) std::llround (100.0 / ratio);
+    const int skip = (int) std::llround ((double) juce::WindowedSincInterpolator::getBaseLatency() / ratio);
     const int padded = inLength + 512 + (int) std::ceil (ratio * 2.0);
 
     juce::AudioBuffer<float> out (channels, outLength);
@@ -69,17 +71,38 @@ juce::Result loadAndResample (const juce::File& file, juce::AudioBuffer<float>& 
     if ((double) reader->lengthInSamples / reader->sampleRate > maxSeconds)
         return juce::Result::fail ("The file is longer than 4 hours");
 
+    // Leaves room for the interpolator's padding and keeps every sample count inside an int.
+    if (reader->lengthInSamples > (int64_t) (std::numeric_limits<int>::max() - 4096))
+        return juce::Result::fail ("The file has too many samples to import");
+
     const int channels = std::min (2, (int) reader->numChannels);
     const int length = (int) reader->lengthInSamples;
-    juce::AudioBuffer<float> decoded (channels, length);
+    const double sourceRate = reader->sampleRate;
 
-    if (! reader->read (&decoded, 0, length, 0, true, channels > 1))
-        return juce::Result::fail ("The file could not be decoded");
+    try
+    {
+        juce::AudioBuffer<float> decoded (channels, length);
 
-    if (std::abs (reader->sampleRate - targetRate) < 0.5)
-        out = std::move (decoded);
-    else
-        out = resample (decoded, reader->sampleRate);
+        if (! reader->read (&decoded, 0, length, 0, true, channels > 1))
+            return juce::Result::fail ("The file could not be decoded");
+
+        reader.reset();   // the decoder may hold its own copy of the whole file
+
+        if (std::abs (sourceRate - targetRate) < 0.5)
+        {
+            out = std::move (decoded);
+        }
+        else
+        {
+            auto resampled = resample (decoded, sourceRate);
+            decoded.setSize (0, 0);
+            out = std::move (resampled);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        return juce::Result::fail ("Not enough memory to import this file");
+    }
 
     return juce::Result::ok();
 }
@@ -110,8 +133,10 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
     if (project == nullptr)
         return juce::Result::fail ("No project");
 
-    wav.deleteFile();
-    std::unique_ptr<juce::OutputStream> stream (wav.createOutputStream());
+    // Written next to the target and moved over it only when complete, so a failed or cancelled export
+    // never touches an existing file.
+    const auto temp = wav.getParentDirectory().getNonexistentChildFile (wav.getFileNameWithoutExtension() + ".partial", ".tmp", false);
+    std::unique_ptr<juce::OutputStream> stream (temp.createOutputStream());
 
     if (stream == nullptr)
         return juce::Result::fail ("Cannot write " + wav.getFullPathName());
@@ -134,15 +159,17 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
     juce::Random random (1);
 
     // TPDF: the difference of two uniform variables in [0, 1) is triangular over ±1 LSB. The dithered value is
-    // rounded to the 24-bit grid here, so the float handed to the writer is exactly representable and the
-    // writer's own float-to-int conversion does not add a second, undithered rounding.
-    const auto quantise = [&random] (float x)
+    // rounded to the 24-bit grid here and handed to the writer as integers (left-aligned in an int32, the writer
+    // keeps the top 24 bits), so the stored value is exactly the dithered one.
+    const auto quantise = [&random] (float x) -> int
     {
         const float r1 = random.nextFloat(), r2 = random.nextFloat();
         const float y = x + (r1 - r2) * lsb24;
-        const float q = std::floor (y / lsb24 + 0.5f) * lsb24;
-        return std::clamp (q, -1.0f, 1.0f - lsb24);
+        const int k = (int) std::floor (y / lsb24 + 0.5f);
+        return std::clamp (k, -8388608, 8388607) * 256;
     };
+
+    std::vector<int> intLeft (exportBlock), intRight (exportBlock);
 
     bool cancelled = false;
 
@@ -159,26 +186,33 @@ juce::Result exportMix (std::shared_ptr<const Project> project, const SampleSour
 
         for (int i = 0; i < n; ++i)
         {
-            left[(size_t) i] = quantise (left[(size_t) i]);
-            right[(size_t) i] = quantise (right[(size_t) i]);
+            intLeft[(size_t) i] = quantise (left[(size_t) i]);
+            intRight[(size_t) i] = quantise (right[(size_t) i]);
         }
 
-        const float* channels[2] = { left.data(), right.data() };
+        const int* channels[2] = { intLeft.data(), intRight.data() };
 
-        if (! writer->writeFromFloatArrays (channels, 2, n))
+        if (! writer->write (channels, n))
         {
             writer.reset();
-            wav.deleteFile();
+            temp.deleteFile();
             return juce::Result::fail ("Writing " + wav.getFileName() + " failed (disk full?)");
         }
     }
 
-    writer.reset();   // finalises the header
+    const bool finalised = cancelled || writer->flush();   // writes the header
+    writer.reset();
 
     if (cancelled)
     {
-        wav.deleteFile();
+        temp.deleteFile();
         return juce::Result::fail ("Export cancelled");
+    }
+
+    if (! finalised || ! temp.replaceFileIn (wav))
+    {
+        temp.deleteFile();
+        return juce::Result::fail ("Could not finish writing " + wav.getFileName());
     }
 
     if (progress)

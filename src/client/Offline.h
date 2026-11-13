@@ -4,7 +4,8 @@
 namespace ensayo
 {
 // Decodes wav/flac/ogg/mp3 (JUCE) and m4a/mp4/aac (Media Foundation), keeps 1 or 2 channels (more → first two),
-// resamples to 48 kHz with juce::WindowedSincInterpolator when needed. Fails on > 4 h.
+// resamples to 48 kHz with juce::WindowedSincInterpolator when needed (no anti-alias filter when downsampling, so
+// content above 24 kHz in a 96/192 kHz source can alias). Fails on > 4 h.
 juce::Result loadAndResample (const juce::File&, juce::AudioBuffer<float>& out);
 // Cuts audio into segmentSamples-long FLAC segments (last one shorter).
 std::vector<juce::MemoryBlock> makeSegments (const juce::AudioBuffer<float>& audio);
