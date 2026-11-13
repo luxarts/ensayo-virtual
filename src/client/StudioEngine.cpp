@@ -427,15 +427,6 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
     inPreview.store (true);
     auto* buffer = previewBuffer.load();
 
-    if (buffer != lastPreviewBuffer)
-    {
-        lastPreviewBuffer = buffer;
-        previewFill = 0;
-        monoState = {};
-        stereoState = {};
-        previewKind = 0;
-    }
-
     // Half-cosine over one frame: the first frame after silence fades in, the last concealed frame fades out.
     const auto ramp = [] (float* dl, float* dr, bool in) noexcept
     {
@@ -447,6 +438,43 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
             dr[i] *= g;
         }
     };
+
+    if (buffer != lastPreviewBuffer)
+    {
+        // Listening turned off (or switched) while a stream sounds: after the samples already decoded, one more frame
+        // is concealed by our own decoder (the old buffer is never touched again) and faded out, so the cut never steps.
+        const auto& state = previewKind == 1 ? monoState : stereoState;
+        const bool sounding = lastPreviewBuffer != nullptr && previewKind != 0 && state.primed;
+        lastPreviewBuffer = buffer;
+
+        if (sounding && previewFill + previewFrame <= (int) previewL.size())
+        {
+            float* dl = previewL.data() + previewFill;
+            float* dr = previewR.data() + previewFill;
+
+            if (previewKind == 1)
+            {
+                previewMono.decode (nullptr, 0, dl);
+                std::copy (dl, dl + previewFrame, dr);
+            }
+            else
+            {
+                previewStereo.decode (nullptr, 0, previewInterleaved.data());
+                deinterleave (previewInterleaved.data(), dl, dr, previewFrame);
+            }
+
+            ramp (dl, dr, false);
+            previewFill += previewFrame;
+        }
+        else
+        {
+            previewFill = 0;
+        }
+
+        monoState = {};
+        stereoState = {};
+        previewKind = 0;
+    }
 
     // One 128-sample frame: a real payload (48 B mono, 96 B stereo), else concealment, else silence.
     const auto decodeFrame = [&] (JitterBuffer& jb, float* dl, float* dr) noexcept
@@ -516,7 +544,7 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
         std::fill (dr, dr + previewFrame, 0.0f);
     };
 
-    if (buffer != nullptr && previewFill + n <= (int) previewL.size())   // always true: sized block + 128
+    if (buffer != nullptr && previewFill + n <= (int) previewL.size())   // always true: sized block + 2 frames
     {
         // Whole 128-sample frames are decoded until the block can be served; the remainder (< 128) waits.
         while (previewFill < n)
@@ -529,6 +557,15 @@ void StudioEngine::addPreview (float* L, float* R, int n) noexcept
         previewFill -= n;
         std::copy (previewL.begin() + n, previewL.begin() + n + previewFill, previewL.begin());
         std::copy (previewR.begin() + n, previewR.begin() + n + previewFill, previewR.begin());
+    }
+    else if (buffer == nullptr && previewFill > 0)
+    {
+        // The faded tail of a stream that was switched off.
+        const int m = std::min (n, previewFill);
+        addStereo (L, R, previewL.data(), previewR.data(), 1.0f, m);
+        previewFill -= m;
+        std::copy (previewL.begin() + m, previewL.begin() + m + previewFill, previewL.begin());
+        std::copy (previewR.begin() + m, previewR.begin() + m + previewFill, previewR.begin());
     }
 
     inPreview.store (false);
@@ -599,8 +636,8 @@ void StudioEngine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     for (auto* v : { &silence, &mixL, &mixR, &scratchL, &scratchR })
         v->assign ((size_t) blockSize, 0.0f);
 
-    previewL.assign ((size_t) (blockSize + previewFrame), 0.0f);
-    previewR.assign ((size_t) (blockSize + previewFrame), 0.0f);
+    previewL.assign ((size_t) (blockSize + 2 * previewFrame), 0.0f);
+    previewR.assign ((size_t) (blockSize + 2 * previewFrame), 0.0f);
     previewInterleaved.assign ((size_t) previewFrame * 2, 0.0f);
     previewPacket.assign (maxPacketBytes, 0);
     previewFill = 0;

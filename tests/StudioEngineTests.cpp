@@ -420,7 +420,8 @@ public:
     // device's pace and checks what reaches the output: the level of the source (within 15 %) and no step above
     // 1.5 x the source's own largest step, including the stream's start, an optional lost packet mid-stream and the
     // end of the stream (concealment, then a faded cut).
-    void previewReceive (bool dropOne)
+    // cutMidStream: listening is turned off (setPreviewBuffer (nullptr)) while packets still arrive.
+    void previewReceive (bool dropOne, bool cutMidStream = false)
     {
         StudioEngine engine;
         engine.setMonitor (0.0f, 0.0f);
@@ -437,7 +438,7 @@ public:
         OpusEncoder encoder (mode, 2);
         std::vector<float> pcm (256);
         std::vector<uint8_t> coded (128);
-        constexpr int blocks = 300, prefill = 8, dropped = 150;
+        constexpr int blocks = 300, prefill = 8, dropped = 150, cutAt = 200;
 
         const auto push = [&] (int b)
         {
@@ -461,6 +462,12 @@ public:
             while (juce::Time::getMillisecondCounterHiRes() < startMs + (b - prefill) * blockMs)
                 juce::Thread::sleep (1);
 
+            if (cutMidStream && b == cutAt)
+            {
+                engine.setPreviewBuffer (nullptr);   // the sine is playing right now: it must fade, not step
+                break;
+            }
+
             push (b);
         }
 
@@ -477,7 +484,7 @@ public:
         const auto bound = 1.5f * maxStepOf (pure);
         std::lock_guard<std::mutex> g (out.lock);
         const auto peak = peakOfVector (out.L), step = maxStepOf (out.L);
-        logMessage (juce::String (dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
+        logMessage (juce::String (cutMidStream ? "cut mid-stream" : dropOne ? "one packet lost" : "no packet lost") + ": underruns while streaming "
                     + juce::String ((int) stats.underruns) + ", output peak " + juce::String (peak, 4) + ", max step "
                     + juce::String (step, 6) + " (bound " + juce::String (bound, 6) + ")");
 
@@ -842,6 +849,9 @@ public:
 
         beginTest ("live preview: a lost packet is concealed without a click");
         previewReceive (true);
+
+        beginTest ("live preview: turning listening off mid-stream fades out without a click");
+        previewReceive (false, true);
     }
 };
 

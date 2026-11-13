@@ -71,7 +71,9 @@ public:
     int64_t getRecordOffset() const noexcept;
     Recorder& getRecorder() noexcept;
 
-    void setPreviewBuffer (JitterBuffer*) noexcept;    // live listening; nullptr = off
+    // Live listening; nullptr = off. A stream that is sounding fades out over one frame (its own concealment) instead
+    // of stopping dead; the old buffer is not touched once this returns.
+    void setPreviewBuffer (JitterBuffer*) noexcept;
     // Encodes the recorder's live audio into 128-sample Opus frames and passes datagrams here. Invoked on the
     // Recorder's writer thread; set it before startRecording() and never reassign it while a take is running.
     std::function<void (const uint8_t* packet, size_t len)> onPreviewPacket;
