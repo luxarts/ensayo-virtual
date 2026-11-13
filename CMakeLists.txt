@@ -65,6 +65,8 @@ set(ENSAYO_CORE_SOURCES
     src/client/LatencyCalibrator.cpp
     # T6
     src/client/Offline.cpp
+    # T8
+    src/client/StudioEngine.cpp
 )
 set(ENSAYO_SERVER_SOURCES
     # T5
@@ -129,6 +131,8 @@ set(ENSAYO_TEST_SOURCES
     tests/LatencyCalibratorTests.cpp
     # T6
     tests/OfflineTests.cpp
+    # T8
+    tests/StudioEngineTests.cpp
 )
 
 set(ENSAYO_MODULES

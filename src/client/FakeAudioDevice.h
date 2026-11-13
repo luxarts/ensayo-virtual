@@ -6,7 +6,10 @@
 #include <vector>
 namespace ensayo
 {
-enum class TestSignal { silence, sine440, click };   // click: +1.0 impulse every 250 ms on both inputs
+// click: +1.0 impulse every 250 ms on both inputs. loopback: input = output delayed by the latencies below
+// (input channel 0 = output L, channel 1 = output R; the first samples are 0).
+enum class TestSignal { silence, sine440, click, loopback };
+struct FakeLatency { int input = 0, output = 0; };              // reported AND applied in loopback mode
 struct ClickEvent { int64_t sampleIndex; double qpcMs; };   // qpcMs = juce::Time::getMillisecondCounterHiRes()
 
 // A std::function that may be (re)assigned from any thread while the device thread invokes it.
@@ -59,7 +62,7 @@ private:
 class FakeAudioDevice : public juce::AudioIODevice
 {
 public:
-    FakeAudioDevice (int blockSize, TestSignal);
+    FakeAudioDevice (int blockSize, TestSignal, FakeLatency = {});
     ~FakeAudioDevice() override;
 
     // Called on the device thread after every callback with the output block; used by the probe.
@@ -68,7 +71,9 @@ public:
 
     static constexpr int clickPeriodSamples = sampleRate / 4;   // 250 ms
 
-    // juce::AudioIODevice overrides: names "Fake In/Out L/R", sample rates {48000}, buffer sizes {64,128,256}, latencies 0.
+    // juce::AudioIODevice overrides: names "Fake In/Out L/R", sample rates {48000}, buffer sizes {64,128,256,512,1024},
+    // latencies = the FakeLatency values. Loopback needs input + output latency >= the block size (a real round trip
+    // always spans at least one block); open() fails otherwise.
     juce::StringArray getOutputChannelNames() override;
     juce::StringArray getInputChannelNames() override;
     juce::Array<double> getAvailableSampleRates() override;
@@ -98,12 +103,14 @@ private:
 
     const int requestedBlockSize;
     const TestSignal signal;
+    const FakeLatency latency;
     int blockSize;
     juce::BigInteger activeInputs, activeOutputs;
     std::atomic<bool> opened { false }, playing { false };
     juce::String lastError;
 
     std::vector<float> inL, inR, outL, outR;
+    std::vector<float> pastL, pastR;   // loopback: ring of past output, indexed by sampleIndex % size
     int64_t sampleIndex = 0;        // device thread
     double sinePhase = 0.0;         // device thread
 
@@ -116,7 +123,7 @@ private:
 class FakeAudioDeviceType : public juce::AudioIODeviceType   // typeName "Fake"; one device "Fake Audio"
 {
 public:
-    FakeAudioDeviceType (int blockSize, TestSignal);
+    FakeAudioDeviceType (int blockSize, TestSignal, FakeLatency = {});
 
     static const char* deviceName() noexcept { return "Fake Audio"; }
     static const char* typeName() noexcept { return "Fake"; }
@@ -131,6 +138,7 @@ public:
 private:
     const int blockSize;
     const TestSignal signal;
+    const FakeLatency latency;
 };
 
 // Detects clicks (sample > 0.5 after 20 ms of quiet) in a stream and reports arrival time.
