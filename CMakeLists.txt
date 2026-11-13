@@ -41,6 +41,7 @@ set(ENSAYO_CORE_SOURCES
     src/core/Protocol.cpp
     src/core/MixMath.cpp
     # T3
+    src/core/Render.cpp
     src/core/OpusCodec.cpp
     src/core/JitterBuffer.cpp
     # T4
@@ -85,6 +86,7 @@ set(ENSAYO_TEST_SOURCES
     tests/ProtocolTests.cpp
     tests/MixMathTests.cpp
     # T3-tests
+    tests/RenderTests.cpp
     tests/OpusCodecTests.cpp
     tests/JitterBufferTests.cpp
     tests/SpscQueueTests.cpp
