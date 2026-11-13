@@ -133,3 +133,68 @@ No apareció ningún bug de alineación, sincronización, permisos, reanudación
   (pendientes tras reinicio, `--resume`).
 - **Automatización de la ventana real** (crear pista, grabar, cortar, mover): cubierta por las
   unitarias `Ui` y `DawView` sobre los componentes reales; el script sólo captura la ventana `--demo`.
+
+---
+
+## Adenda: chat de voz, transporte y vúmetros (2026-11-13, tarea 4)
+
+Misma máquina y misma rama, sobre el plan `docs/plans/2026-11-13-chat-de-voz-y-transporte.md`. Esta vez las
+unitarias corrieron en **Release** (`build\EnsayoTests_artefacts\Release\EnsayoTests.exe`), y después, no a la
+vez, `run-all.ps1`.
+
+### Unitarias
+
+**`TOTAL: 271 results, 0 failures`**, exit 0. Lo nuevo o cambiado en esta tarea:
+
+- `StudioEngine / received streams: start, end and concealment are faded` y `... a lost packet is concealed
+  without a click`: el contador de recepción (`chatReceivedFrames`) cuenta sólo cuadros reales: 300 de 300
+  enviados, y 299 de 299 con un paquete perdido (el cuadro ocultado y los 18 de ocultamiento del final no
+  cuentan).
+- `HeadlessClient / runHeadless sends and receives the voice chat and prints chat_rx per received stream at exit`
+  (puerto 22234): otro integrante en el mismo proceso (motor con seno en el micrófono, unido con
+  `SessionController`) y `runHeadless --fake-audio sine --duration 3`. El headless imprimió
+  `chat_rx <clientId de Rita> voice 1126` y Rita recibió 1130 cuadros de voz del headless (3 s ≈ 1125).
+- `DawView / the delete button ...`: durante mi propia toma no se puede borrar ninguna pista (tooltip "No se
+  pueden borrar pistas mientras grabás"), igual que el resto de la edición; también para el host.
+- `Ui / a guest joins a link; a lost connection is read-only (Play with an armed track only plays) ...`: en
+  "Sólo lectura" con una pista propia armada, Play reproduce: no intenta grabar ni muestra un error.
+- `UiTests` usaba el puerto 22246; pasó a 22233 para que 22240–22246 quede sólo para la integración.
+
+### Integración
+
+| Script | Puerto | Resultado | Tiempo | Medidas |
+|---|---|---|---|---|
+| screenshots | – | PASS | 4.2 s | controles OK; ventana `--demo` capturada |
+| record-sync | 22240 | PASS | 42.6 s | A tenía k = 1..6 de la toma de B antes de su `take_complete`; hashes iguales; offset 464; **23 clicks, error máximo 0** |
+| edit-sync | 22241 | PASS | 30.8 s | 6 ediciones aplicadas, 1 rechazada; A, B y C con el mismo hash |
+| reconnect | 22242 | PASS | 5.5 s | 3 segmentos; `--resume` completa 144000 muestras |
+| reopen | 22243 | PASS | 3.5 s | misma sesión y host; mismo hash; C baja la toma |
+| import-export | 22244 | PASS | 6.5 s | WAV 144000 muestras, clicks ±0; YouTube 19.1 s, 915052 muestras |
+| **voice-chat** | 22246 | PASS | 12.7 s | 6 s de solapamiento, 2250 cuadros esperados (mínimo 1800): **A recibió 2258 de B, B recibió 2253 de A** (100 %) |
+| asio-calibration | 22245 | PASS | 16 s | calibración 38; 15 clicks, error máximo 0 (límite 48) |
+
+- **voice-chat** (nuevo): A hostea con `--host`, B se une; los dos con `--fake-audio sine`, sin grabar. Cada uno
+  imprime al salir `chat_rx <clientId> voice|instrument <cuadros>` (cuadros Opus de 128 muestras decodificados,
+  sin contar los ocultados). Se exige exactamente un stream de voz en cada lado, ninguno de instrumento, y al
+  menos el 80 % de 375 × 6. El conteo pasa apenas de 2250 porque B manda desde que se conecta (antes de su
+  `welcome`) hasta que cierra, un poco más que sus 6 s.
+- **record-sync con el chat siempre activo**: B graba en loopback su propia salida, y en esa salida también
+  suena el chat de A. A queda en `--fake-audio silence` (el valor por defecto), así que su chat es silencio y
+  la toma de B sigue con error 0. No hizo falta silenciar el chat de B. Ningún otro script usaba la escucha en
+  vivo ni la semántica vieja de Stop/Grabar (graban por `--record`, que usa `startTake`/`stopTake`).
+
+### Capturas revisadas
+
+- `session.png` y `demo-window.png`: transporte con **|<** y **▶ Play** (sin Stop ni Grabar ni Escuchar en
+  vivo); cada pista con **×** (deshabilitada en el Bajo de Martín, que no es mía) y vúmetro con número en dB
+  (el del Bajo, en +0.7, con el testigo de clip rojo); panel **Mi audio** con los cuatro faders y "Silenciar
+  mi micrófono"; panel **Participantes** con Martín (-4.5 dB) y Sofía (silenciada, **M** rojo). Sin
+  solapamientos.
+- `lobby.png`: sin cambios.
+
+### Cambios en el producto de esta tarea
+
+1. `StudioEngine::chatReceivedFrames()`: cuadros reales recibidos por stream (`clientId`, tipo), atómicos que el
+   callback sólo incrementa; `--headless` los imprime como `chat_rx` al salir.
+2. Play en "Sólo lectura" con una pista armada reproduce en vez de intentar grabar.
+3. Durante mi propia toma se bloquea borrar cualquier pista.
