@@ -2,24 +2,26 @@
 
 namespace ensayo
 {
-bool RemoteStreamTable::Slot::pop (uint32_t expectedGeneration, uint8_t* out, int& len) noexcept
+bool RemoteStreamTable::Slot::pop (uint64_t expectedState, uint8_t* out, int& len) noexcept
 {
     len = 0;
 
-    if (generation.load (std::memory_order_acquire) != expectedGeneration
-        || key.load (std::memory_order_acquire) == freeKey)
-        return false;
+    // Dekker with the producer's claim: raise `reading`, then look at `state` (both seq_cst). A claim either sees
+    // `reading` up and leaves this slot alone, or happened before and this load sees its new state.
+    reading.store (true);
+    const auto current = state.load();
 
-    const bool popped = buffer.pop (out, len);
-
-    // A block pushed for a newer claim is published after its generation bump, so seeing that block implies seeing
-    // the new generation here.
-    if (generation.load (std::memory_order_acquire) != expectedGeneration
-        || key.load (std::memory_order_acquire) == freeKey)
+    if (current != expectedState || keyOf (current) == freeKey)
     {
-        len = 0;
+        reading.store (false);
         return false;
     }
+
+    const bool popped = buffer.pop (out, len);
+    reading.store (false);
+
+    if (! popped)
+        len = 0;
 
     return popped;
 }
@@ -31,11 +33,12 @@ int RemoteStreamTable::push (uint32_t clientId, StreamKind kind, uint16_t seq, c
         return -1;
 
     const auto wanted = keyFor (clientId, kind);
-    int index = -1, firstFree = -1;
+    int index = -1, claimable = -1;
 
     for (int i = 0; i < capacity; ++i)
     {
-        const auto key = table[(size_t) i].key.load (std::memory_order_relaxed);   // only this thread writes it
+        auto& slot = table[(size_t) i];
+        const auto key = Slot::keyOf (slot.state.load (std::memory_order_relaxed));   // only this thread writes it
 
         if (key == wanted)
         {
@@ -43,21 +46,23 @@ int RemoteStreamTable::push (uint32_t clientId, StreamKind kind, uint16_t seq, c
             break;
         }
 
-        if (key == freeKey && firstFree < 0)
-            firstFree = i;
+        // A free slot is claimable only while no pop is inside it (it may still be finishing a pop that began
+        // before the release).
+        if (key == freeKey && claimable < 0 && ! slot.reading.load())
+            claimable = i;
     }
 
     if (index < 0)
     {
-        if (firstFree < 0)
+        if (claimable < 0)
             return -1;
 
-        index = firstFree;
+        index = claimable;
         auto& slot = table[(size_t) index];
-        slot.buffer.reset();
-        slot.releaseKey.store (freeKey, std::memory_order_relaxed);
-        slot.generation.fetch_add (1, std::memory_order_acq_rel);
-        slot.key.store (wanted, std::memory_order_release);
+        const auto generation = Slot::generationOf (slot.state.load (std::memory_order_relaxed)) + 1;
+        slot.buffer.resetForNewStream();
+        slot.releaseState.store (0, std::memory_order_relaxed);
+        slot.state.store (((uint64_t) generation << 32) | wanted);
     }
 
     auto& slot = table[(size_t) index];
@@ -70,13 +75,13 @@ void RemoteStreamTable::sweep (double nowMs) noexcept
 {
     for (auto& slot : table)
     {
-        const auto key = slot.key.load (std::memory_order_relaxed);
-        const auto requested = slot.releaseKey.exchange (freeKey, std::memory_order_acq_rel);
+        const auto state = slot.state.load (std::memory_order_relaxed);
+        const auto requested = slot.releaseState.exchange (0, std::memory_order_acq_rel);
 
-        if (key == freeKey)
+        if (Slot::keyOf (state) == freeKey)
             continue;
 
-        if (requested == key || nowMs - slot.lastPacketMs >= idleReleaseMs)
+        if (requested == state || nowMs - slot.lastPacketMs >= idleReleaseMs)
             release (slot);
     }
 }
@@ -85,10 +90,11 @@ void RemoteStreamTable::releaseClient (uint32_t clientId) noexcept
 {
     for (auto& slot : table)
     {
-        const auto key = slot.key.load (std::memory_order_acquire);
+        const auto state = slot.state.load (std::memory_order_acquire);
+        const auto key = Slot::keyOf (state);
 
         if (key != freeKey && clientOf (key) == clientId)
-            slot.releaseKey.store (key, std::memory_order_release);
+            slot.releaseState.store (state, std::memory_order_release);
     }
 }
 
@@ -96,7 +102,7 @@ void RemoteStreamTable::clear() noexcept
 {
     for (auto& slot : table)
     {
-        slot.releaseKey.store (freeKey, std::memory_order_relaxed);
+        slot.releaseState.store (0, std::memory_order_relaxed);
         release (slot);
     }
 }
@@ -106,7 +112,7 @@ int RemoteStreamTable::activeCount() const noexcept
     int count = 0;
 
     for (const auto& slot : table)
-        if (slot.key.load (std::memory_order_acquire) != freeKey)
+        if (Slot::keyOf (slot.state.load (std::memory_order_acquire)) != freeKey)
             ++count;
 
     return count;
@@ -114,6 +120,7 @@ int RemoteStreamTable::activeCount() const noexcept
 
 void RemoteStreamTable::release (Slot& slot) noexcept
 {
-    slot.key.store (freeKey, std::memory_order_release);
+    const auto state = slot.state.load (std::memory_order_relaxed);
+    slot.state.store (state & ~(uint64_t) 0xffffffffu);   // keeps the generation (seq_cst: see pop)
 }
 }

@@ -16,12 +16,16 @@ namespace ensayo
 //   consumer - one thread (the audio callback): slots(), then per slot the protocol below.
 //
 // Consumer protocol, per slot and per block:
-//   const auto key = slot.key.load (std::memory_order_acquire);          // freeKey = nothing there
-//   const auto generation = slot.generation.load (std::memory_order_acquire);
-//   if (key or generation differ from what this slot decoded last) -> a new stream: fresh decoder, fade in
-//   (and the previous one, if it was sounding, is concealed and faded out like any other stop);
-//   slot.pop (generation, out, len)  -> false: nothing due, or the slot changed hands meanwhile (conceal).
-// A slot's JitterBuffer is reset by the producer when it is claimed, so a stream always starts on a clean window.
+//   const auto state = slot.state.load (std::memory_order_acquire);    // key and generation in one load
+//   if (Slot::keyOf (state) == freeKey)  -> nothing there (fade out what was sounding)
+//   if (state != the state this slot decoded last) -> a new stream: fresh decoder, fade in (the previous one, if it
+//   was sounding, is concealed and faded out like any other stop);
+//   slot.pop (state, out, len)  -> false: nothing due, or the slot changed hands meanwhile (conceal).
+//
+// Claiming a slot resets its JitterBuffer (non-atomic storage), so claim and pop are kept apart with a Dekker
+// hand-off: pop raises `reading` and then checks `state`; the producer only claims a free slot whose `reading` is
+// down (a free slot cannot be entered, since pop sees it free and leaves), and otherwise takes another free slot or
+// drops the packet.
 class RemoteStreamTable
 {
 public:
@@ -36,25 +40,33 @@ public:
 
     struct Slot
     {
-        std::atomic<uint32_t> key { freeKey };          // written by the producer only (release)
-        std::atomic<uint32_t> generation { 0 };         // +1 on every claim, before `key` is published
+        // generation << 32 | key. Written by the producer only (seq_cst). The generation grows on every claim and is
+        // kept on release, so a state value names one stream instance.
+        std::atomic<uint64_t> state { 0 };
+        static constexpr uint32_t keyOf (uint64_t s) noexcept         { return (uint32_t) s; }
+        static constexpr uint32_t generationOf (uint64_t s) noexcept  { return (uint32_t) (s >> 32); }
+        uint32_t key() const noexcept                                 { return keyOf (state.load (std::memory_order_acquire)); }
+
         // Sized for the largest payload (128-sample stereo, 96 B); voice blocks are 48 B.
         JitterBuffer buffer { codedBytesStereo (FrameSize::f128), frameSamples (FrameSize::f128) * 1000.0 / sampleRate };
 
-        // Consumer: one block of the stream claimed as `expectedGeneration`. False when nothing is due or the slot
-        // was released / claimed again meanwhile (then len = 0 and the block, if any, is not this stream's).
-        bool pop (uint32_t expectedGeneration, uint8_t* out, int& len) noexcept;
+        // Consumer: one block of the stream whose state was `expectedState`. False when nothing is due, or the slot
+        // was released / claimed again (then len = 0).
+        bool pop (uint64_t expectedState, uint8_t* out, int& len) noexcept;
+
+        // Consumer-owned (raised only inside pop); public so tests can hold a slot as if mid-pop.
+        std::atomic<bool> reading { false };
 
     private:
         friend class RemoteStreamTable;
-        std::atomic<uint32_t> releaseKey { freeKey };   // message thread -> producer: release if key still equals it
+        std::atomic<uint64_t> releaseState { 0 };       // message thread -> producer: release if state still equals it
         double lastPacketMs = 0.0;                      // producer only
     };
 
     RemoteStreamTable() = default;
 
     // Producer. Routes one payload to the slot of (clientId, kind), claiming a free slot on a stream's first packet.
-    // Returns the slot index, or -1 when clientId is out of range or every slot is taken by another stream.
+    // Returns the slot index, or -1 when clientId is out of range or no slot can take a new stream right now.
     int push (uint32_t clientId, StreamKind kind, uint16_t seq, const uint8_t* payload, int len, double nowMs) noexcept;
     // Producer, at least every few hundred ms: releases idle streams and the ones requested by releaseClient.
     void sweep (double nowMs) noexcept;
@@ -64,12 +76,12 @@ public:
     // Only while no producer runs (e.g. between connections): frees every slot.
     void clear() noexcept;
 
-    // Consumer (any thread for reading keys).
+    // Consumer (any thread for reading states).
     std::span<Slot, capacity> slots() noexcept           { return table; }
     int activeCount() const noexcept;
 
 private:
-    void release (Slot&) noexcept;
+    static void release (Slot&) noexcept;
 
     std::array<Slot, capacity> table;
 };

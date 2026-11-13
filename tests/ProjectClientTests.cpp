@@ -1206,7 +1206,7 @@ public:
         auto slotFor = [&table] (uint32_t clientId, StreamKind kind) -> RemoteStreamTable::Slot*
         {
             for (auto& slot : table.slots())
-                if (slot.key.load() == RemoteStreamTable::keyFor (clientId, kind))
+                if (slot.key() == RemoteStreamTable::keyFor (clientId, kind))
                     return &slot;
 
             return nullptr;
@@ -1238,13 +1238,13 @@ public:
 
         for (auto [slot, marker] : { std::pair { sb, 1 }, std::pair { sc, 2 } })
         {
-            const auto generation = slot->generation.load();
+            const auto state = slot->state.load();
             int popped = 0, last = -1;
             bool ordered = true;
 
             for (int i = 0; i < 20; ++i)
             {
-                if (! slot->pop (generation, out.data(), len))
+                if (! slot->pop (state, out.data(), len))
                     continue;
 
                 const int seq = out[1];
